@@ -19,6 +19,7 @@ package sjws_nettask.cp;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Optional;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Base64;
@@ -43,6 +44,7 @@ public final class DataApply {
     private final byte[] trustBundle;
     private final long trustFloor;
     private final Path stateDir;
+    private final Path pin;
     private final LongSupplier nowMillis;
     private final Map<Long, String> retained = new LinkedHashMap<>();
     private final ArrayDeque<Long> order = new ArrayDeque<>();
@@ -50,21 +52,25 @@ public final class DataApply {
     private long appliedEpoch;
 
     private DataApply(byte[] rootPublic, long pinFloor, List<TrustKey> keys, byte[] trustBundle, long trustFloor,
-            Path stateDir, LongSupplier nowMillis) {
+            Path stateDir, Path pin, LongSupplier nowMillis, long appliedVersion) {
         this.rootPublic = rootPublic;
         this.pinFloor = pinFloor;
         this.keys = List.copyOf(keys);
         this.trustBundle = trustBundle.clone();
         this.trustFloor = trustFloor;
         this.stateDir = stateDir;
+        this.pin = pin;
         this.nowMillis = nowMillis;
+        this.appliedVersion = appliedVersion;
     }
 
     public static DataApply open(KeyRing keys, Path pin, Path stateDir, LongSupplier nowMillis) throws IOException {
-        LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
+        if (!LastGoodFiles.isRegularFile(pin)) {
+            LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
+        }
         var read = LastGoodFiles.readPin(pin);
         return new DataApply(read.rootPublic(), read.versionFloor(), keys.bundle().keys(), keys.bundle().encoded(),
-                keys.bundle().versionFloor(), stateDir, nowMillis);
+                keys.bundle().versionFloor(), stateDir, pin, nowMillis, read.appliedVersion());
     }
 
     /**
@@ -84,11 +90,14 @@ public final class DataApply {
         if (parsed.versionFloor() < read.versionFloor()) {
             throw new IOException("trust bundle floor is below the pinned floor");
         }
+        if (parsed.bundleSerial() < read.bundleSerial()) {
+            throw new IOException("trust bundle serial is below the pinned floor");
+        }
         if (nowMillis.getAsLong() > parsed.notAfterMillis()) {
             throw new IOException("trust bundle has expired");
         }
         return new DataApply(read.rootPublic(), read.versionFloor(), parsed.keys(), parsed.encoded(),
-                parsed.versionFloor(), stateDir, nowMillis);
+                parsed.versionFloor(), stateDir, pin, nowMillis, read.appliedVersion());
     }
 
     public record Decision(String error, boolean noop, String yaml) {
@@ -208,6 +217,15 @@ public final class DataApply {
         record(snapshot);
         LastGoodFiles.write(stateDir, appliedVersion, appliedEpoch, snapshot.keyId(), keys, trustFloor, trustBundle,
                 snapshot);
+        if (this.pin != null) {
+            long serial = 0L;
+            try {
+                serial = TrustBundle.parse(this.trustBundle, this.rootPublic).bundleSerial();
+            } catch (CpKeyException e) {
+                serial = 0L;
+            }
+            LastGoodFiles.ratchetPin(this.pin, snapshot.version(), serial);
+        }
     }
 
     /** In-memory part of {@link #remember}: the anti-rollback floor holds even where nothing is written. */
@@ -250,7 +268,132 @@ public final class DataApply {
 
     /** Reads a snapshot back out of {@code last-good.json}. The caller still runs {@link #decide}. */
     public static SignedSnapshot readLastGood(Path stateDir) throws IOException {
-        return parseSnapshot(Files.readString(LastGoodFiles.configDir(stateDir).resolve("last-good.json")));
+        return parseSnapshot(LastGoodFiles.readStringNoFollow(LastGoodFiles.configDir(stateDir).resolve("last-good.json")));
+    }
+
+    /**
+     * Signed last-good when {@code <stateDir>/config/last-good.json} parses as a control-plane
+     * snapshot with {@code version > 0}. Empty for a missing file, an unsigned
+     * {@code LastGoodStore} envelope, or any parse error. This is the readiness definition of
+     * "has last-good"; the unsigned boot file is not.
+     */
+    public static Optional<SignedSnapshot> tryReadLastGood(Path stateDir) {
+        if (stateDir == null) {
+            return Optional.empty();
+        }
+        try {
+            var path = LastGoodFiles.configDir(stateDir).resolve("last-good.json");
+            if (!LastGoodFiles.isRegularFile(path)) {
+                return Optional.empty();
+            }
+            var snapshot = parseSnapshot(LastGoodFiles.readStringNoFollow(path));
+            if (snapshot.version() <= 0) {
+                return Optional.empty();
+            }
+            return Optional.of(snapshot);
+        } catch (RuntimeException | IOException e) {
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * A persisted last-good that verifies under the pinned root, the stored trust bundle, and
+     * the rollback floor. Empty when the pin, trust, or floor file is missing, the signature or
+     * canonical hash is wrong, the envelope is expired, or the version does not match the floor.
+     * Startup/readiness only; the request path does not call this.
+     */
+    /**
+     * A last-good snapshot that already passed the pin, trust, signature, and floor checks,
+     * plus the bundle serial stored on the pin.
+     */
+    public record VerifiedLastGood(SignedSnapshot snapshot, long bundleSerial) {
+    }
+
+    public static Optional<VerifiedLastGood> tryReadVerifiedLastGood(Path stateDir, Path pin) {
+        if (stateDir == null || pin == null) {
+            return Optional.empty();
+        }
+        try {
+            var snapshot = tryReadLastGood(stateDir).orElse(null);
+            if (snapshot == null) {
+                return Optional.empty();
+            }
+            var pinned = LastGoodFiles.readPin(pin);
+            var dir = LastGoodFiles.configDir(stateDir);
+            var trustPath = dir.resolve("trust.json");
+            var floorPath = dir.resolve("floor.json");
+            if (!LastGoodFiles.isRegularFile(trustPath) || !LastGoodFiles.isRegularFile(floorPath)) {
+                return Optional.empty();
+            }
+            var trustJson = LastGoodFiles.readStringNoFollow(trustPath);
+            var bundleBytes = Base64.getDecoder().decode(LastGoodFiles.readString(trustJson, "bundle"));
+            TrustBundle bundle;
+            try {
+                bundle = TrustBundle.parse(bundleBytes, pinned.rootPublic());
+            } catch (CpKeyException e) {
+                return Optional.empty();
+            }
+            if (bundle.versionFloor() < pinned.versionFloor()) {
+                return Optional.empty();
+            }
+            if (bundle.bundleSerial() < pinned.bundleSerial()) {
+                return Optional.empty();
+            }
+            long now = System.currentTimeMillis();
+            if (now > bundle.notAfterMillis()) {
+                return Optional.empty();
+            }
+            if (snapshot.kind() != SnapshotCrypto.KIND_FULL || snapshot.parentVersion() != 0L) {
+                return Optional.empty();
+            }
+            if (snapshot.canonicalHash().length != 32 || snapshot.nonce().length != 16) {
+                return Optional.empty();
+            }
+            if (!snapshot.canonicalYaml().startsWith("schema: " + snapshot.schema() + "\n")) {
+                return Optional.empty();
+            }
+            if (!Arrays.equals(KeyRing.hash(snapshot.canonicalYaml()), snapshot.canonicalHash())) {
+                return Optional.empty();
+            }
+            if (forbidden(snapshot.canonicalYaml())) {
+                return Optional.empty();
+            }
+            TrustKey key = null;
+            for (var candidate : bundle.keys()) {
+                if (candidate.keyId().equals(snapshot.keyId())) {
+                    key = candidate;
+                    break;
+                }
+            }
+            if (key == null) {
+                return Optional.empty();
+            }
+            var onlineKey = SnapshotCrypto.publicKey(key.publicKey());
+            if (onlineKey == null || !SnapshotCrypto.verify(onlineKey, SnapshotCrypto.snapshotInput(snapshot),
+                    snapshot.signature())) {
+                return Optional.empty();
+            }
+            if (now > key.notAfterMillis()) {
+                return Optional.empty();
+            }
+            if (snapshot.version() < key.versionMin() || snapshot.version() > key.versionMax()) {
+                return Optional.empty();
+            }
+            if (now < snapshot.issuedAtMillis() || now > snapshot.expiresAtMillis()) {
+                return Optional.empty();
+            }
+            long maxVersion = LastGoodFiles.readLong(LastGoodFiles.readStringNoFollow(floorPath), "maxVersion");
+            long floor = Math.max(pinned.versionFloor(), bundle.versionFloor());
+            if (snapshot.version() < floor || snapshot.version() != maxVersion) {
+                return Optional.empty();
+            }
+            if (snapshot.version() < pinned.appliedVersion()) {
+                return Optional.empty();
+            }
+            return Optional.of(new VerifiedLastGood(snapshot, bundle.bundleSerial()));
+        } catch (RuntimeException | IOException e) {
+            return Optional.empty();
+        }
     }
 
     /** Parses {@link LastGoodFiles#snapshotJson}. Fields are not verified here; {@link #decide} does that. */

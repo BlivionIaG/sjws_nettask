@@ -346,7 +346,7 @@ public final class LastGoodStore {
                     case "version" -> envelope.version = parser.number();
                     case "canonicalHash" -> envelope.canonicalHash = parser.string();
                     case "signature" -> envelope.signature = parser.string();
-                    case "canonical" -> envelope.canonical = parser.string();
+                    case "canonical", "canonicalYaml" -> envelope.canonical = parser.string();
                     default -> parser.skipValue();
                 }
             }

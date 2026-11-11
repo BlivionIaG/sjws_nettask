@@ -27,6 +27,9 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import sjws_nettask.clusterharness.NodeFixtures;
+import sjws_nettask.config.ConfigDocument;
+import sjws_nettask.cp.KeyRing;
+import sjws_nettask.cp.LastGoodFiles;
 import sjws_nettask.config.SnapshotVerifier;
 import sjws_nettask.ha.HaEvents;
 import sjws_nettask.ha.HaSettings;
@@ -334,8 +337,8 @@ class ServiceDaemonTest {
         var seen = new AtomicReference<String>();
         int port = freePort();
         int code = Sjws_nettask.run(new String[] {"--role=data", "--bootstrap=" + fix, "--pid-file=" + pid,
-                "--state-dir=" + tmp.resolve("last-good"), "--shutdown-timeout=2", Integer.toString(port),
-                html.toString()}, Map.of(), out, err, NO_H3, server -> {
+                "--bind-content=true", "--state-dir=" + tmp.resolve("last-good"), "--shutdown-timeout=2",
+                Integer.toString(port), html.toString()}, Map.of(), out, err, NO_H3, server -> {
                     try {
                         var buf = new ByteArrayOutputStream();
                         assertEquals(0, Daemon.status(pid, new PrintStream(buf, true, StandardCharsets.UTF_8), err));
@@ -671,7 +674,7 @@ class ServiceDaemonTest {
         var matched = Daemon.parse(new String[] {"--bind-content=true"}, Map.of());
         errBytes.reset();
         assertTrue(Sjws_nettask.resolveBind(matched, dataLoaded, err));
-        assertEquals("", err());
+        assertTrue(err().contains("--bind-content=true binds the content port with no verified last-good"), err());
 
         ServiceHooks nameless = new ServiceHooks() {
             @Override
@@ -966,4 +969,101 @@ class ServiceDaemonTest {
             return ((InetSocketAddress) channel.getLocalAddress()).getPort();
         }
     }
+
+    @Test
+    void dataRoleDefersContentBindUntilVerifiedLastGood() throws Exception {
+        var html = Files.createDirectory(tmp.resolve("defer-html"));
+        Files.writeString(html.resolve("index.html"), "hi");
+        var state = tmp.resolve("defer-state");
+        var yaml = tmp.resolve("defer-data.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        errBytes.reset();
+        assertFalse(Sjws_nettask.resolveBind(Daemon.parse(new String[] {}, Map.of()), loaded, err));
+        assertEquals("", err());
+
+        Files.createDirectories(state.resolve("config"));
+        Files.writeString(state.resolve("config").resolve("last-good.json"), signedLastGoodJson(6, 1_000, 2_000));
+        var again = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        errBytes.reset();
+        assertFalse(Sjws_nettask.resolveBind(Daemon.parse(new String[] {}, Map.of()), again, err),
+                "an unverified envelope must not bind the content port");
+        assertEquals("", err());
+        errBytes.reset();
+        assertTrue(Sjws_nettask.resolveBind(Daemon.parse(new String[] {"--bind-content=true"}, Map.of()), loaded, err));
+        assertTrue(err().contains("--bind-content=true binds the content port with no verified last-good"), err());
+        assertFalse(err().contains("overrides the data"), err());
+
+        var empty = tmp.resolve("empty-state");
+        var hookDir = tmp.resolve("hook-state");
+        var hookYaml = tmp.resolve("hook-data.yaml");
+        Files.writeString(hookYaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + empty.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var hookLoaded = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + hookYaml}, Map.of());
+        errBytes.reset();
+        assertFalse(Sjws_nettask.resolveBind(Daemon.parse(new String[] {}, Map.of()), hookLoaded, err));
+        var hookPin = persistVerifiedLastGood(tmp, hookDir, hookLoaded.document(), 7);
+        ServiceHooks hooks = new ServiceHooks() {
+            @Override
+            public void onListening(SjwsServer server, Path pidFile, java.time.Duration shutdownTimeout) {
+            }
+
+            @Override
+            public void onShutdown() {
+            }
+
+            @Override
+            public String startupLine() {
+                return null;
+            }
+
+            @Override
+            public Path stateDir() {
+                return hookDir;
+            }
+
+            @Override
+            public Path pinFile() {
+                return hookPin;
+            }
+        };
+        errBytes.reset();
+        assertTrue(Sjws_nettask.resolveBind(Daemon.parse(new String[] {}, Map.of()), hookLoaded, err, hooks));
+        assertEquals("", err());
+        errBytes.reset();
+        assertTrue(Sjws_nettask.resolveBind(Daemon.parse(new String[] {"--bind-content=true"}, Map.of()), hookLoaded,
+                err, hooks));
+        assertFalse(err().contains("no verified last-good"), err());
+        assertFalse(Sjws_nettask.hasVerifiedLastGood(null, null));
+        assertTrue(Sjws_nettask.hasVerifiedLastGood(null, hooks));
+    }
+
+    private static Path persistVerifiedLastGood(Path pinDir, Path stateDir, ConfigDocument document, long version)
+            throws Exception {
+        var keys = KeyRing.generate("online-1", System.currentTimeMillis() + 86_400_000L, 0, Long.MAX_VALUE / 2);
+        var pin = pinDir.resolve("root-" + version + ".pin");
+        LastGoodFiles.writePin(pin, keys.rootPublic(), keys.versionFloor());
+        long now = System.currentTimeMillis();
+        var snap = keys.sign(document, version, 1L, 1L, now, now + 3_600_000L, 0L);
+        LastGoodFiles.write(stateDir, snap.version(), snap.epoch(), snap.keyId(), keys.bundle().keys(),
+                keys.bundle().versionFloor(), keys.bundle().encoded(), snap);
+        return pin;
+    }
+
+    private static String signedLastGoodJson(long version, long issued, long expires) {
+        var body = "schema: 1\nnode:\n  mode: data\n";
+        var hash = "00".repeat(32);
+        return "{\"schema\":1,\"version\":" + version + ",\"raftIndex\":1,\"canonicalHash\":\"" + hash
+                + "\",\"keyId\":\"k1\",\"epoch\":1,\"parentVersion\":0,\"kind\":1,\"projectionId\":\"\","
+                + "\"issuedAtMillis\":" + issued + ",\"expiresAtMillis\":" + expires
+                + ",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAA==\",\"signature\":\""
+                + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\","
+                + "\"rollbackOf\":0,\"canonicalYaml\":" + jsonString(body) + "}";
+    }
+
+    private static String jsonString(String value) {
+        return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\"";
+    }
+
 }
