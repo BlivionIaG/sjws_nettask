@@ -92,7 +92,11 @@ document, so they do not contain a key password. The temp file and its directory
 are fsynced before the atomic rename, and the write runs after the reload lock is
 released. Standalone and control do not write this file and do not boot from it.
 A file left by an older build at `<file>.last-good` is still read once when the
-JSON file is absent. A failed apply leaves both the running config and this file
+JSON file is absent. When a bootstrap pin is set, only a signed `last-good.json`
+that verifies under the pin is a boot source; an unsigned file stops startup with
+an error. A recovery file must not be a symlink, must be owned by root or the
+service user, and must not be group- or world-writable (nor may its directories).
+A failed apply leaves both the running config and this file
 as they were.
 
 In a duration, a bare integer is seconds and `1m` is one minute (`ms`, `s`, `m`,

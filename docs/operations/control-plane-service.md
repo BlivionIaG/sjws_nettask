@@ -203,11 +203,16 @@ implemented outside this daemon slice, in `sjws_nettask.cp`.
    a long poll), which moves `connection` between `pending`, `connected` and
    `disconnected`, and late-binds the content port after the first applied
    snapshot. A missing config file on a data node boots from the same verified
-   last-good when the bootstrap pin is present, or from an unsigned
-   `<stateDir>/config/last-good.json` envelope when that file is the unsigned boot
-   form and `node.mode` is `data`. An unsigned `LastGoodStore` boot file is not
-   a verified last-good for readiness. A leftover sibling `<file>.last-good` is read
-   once when that JSON file is absent (`LastGoodStore`). `Requires=` stays off the data unit.
+   last-good when the bootstrap pin is present. With a pin, an unsigned
+   `<stateDir>/config/last-good.json`, a signed one that does not verify, or a
+   leftover sibling `<file>.last-good` stops startup with an error. Without a pin,
+   the unsigned boot form of that file is read when `node.mode` is `data`, and the
+   sibling is read once when that JSON file is absent (`LastGoodStore`). Every
+   recovery file (and, with a pin, the trust, floor and pin files) is opened
+   without following a symlink, must be a regular file owned by root or the
+   service user, not group- or world-writable, under directories that pass the
+   same checks. An unsigned `LastGoodStore` boot file is not a verified last-good
+   for readiness. `Requires=` stays off the data unit.
 
 5. **SIGHUP is reload.** The daemon child installs `ReloadHook`. `ExecReload` is
    `kill -HUP`. A data node reloads local bootstrap settings only after

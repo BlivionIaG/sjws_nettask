@@ -39,6 +39,14 @@ public interface ServerControl extends AutoCloseable {
     }
 
     /**
+     * Metrics for the Metrics view (#366): the nodes that reported and how many are known, or null
+     * when this control has none. Never throws.
+     */
+    default MetricsView.Report metrics() {
+        return null;
+    }
+
+    /**
      * Starts a graceful drain without blocking (#381): stop accepting, let in-flight work finish
      * up to the HA drain timeout, then close. Idempotent: while a drain runs, the same operation
      * is returned. Cancelling a drain is not supported: HA's drain lifecycle has no cancel.
