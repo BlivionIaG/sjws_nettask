@@ -32,7 +32,7 @@ The request path does not change when these files are added. Counters stay off u
 | Cluster API-key requests | `sum by (api_key) (sjws_cluster_api_key_requests)` |
 | Messaging lag | `sum by (topic) (sjws_messaging_lag_messages)` and `sum by (topic) (sjws_messaging_lag_offsets)` |
 | Messaging in-flight | `sum by (topic) (sjws_messaging_inflight)` |
-| Messaging DLQ depth | `sum by (topic) (sjws_messaging_dlq_depth)` |
+| Messaging DLQ depth | `sum by (topic) (max without (group) (sjws_messaging_dlq_depth))` |
 | Messaging oldest pending age | `max by (topic) (sjws_messaging_oldest_pending_age_ms)` |
 | Messaging produce latency | `histogram_quantile(0.50, sum by (le) (rate(sjws_messaging_produce_duration_seconds_bucket[5m])))` and the same with `0.99` |
 | Messaging fetch latency | `histogram_quantile(0.50, sum by (le) (rate(sjws_messaging_fetch_duration_seconds_bucket[5m])))` and the same with `0.99` |

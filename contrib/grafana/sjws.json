@@ -326,7 +326,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum by (topic) (sjws_messaging_dlq_depth)",
+          "expr": "sum by (topic) (max without (group) (sjws_messaging_dlq_depth))",
           "legendFormat": "{{topic}}",
           "refId": "A"
         }

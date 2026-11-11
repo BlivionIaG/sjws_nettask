@@ -368,7 +368,8 @@ class PrometheusScrapeTest {
         assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_cluster_requests_per_second")));
         assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_lag_messages")));
         assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_inflight")));
-        assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_dlq_depth")));
+        assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_dlq_depth")
+                && e.contains("max without (group)")), exprs.toString());
         assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_oldest_pending_age_ms")));
         assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_produce_duration_seconds_bucket")));
         assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_fetch_duration_seconds_bucket")));
