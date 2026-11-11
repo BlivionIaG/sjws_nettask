@@ -19,6 +19,7 @@ package sjws_nettask.config;
 import java.util.ArrayList;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.routing.Admission;
 import sjws_nettask.routing.Cidr;
 import sjws_nettask.routing.ProblemErrorHandler;
 import sjws_nettask.routing.ProxyHandler;
@@ -110,18 +111,20 @@ final class RoutingCompiler {
         var source = UpstreamRegistry.fromConfig(set);
         var scheme = u.url().getScheme();
         var path = u.url().getRawPath() == null ? "" : u.url().getRawPath();
+        var admission = Admission.of(u.maxPending(), u.maxConnections());
         EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
                 java.net.URI.create(scheme + "://" + e.authority() + path), u.connectTimeout(), u.responseTimeout(),
                 u.idleReadTimeout(), u.maxBody(), proto, cidrs, u.preserveHost(), 256),
-                sjws_nettask.routing.ByteBudget.shared(), null);
+                sjws_nettask.routing.ByteBudget.shared(), null, admission);
         var retry = u.resilience() == null ? null : u.resilience().retry();
-        return new EndpointBalancer(source, pools, retry, d.outlier());
+        return new EndpointBalancer(source, pools, retry, d.outlier(), admission);
     }
 
     private static ProxyHandler proxy(Upstream u, String proto, java.util.List<Cidr> cidrs) {
         return new ProxyHandler(new ProxyHandler.Settings(u.url(), u.connectTimeout(), u.responseTimeout(),
                 u.idleReadTimeout(), u.maxBody(), proto, cidrs, u.preserveHost(), 256),
-                sjws_nettask.routing.ByteBudget.shared(), u.resilience());
+                sjws_nettask.routing.ByteBudget.shared(), u.resilience(),
+                Admission.of(u.maxPending(), u.maxConnections()));
     }
 
 }

@@ -27,10 +27,18 @@ import java.time.Duration;
  * {@code Settings} record does not carry them yet.
  *
  * @param maxBody request body cap, bytes (fits in a positive {@code int})
+ * @param maxPending concurrent outstanding exchanges to this upstream, or 0 if unset
+ * @param maxConnections concurrent sockets to this upstream (in use, connecting, or idle), or 0 if unset
  */
 public record Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout,
         Duration idleReadTimeout, int maxBody, boolean preserveHost, sjws_nettask.routing.Resilience resilience,
-        Upstream.Discovery discovery) {
+        int maxPending, int maxConnections, Upstream.Discovery discovery) {
+
+    public Upstream {
+        if (maxPending < 0 || maxConnections < 0) {
+            throw new IllegalArgumentException("max_pending and max_connections must be >= 0");
+        }
+    }
 
     /**
      * {@code endpoints:} instead of one {@code url}: the static endpoint set (the default
@@ -45,6 +53,14 @@ public record Upstream(String name, URI url, Duration connectTimeout, Duration r
             java.util.Objects.requireNonNull(lb, "lb");
             java.util.Objects.requireNonNull(outlier, "outlier");
         }
+    }
+
+    /** Limits unset (the usual constructor). */
+    public Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout, Duration idleReadTimeout,
+            int maxBody, boolean preserveHost, sjws_nettask.routing.Resilience resilience,
+            Upstream.Discovery discovery) {
+        this(name, url, connectTimeout, responseTimeout, idleReadTimeout, maxBody, preserveHost, resilience, 0, 0,
+                discovery);
     }
 
     /** A single URL. */

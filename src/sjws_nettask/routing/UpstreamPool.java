@@ -80,6 +80,13 @@ final class UpstreamPool implements AutoCloseable {
         }
     }
 
+    /** The per-upstream {@code max_connections} cap was reached; answer 503 locally. */
+    static final class ConnectionLimit extends IOException {
+        ConnectionLimit() {
+            super("upstream connection limit");
+        }
+    }
+
     private static final ReentrantLock LOOPS_LOCK = new ReentrantLock();
     private static EventLoopGroup loops;
     private static int users;
@@ -94,9 +101,15 @@ final class UpstreamPool implements AutoCloseable {
     private volatile boolean retired;
 
     private final ByteBudget budget;
+    private final Admission admission;
 
     UpstreamPool(URI upstream, Duration connectTimeout, int maxIdle, ByteBudget budget) {
+        this(upstream, connectTimeout, maxIdle, budget, null);
+    }
+
+    UpstreamPool(URI upstream, Duration connectTimeout, int maxIdle, ByteBudget budget, Admission admission) {
         this.budget = java.util.Objects.requireNonNull(budget);
+        this.admission = admission;
         boolean tls = "https".equals(upstream.getScheme());
         this.host = upstream.getHost();
         this.port = upstream.getPort() > 0 ? upstream.getPort() : tls ? 443 : 80;
@@ -165,6 +178,13 @@ final class UpstreamPool implements AutoCloseable {
                 return new Lease(ch, true);
             }
         }
+        Admission.Hold slot = null;
+        if (this.admission != null && this.admission.limitsConnections()) {
+            slot = this.admission.tryConnection();
+            if (slot == null) {
+                throw new ConnectionLimit();
+            }
+        }
         var connected = new CompletableFuture<Channel>();
         this.bootstrap.connect(this.host, this.port).addListener(f -> {
             if (f.isSuccess()) {
@@ -174,15 +194,44 @@ final class UpstreamPool implements AutoCloseable {
             }
         });
         try {
-            return new Lease(connected.get(this.connectTimeout.toMillis() + 1000, TimeUnit.MILLISECONDS), false);
+            var ch = connected.get(this.connectTimeout.toMillis() + 1000, TimeUnit.MILLISECONDS);
+            if (slot != null) {
+                var held = slot;
+                ch.closeFuture().addListener(f -> held.release());
+                slot = null;
+            }
+            return new Lease(ch, false);
         } catch (TimeoutException e) {
+            connected.whenComplete((ch, err) -> {
+                if (ch != null) {
+                    ch.close();
+                }
+            });
+            if (slot != null) {
+                slot.release();
+                slot = null;
+            }
             throw new ConnectTimeout("connect to " + this.host + ":" + this.port + " timed out");
         } catch (ExecutionException e) {
+            if (slot != null) {
+                slot.release();
+                slot = null;
+            }
             var cause = e.getCause();
             if (cause instanceof io.netty.channel.ConnectTimeoutException) {
                 throw new ConnectTimeout(cause.getMessage());
             }
             throw new ConnectFailed("connect to " + this.host + ":" + this.port + ": " + cause, cause);
+        } catch (InterruptedException e) {
+            connected.whenComplete((ch, err) -> {
+                if (ch != null) {
+                    ch.close();
+                }
+            });
+            if (slot != null) {
+                slot.release();
+            }
+            throw e;
         }
     }
 

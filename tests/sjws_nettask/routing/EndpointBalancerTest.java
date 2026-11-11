@@ -32,6 +32,9 @@ import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -90,9 +93,15 @@ class EndpointBalancerTest {
 
     private EndpointBalancer balancer(StaticUpstreamSource src, Resilience.Retry retry, EndpointBalancer.Outlier o,
             Duration grace) {
+        return balancer(src, retry, o, grace, null);
+    }
+
+    private EndpointBalancer balancer(StaticUpstreamSource src, Resilience.Retry retry, EndpointBalancer.Outlier o,
+            Duration grace, Admission admission) {
         EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
-                URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http", null));
-        var b = new EndpointBalancer(src, pools, retry, o, grace, this.now::get);
+                URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http",
+                null), ByteBudget.shared(), null, admission);
+        var b = new EndpointBalancer(src, pools, retry, o, grace, this.now::get, admission);
         this.balancers.add(b);
         return b;
     }
@@ -426,4 +435,56 @@ class EndpointBalancerTest {
 
 
 
+
+    @Test
+    void maxPendingIsSharedAcrossTheEndpointSet() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var hits = new AtomicInteger();
+        // replace the first server with a holding handler
+        this.servers.get(0).stop(0);
+        var hold = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        hold.setExecutor(java.util.concurrent.Executors.newCachedThreadPool(r -> {
+            var th = new Thread(r);
+            th.setDaemon(true);
+            return th;
+        }));
+        hold.createContext("/", ex -> {
+            hits.incrementAndGet();
+            entered.countDown();
+            try {
+                if (!release.await(8, TimeUnit.SECONDS)) {
+                    throw new RuntimeException("release timed out");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            var body = "a".getBytes(StandardCharsets.UTF_8);
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        hold.start();
+        this.servers.set(0, hold);
+        var admission = Admission.of(1, 0);
+        var src = new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1), ep(1, 1)));
+        var b = balancer(src, null, null, Duration.ofSeconds(10), admission);
+        var held = new java.util.concurrent.CompletableFuture<sjws_nettask.core.Response>();
+        try {
+            Thread.ofPlatform().start(() -> held.complete(b.handle(new Request("GET", "/"))));
+            assertTrue(entered.await(8, TimeUnit.SECONDS));
+            var refused = b.handle(new Request("GET", "/"));
+            assertEquals(503, refused.status());
+            assertEquals("1", refused.headers().get("retry-after"));
+            assertTrue(ProxyHandler.isLocalRefusal(refused));
+            assertEquals(1, hits.get()); // second request must not go to the other endpoint
+        } finally {
+            release.countDown();
+        }
+        body(held.get(8, TimeUnit.SECONDS));
+        assertEquals(0, admission.pending());
+        var again = b.handle(new Request("GET", "/"));
+        assertEquals(200, again.status());
+        body(again);
+    }
 }

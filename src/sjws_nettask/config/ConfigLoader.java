@@ -622,7 +622,8 @@ public final class ConfigLoader {
             }
             var body = YamlValues.mapping(entry.getValue(), "routing.upstreams." + name);
             YamlValues.knownKeys(body, List.of("url", "connect_timeout", "response_timeout", "idle_read_timeout",
-                    "max_body", "preserve_host", "retry", "circuit", "endpoints", "lb"), "routing.upstreams." + name);
+                    "max_body", "preserve_host", "retry", "circuit", "endpoints", "lb", "max_pending",
+                    "max_connections"), "routing.upstreams." + name);
             boolean multi = body.containsKey("endpoints");
             if (multi == body.containsKey("url")) {
                 throw new ConfigException("routing.upstreams." + name + ": exactly one of url or endpoints is required");
@@ -671,7 +672,16 @@ public final class ConfigLoader {
                 circuit = circuit(body.get("circuit"), "routing.upstreams." + name + ".circuit");
             }
             var resilience = retry == null && circuit == null ? null : new sjws_nettask.routing.Resilience(retry, circuit);
-            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience, discovery));
+            int maxPending = body.containsKey("max_pending")
+                    ? integer(body.get("max_pending"), "routing.upstreams." + name + ".max_pending", 1,
+                            Integer.MAX_VALUE)
+                    : 0;
+            int maxConnections = body.containsKey("max_connections")
+                    ? integer(body.get("max_connections"), "routing.upstreams." + name + ".max_connections", 1,
+                            Integer.MAX_VALUE)
+                    : 0;
+            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience, maxPending,
+                    maxConnections, discovery));
         }
         return Map.copyOf(out);
     }
