@@ -40,7 +40,7 @@ public final class AdminTui {
     static final int LOG_LINES = 15;
     static final int FILE_TAIL_BYTES = 256 * 1024;
 
-    enum View { STATUS, CONFIG, LOGS, CLUSTER }
+    enum View { STATUS, CONFIG, LOGS, METRICS, CLUSTER }
 
     /** How long the Cluster view waits for a cluster status before showing it as unavailable. */
     static final Duration CLUSTER_TIMEOUT = Duration.ofSeconds(2);
@@ -103,6 +103,7 @@ public final class AdminTui {
                 case "1", "v" -> this.view = View.STATUS;
                 case "2", "c" -> this.view = View.CONFIG;
                 case "3", "l" -> this.view = View.LOGS;
+                case "5", "g" -> this.view = View.METRICS;
                 case "6", "k" -> this.view = View.CLUSTER;
                 case "s" -> act("start", this.control::start);
                 case "x" -> act("stop", this.control::stop);
@@ -115,7 +116,8 @@ public final class AdminTui {
                 default -> this.message = "unknown command '" + line.trim() + "' (h for help)";
             }
             if (cmd.equals("h") || cmd.equals("?")) {
-                this.message = "commands: s start, x stop, r reload, n drain, v/c/l/k status/config/logs/cluster, node <id> node detail, Enter refresh, q quit";
+                this.message = "commands: s start, x stop, r reload, n drain, v/c/l/g/k status/config/logs/metrics/cluster,"
+                        + " node <id> node detail, Enter refresh, q quit";
             }
         } catch (ServerControl.ControlException e) {
             this.message = color(RED, "error: " + e.getMessage());
@@ -146,6 +148,7 @@ public final class AdminTui {
                 .append(tab(View.STATUS, "v status")).append(" | ")
                 .append(tab(View.CONFIG, "c config")).append(" | ")
                 .append(tab(View.LOGS, "l logs")).append(" | ")
+                .append(tab(View.METRICS, "g metrics")).append(" | ")
                 .append(tab(View.CLUSTER, "k cluster")).append("]\n");
         sb.append("State: ").append(stateText(status.state()));
         if (status.state() == ServerStatus.State.RUNNING) {
@@ -156,6 +159,7 @@ public final class AdminTui {
             case STATUS -> renderStatus(sb, status);
             case CONFIG -> status.config().forEach((k, v) -> sb.append(String.format("  %-22s %s%n", k, v)));
             case LOGS -> renderLogs(sb);
+            case METRICS -> renderMetrics(sb);
             case CLUSTER -> renderClusterView(sb);
         }
         sb.append('\n');
@@ -221,6 +225,30 @@ public final class AdminTui {
         for (var key : cluster.apiKeys()) {
             sb.append(String.format(Locale.ROOT, "  api-key %s  requests %d  errors %d  p99 %s%n", key.name(),
                     key.requests(), key.errors(), latency(key.p99Nanos())));
+        }
+    }
+
+    private void renderMetrics(StringBuilder sb) {
+        var report = this.control.metrics();
+        if (report == null) {
+            sb.append("  metrics are not available for this server\n");
+            return;
+        }
+        int reporting = report.nodes().size();
+        var nodes = String.format(Locale.ROOT, "Nodes reporting %d/%d", reporting, report.nodesTotal());
+        sb.append(reporting < report.nodesTotal() ? color(YELLOW, nodes + " (missing nodes are not in the totals)")
+                : nodes).append('\n');
+        if (reporting == 0) {
+            return;
+        }
+        if (reporting > 1) {
+            sb.append(color(BOLD, "Aggregate")).append('\n');
+            sb.append(MetricsView.render(MetricsView.aggregate(
+                    report.nodes().stream().map(MetricsView.Node::snapshot).toList())));
+        }
+        for (var node : report.nodes()) {
+            sb.append(color(BOLD, "Node " + node.nodeId())).append('\n');
+            sb.append(MetricsView.render(node.snapshot()));
         }
     }
 

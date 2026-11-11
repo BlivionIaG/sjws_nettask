@@ -16,6 +16,7 @@
  */
 package sjws_nettask.config;
 
+import java.time.Duration;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -27,12 +28,20 @@ import java.util.regex.Pattern;
  * and keeps the last good config when the control plane is unreachable.
  *
  * @param labels selector map pushed with the config; empty when unset
+ * @param maxStaleness optional operator ceiling on last-good freshness; null means only the
+ *        signed {@code expiresAtMillis} is consulted
  */
-public record NodeSettings(Mode mode, Map<String, String> labels) {
+public record NodeSettings(Mode mode, Map<String, String> labels, Duration maxStaleness) {
 
     public static final int MAX_LABELS = 64;
     public static final Pattern LABEL = Pattern.compile("[A-Za-z0-9_.:-]{1,63}");
-    public static final NodeSettings STANDALONE = new NodeSettings(Mode.STANDALONE, Map.of());
+    /** Longest {@code node.max_staleness} the loader accepts. There is no default ceiling. */
+    public static final Duration MAX_STALENESS = Duration.ofDays(7);
+    public static final NodeSettings STANDALONE = new NodeSettings(Mode.STANDALONE, Map.of(), null);
+
+    public NodeSettings(Mode mode, Map<String, String> labels) {
+        this(mode, labels, null);
+    }
 
     public NodeSettings {
         Objects.requireNonNull(mode, "mode");
@@ -45,6 +54,10 @@ public record NodeSettings(Mode mode, Map<String, String> labels) {
                     || !LABEL.matcher(entry.getValue()).matches()) {
                 throw new ConfigException("node.labels: invalid entry");
             }
+        }
+        if (maxStaleness != null
+                && (maxStaleness.isZero() || maxStaleness.isNegative() || maxStaleness.compareTo(MAX_STALENESS) > 0)) {
+            throw new ConfigException("node.max_staleness: must be between 1ms and 7d");
         }
     }
 
