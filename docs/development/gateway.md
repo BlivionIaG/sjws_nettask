@@ -126,3 +126,18 @@ rules cannot change `content-length`, `transfer-encoding`, `connection`, `keep-a
 `server` or `alt-svc`. Request rules build one new header map and pass `request.withHeaders`.
 Response-only rules do not. Response fields are removed and then set, so a set wins over a
 remove of the same name.
+
+
+## ip-acl
+
+Client-address allow and deny lists, compiled to `routing.Cidr` when the filter is built.
+`allow` and `deny` are addresses or CIDRs (IPv4 and IPv6), one per line, or comma-separated
+when the value has no newline. At least one list is required. A `#` line is ignored. At most
+4096 entries per list.
+
+The request path reads `request.peer()` and does not allocate for a known address. A missing
+peer is refused (fail closed). A deny match always wins. An allow list without a deny list
+admits only listed addresses. A deny list without an allow list admits everyone except the
+denied addresses. A refusal is 403; there is no hide-as-404 mode. Scope (route / labels) is
+the same as every other gateway entry. The filter is off, with no cost, until a document
+names it.

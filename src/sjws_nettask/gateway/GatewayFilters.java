@@ -47,6 +47,7 @@ public final class GatewayFilters {
         registry.factory("cors", CorsFilter::create);
         registry.factory("request-size", RequestSizeFilter::create);
         registry.factory("header-rewrite", HeaderRewriteFilter::create);
+        registry.factory("ip-acl", IpAclFilter::create);
         return registry;
     }
 }
