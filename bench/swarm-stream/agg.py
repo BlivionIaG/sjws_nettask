@@ -22,6 +22,15 @@ def load(p: Path):
         return None
 
 
+def closed_loop_info(out: Path, abs_tag: str) -> dict:
+    """Closed-loop info leg cl-NN run right after abs-NN (inceptor Q1: info only)."""
+    r = load(out / abs_tag.replace("abs-", "cl-", 1) / "result.json")
+    if not r:
+        return {}
+    return {"mib_s": r.get("mib_s"), "p99_us": r.get("p99_us"),
+            "client_cpu_pct_of_wall": r.get("client_cpu_pct_of_wall")}
+
+
 def main():
     out = Path(sys.argv[1])
     abs_runs = sorted(out.glob("abs-*/result.json"))
@@ -61,10 +70,21 @@ def main():
             "max_connections_per_ip": r.get("max_connections_per_ip"),
             "load1_pre": ev["load1_pre"],
             "load1_post": ev["load1_post"],
+            # inceptor Q1/Q2/Q5 (2026-11-11)
+            "offered_mib_s": r.get("offered_mib_s"),
+            "latency_basis": r.get("latency_basis"),
+            "p99_send_us": r.get("p99_send_us"),
+            "p99_sched_us": r.get("p99_sched_us"),
+            "sched_late_pct": r.get("sched_late_pct"),
+            "closed_loop": closed_loop_info(out, p.parent.name),
         })
 
     valid = [w for w in windows if w["valid"]]
+    floor = load(out / "floor" / "result.json")
+    floor_txt = (f"floor@{floor.get('offered_mib_s')}MiB/s p99={floor.get('p99_us')}µs "
+                 f"(send {floor.get('p99_send_us')}, valid={evaluate_window(floor)['valid']})") if floor else "floor=n/a"
     print(f"absolute windows: {len(windows)} total, {len(valid)} valid (need 5–8)")
+    print(f"generator latency {floor_txt} (Q5: reported, never subtracted)")
     for w in windows:
         mib_s = w['mib_s']
         mib_txt = f"{mib_s:.3f}" if isinstance(mib_s, (int, float)) else "n/a"
@@ -75,6 +95,11 @@ def main():
               f"refused_per_ip={w['refused_per_ip']} drain_to={w['drain_timed_out']} "
               f"open_after={w['open_sessions_after_drain']} max_per_ip={w.get('max_connections_per_ip')} "
               f"load={w['load1_pre']}→{w['load1_post']}")
+        cl = w.get("closed_loop") or {}
+        print(f"    offered={w.get('offered_mib_s')} achieved={mib_txt} basis={w.get('latency_basis')} "
+              f"p99_sched={w.get('p99_sched_us')} p99_send={w.get('p99_send_us')} late%={w.get('sched_late_pct')} | "
+              f"closed-loop(info) mib_s={cl.get('mib_s')} p99={cl.get('p99_us')} cpu={cl.get('client_cpu_pct_of_wall')} | "
+              f"{floor_txt}")
         if (w['transport_retry_flag'] or w['refused_per_ip'] or w['drain_timed_out']
                 or w['open_sessions_after_drain'] != 0 or w.get('setup_fail') or w.get('noisy')):
             print(f"  INVALID {w['tag']}: tx_retry={w['transport_retry_flag']} "
@@ -112,6 +137,11 @@ def main():
             reason.append("median missed §13 (≥100 MiB/s and p99<1ms)")
         if not ok_floor:
             reason.append("a window below 80 MiB/s or p99>1.5ms")
+        # inceptor Q1: gate windows must be paced (offered >= 100) with p99 from the scheduled send time.
+        for w in use:
+            off = w.get("offered_mib_s")
+            if w.get("latency_basis") != "scheduled" or not isinstance(off, (int, float)) or off < 100.0:
+                reason.append(f"{w['tag']}: not a paced gate window (offered={off}, basis={w.get('latency_basis')})")
         # hard zeros across valid windows (retries/refused/open already exclude from valid)
         for w in use:
             if w.get("transport_retry_flag"):

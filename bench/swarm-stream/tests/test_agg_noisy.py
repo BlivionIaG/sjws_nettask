@@ -16,6 +16,8 @@ def write_abs(root: Path, tag: str, **over):
         "p50_us": 100.0,
         "p90_us": 200.0,
         "mib_s": 120.0,
+        "offered_mib_s": 110.0,  # inceptor Q1: paced gate window
+        "latency_basis": "scheduled",
         "load1_pre": 0.5,
         "load1_post": 1.0,
         "self_loaded": False,

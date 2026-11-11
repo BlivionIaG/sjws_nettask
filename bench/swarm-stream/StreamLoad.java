@@ -39,8 +39,9 @@ public class StreamLoad {
     static final int SUB_BITS = 6;
     static final int SUB = 1 << SUB_BITS; // 64
     static final int BUCKETS = 64 * SUB;  // 4096
-    // #415: instance histograms so the consumer can record both the send-stamp latency (LAT, the
-    // §13 number) and the schedule-stamp latency (LAT_CO, coordinated-omission view) per chunk.
+    // #415: instance histograms so the consumer records, per chunk, both the send-stamp latency
+    // (LAT) and the scheduled-send-time latency (LAT_CO). inceptor Q1 (2026-11-11): paced gate
+    // windows report p99 from the scheduled send time, so a stalled producer cannot hide backlog.
     final ThreadLocal<long[]> TL = ThreadLocal.withInitial(() -> new long[BUCKETS]);
     final ConcurrentLinkedQueue<long[]> ALL = new ConcurrentLinkedQueue<>();
     final ThreadLocal<Boolean> REG = ThreadLocal.withInitial(() -> Boolean.FALSE);
@@ -123,9 +124,12 @@ public class StreamLoad {
       TOTAL.reset();
     }
   }
-  /** Send-stamp chunk latency (the §13 gate number, unchanged semantics). */
+  /** Send-stamp chunk latency (actual send → consumer). Reported beside the gate p99 when paced. */
   static final LatBag LAT = new LatBag();
-  /** Schedule-stamp chunk latency: only differs from LAT when --rate-mib-s paces producers. */
+  /**
+   * Scheduled-send-time chunk latency (slot → consumer). The gate p99 ({@code p99_us}) when paced
+   * (inceptor Q1). Equal to LAT in closed loop, where the slot is the send time.
+   */
   static final LatBag LAT_CO = new LatBag();
   /** #415 pacing: sends during measure, sends that started > 1 ms after their slot, worst lag. */
   static final LongAdder SCHED_SENDS = new LongAdder(), SCHED_LATE = new LongAdder();
@@ -263,9 +267,15 @@ public class StreamLoad {
     r.chunkSamples = (int) Math.min(Integer.MAX_VALUE, LAT.count());
     r.bytes = bytesRx.sum();
     r.mibS = (r.bytes / (1024.0 * 1024.0)) / Math.max(1e-6, args.secs);
-    r.p50 = LAT.pctFromBuckets(0.50); r.p90 = LAT.pctFromBuckets(0.90); r.p99 = LAT.pctFromBuckets(0.99);
-    r.p50Co = LAT_CO.pctFromBuckets(0.50); r.p90Co = LAT_CO.pctFromBuckets(0.90); r.p99Co = LAT_CO.pctFromBuckets(0.99);
-    r.latHist = LAT.sparseJson(); r.latHistCo = LAT_CO.sparseJson();
+    // inceptor Q1 (2026-11-11): paced windows gate on latency from each chunk's SCHEDULED send time;
+    // closed loop keeps the send stamp (identical there). Both are always reported side by side.
+    boolean paced = args.rateMibS > 0;
+    LatBag gateLat = paced ? LAT_CO : LAT;
+    r.latencyBasis = paced ? "scheduled" : "send";
+    r.p50 = gateLat.pctFromBuckets(0.50); r.p90 = gateLat.pctFromBuckets(0.90); r.p99 = gateLat.pctFromBuckets(0.99);
+    r.p50Send = LAT.pctFromBuckets(0.50); r.p90Send = LAT.pctFromBuckets(0.90); r.p99Send = LAT.pctFromBuckets(0.99);
+    r.p50Sched = LAT_CO.pctFromBuckets(0.50); r.p90Sched = LAT_CO.pctFromBuckets(0.90); r.p99Sched = LAT_CO.pctFromBuckets(0.99);
+    r.latHistSend = LAT.sparseJson(); r.latHistSched = LAT_CO.sparseJson();
     LAT.clearAll(); LAT_CO.clearAll();
     r.rateMibS = args.rateMibS;
     r.leanConsumer = args.leanConsumerActive();
@@ -424,8 +434,8 @@ public class StreamLoad {
         int flags = (seq == 0 ? FIRST : 0);
         byte[] frame = tokenFrameInto(lease.streamHi, lease.streamLo, lease.attempt, seq, flags, payload, frameScratch);
         frameScratch = frame;
-        writeAsciiNs(frame, FRAME_HDR + CHUNK_HDR, emitNs); // send stamp (consumer e2e, §13 number)
-        if (coStamp) writeAsciiNs(frame, FRAME_HDR + CHUNK_HDR + 20, slotNs); // schedule stamp (LAT_CO)
+        writeAsciiNs(frame, FRAME_HDR + CHUNK_HDR, emitNs); // actual send stamp (LAT)
+        if (coStamp) writeAsciiNs(frame, FRAME_HDR + CHUNK_HDR + 20, slotNs); // scheduled send time (LAT_CO, paced gate p99)
         int tries = 0;
         while (!stop.get()) {
           try {
@@ -1298,6 +1308,8 @@ public class StreamLoad {
     if (args.base == null || args.tokensFile == null || args.out == null) throw new IllegalArgumentException("need --base --tokens-file --out");
     if ("chunked".equals(args.accept)) args.accept = "binary";
     if (args.rateMibS < 0) throw new IllegalArgumentException("--rate-mib-s must be >= 0");
+    // Paced windows gate on the scheduled-send stamp at data[20..40) (inceptor Q1): it must fit.
+    if (args.rateMibS > 0 && args.chunkBytes < 40) throw new IllegalArgumentException("--rate-mib-s needs --chunk-bytes >= 40");
     if (args.groups <= 0) args.groups = args.streams; // 1:1 legacy
     if (args.groups > args.streams) args.groups = args.streams;
     String heapEnv = System.getenv("HEAP");
@@ -1321,8 +1333,9 @@ public class StreamLoad {
     boolean selfLoaded, stallFlag, generatorSaturated, transportRetryFlag, drainTimedOut;
     int genCores;
     double genSatLimitPct;
-    Double p50Co, p90Co, p99Co;
-    String latHist = "[]", latHistCo = "[]";
+    String latencyBasis = "send";
+    Double p50Send, p90Send, p99Send, p50Sched, p90Sched, p99Sched;
+    String latHistSend = "[]", latHistSched = "[]";
     double rateMibS, schedLatePct, schedLagMaxUs;
     long schedSends;
     boolean leanConsumer;
@@ -1368,7 +1381,9 @@ public class StreamLoad {
       field(sb, "sched_late_pct", schedLatePct, true);
       field(sb, "sched_lag_max_us", schedLagMaxUs, true);
       field(sb, "lean_consumer", leanConsumer, true);
-      field(sb, "p99_co_us", p99Co, true);
+      field(sb, "latency_basis", quote(latencyBasis), true);
+      field(sb, "p99_send_us", p99Send, true);
+      field(sb, "p99_sched_us", p99Sched, true);
       field(sb, "requests", requests, true);
       field(sb, "producer_transport_retries", producerTransportRetries, true);
       field(sb, "consumer_connect_retries", consumerConnectRetries, true);
@@ -1401,17 +1416,23 @@ public class StreamLoad {
         .append("},\n");
       sb.append("  \"chunk_latency\":{")
         .append("\"n\":").append(chunkSamples)
+        .append(",\"basis\":").append(quote(latencyBasis))
         .append(",\"p50_us\":").append(p50)
         .append(",\"p90_us\":").append(p90)
         .append(",\"p99_us\":").append(p99)
         .append(",\"hist_sub_bits\":").append(LatBag.SUB_BITS)
-        .append(",\"hist\":").append(latHist)
         .append("},\n");
-      sb.append("  \"chunk_latency_co\":{")
-        .append("\"p50_us\":").append(p50Co)
-        .append(",\"p90_us\":").append(p90Co)
-        .append(",\"p99_us\":").append(p99Co)
-        .append(",\"hist\":").append(latHistCo)
+      sb.append("  \"chunk_latency_send\":{")
+        .append("\"p50_us\":").append(p50Send)
+        .append(",\"p90_us\":").append(p90Send)
+        .append(",\"p99_us\":").append(p99Send)
+        .append(",\"hist\":").append(latHistSend)
+        .append("},\n");
+      sb.append("  \"chunk_latency_sched\":{")
+        .append("\"p50_us\":").append(p50Sched)
+        .append(",\"p90_us\":").append(p90Sched)
+        .append(",\"p99_us\":").append(p99Sched)
+        .append(",\"hist\":").append(latHistSched)
         .append("},\n");
       sb.append("  \"hard_zeros\":").append(mapJson(hardZeros)).append(",\n");
       sb.append("  \"counters\":").append(mapJson(counters)).append(",\n");

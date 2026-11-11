@@ -17,6 +17,15 @@ PHASE=${PHASE:-all}
 # #415: the gate drives the Java generator (drive.py saturates CPython at 1k streams; one.sh's
 # own default stays python for the small SDK checks). RATE_MIB_S / LEAN_CONSUMER pass through.
 export LOADGEN=${LOADGEN:-java}
+# inceptor Q1 (2026-11-11, gate-rule change disclosed on PR 8, Architecture sign-off pending):
+# absolute (abs-*) and A/A windows run PACED at GATE_RATE_MIB_S offered (default 110) and gate on
+# achieved >= 100 MiB/s and p99 < 1 ms, p99 measured from each chunk's SCHEDULED send time.
+# Each abs window is followed by a closed-loop info leg cl-NN (info only, never counted;
+# CLOSED_LOOP_INFO=0 skips it). Q5: one low-rate floor leg (FLOOR_RATE_MIB_S, default 10) reports
+# the generator's own latency floor next to each window; it is never subtracted.
+GATE_RATE_MIB_S=${GATE_RATE_MIB_S:-110}
+FLOOR_RATE_MIB_S=${FLOOR_RATE_MIB_S:-10}
+CLOSED_LOOP_INFO=${CLOSED_LOOP_INFO:-1}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
 # Bench lock convention (AGENTS.md / shared box):
@@ -37,11 +46,12 @@ python3 -c "import sys; sys.exit(0 if float('$LOAD_PRE') < 3.0 else 1)" || {
 }
 
 run_one() {
-  local jar=$1 arm=$2 accept=$3 credit_off=$4 tag=$5
+  # $6 = offered rate MiB/s for this leg ("" = closed loop); defaults to the caller's RATE_MIB_S.
+  local jar=$1 arm=$2 accept=$3 credit_off=$4 tag=$5 rate=${6-${RATE_MIB_S:-}}
   local wd="$OUT/$tag" load_pre rc=0 mon
   mkdir -p "$wd"
   load_pre=$(awk '{print $1}' /proc/loadavg)
-  echo "=== $tag accept=$accept credit_off=$credit_off load1_pre=$load_pre ===" | tee -a "$OUT/gate.log"
+  echo "=== $tag accept=$accept credit_off=$credit_off rate=${rate:-closed} load1_pre=$load_pre ===" | tee -a "$OUT/gate.log"
   # 07:05: recheck start gate (load1 < 3) before EVERY leg
   if ! python3 -c "import sys; sys.exit(0 if float('$load_pre') < 3.0 else 1)"; then
     echo "gate: skip $tag — load1_pre=$load_pre >= 3 (NOISY)" | tee -a "$OUT/gate.log"
@@ -53,7 +63,7 @@ run_one() {
   python3 "$HERE/foreign_cpu.py" --out "$wd/foreign_cpu.json" --allow-pid "$$" \
     --allow-pid-file "$wd/bench.pids" --interval 5 &
   mon=$!
-  CREDIT_OFF=$credit_off WARMUP=$WARMUP GATE_GROUPS=$GATE_GROUPS \
+  RATE_MIB_S=$rate CREDIT_OFF=$credit_off WARMUP=$WARMUP GATE_GROUPS=$GATE_GROUPS \
     "$HERE/one.sh" "$jar" "$wd" "$accept" "$wd/result.json" "$SECS" "$STREAMS" \
     2>&1 | tee -a "$OUT/gate.log" || rc=$?
   kill -TERM "$mon" 2>/dev/null || true
@@ -77,6 +87,11 @@ abs_valid_count() {
   echo "$valid"
 }
 
+if [ "$PHASE" = all ] || [ "$PHASE" = abs ] || [ "$PHASE" = floor ]; then
+  # Q5: generator latency floor (low offered rate, same jar/config), reported, never subtracted.
+  [ -f "$OUT/floor/result.json" ] || run_one "$HEAD_JAR" floor "$ACCEPT" 0 "floor" "$FLOOR_RATE_MIB_S" || true
+fi
+
 if [ "$PHASE" = all ] || [ "$PHASE" = abs ]; then
   valid=$(abs_valid_count)
   echo "abs resume: $valid already valid" | tee -a "$OUT/gate.log"
@@ -90,9 +105,14 @@ if [ "$PHASE" = all ] || [ "$PHASE" = abs ]; then
       echo "skip existing $tag" | tee -a "$OUT/gate.log"
       continue
     fi
-    if ! run_one "$HEAD_JAR" head "$ACCEPT" 0 "$tag"; then
+    if ! run_one "$HEAD_JAR" head "$ACCEPT" 0 "$tag" "$GATE_RATE_MIB_S"; then
       echo "window $tag: one.sh failed" | tee -a "$OUT/gate.log"
       continue
+    fi
+    # Q1: closed-loop numbers beside every window (info only; cl-* never counts as abs).
+    if [ "$CLOSED_LOOP_INFO" = 1 ]; then
+      cltag=$(printf 'cl-%02d' "$attempt")
+      [ -f "$OUT/$cltag/result.json" ] || run_one "$HEAD_JAR" info "$ACCEPT" 0 "$cltag" "" || true
     fi
     created=$((created + 1))
     ok=$(python3 "$HERE/window_valid.py" "$OUT/$tag/result.json")
@@ -106,8 +126,8 @@ if [ "$PHASE" = all ] || [ "$PHASE" = abs ]; then
 fi
 
 if [ "$PHASE" = all ] || [ "$PHASE" = aa ]; then
-  [ -f "$OUT/aa-a/result.json" ] || run_one "$HEAD_JAR" aa "$ACCEPT" 0 "aa-a" || true
-  [ -f "$OUT/aa-b/result.json" ] || run_one "$HEAD_JAR" aa "$ACCEPT" 0 "aa-b" || true
+  [ -f "$OUT/aa-a/result.json" ] || run_one "$HEAD_JAR" aa "$ACCEPT" 0 "aa-a" "$GATE_RATE_MIB_S" || true
+  [ -f "$OUT/aa-b/result.json" ] || run_one "$HEAD_JAR" aa "$ACCEPT" 0 "aa-b" "$GATE_RATE_MIB_S" || true
 fi
 
 if [ "$PHASE" = all ] || [ "$PHASE" = info ]; then

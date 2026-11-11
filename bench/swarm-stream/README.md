@@ -82,11 +82,19 @@ flag-off emits nothing). Validate a scrape with `promtool check metrics`.
   `HttpClient` consumer so the generator change can be A/B'd on its own. SSE keeps `HttpClient`.
 - **Pacing** (`RATE_MIB_S=<aggregate MiB/s>`, `--rate-mib-s`; unset = closed loop as before):
   each stream sends one chunk per `streams × chunk_bytes / rate` seconds, random phase, late slots
-  caught up (wrk2-style). The send stamp (data bytes 0–20) is unchanged and is what `p99_us`
-  reports; a schedule stamp (bytes 20–40) gives `chunk_latency_co` (coordinated-omission view).
-  `offered_mib_s`, `sched_late_pct` (sends > 1 ms behind their slot) and `sched_lag_max_us` are
-  reported. Pacing is a **rule question for inceptor/Architecture** (see `PLAN-415-414.md`);
-  validity rules are unchanged by it.
+  caught up (wrk2-style). Each chunk carries its actual send stamp (data bytes 0–20) and its
+  scheduled send time (bytes 20–40). **Paced windows report `p99_us` from the scheduled send time**
+  (`latency_basis: "scheduled"`, inceptor Q1 2026-11-11), so a stalled producer cannot hide backlog;
+  closed loop keeps the send stamp (the two are equal there). `p99_send_us` / `p99_sched_us` and
+  `chunk_latency_send` / `chunk_latency_sched` are always reported side by side, with
+  `offered_mib_s`, `sched_late_pct` (sends > 1 ms behind their slot) and `sched_lag_max_us`.
+  Validity rules are unchanged.
+- **Gate-rule change (disclosed on PR 8 / #299, Architecture sign-off pending):** `gate.sh` runs
+  abs and A/A windows paced at `GATE_RATE_MIB_S` (default 110) and `agg.py` passes only paced windows
+  (offered ≥ 100, scheduled-time p99) on achieved ≥ 100 MiB/s and p99 < 1 ms (guards unchanged).
+  Each abs window is followed by a closed-loop info leg `cl-NN` (info only; `CLOSED_LOOP_INFO=0`
+  skips it) and one `floor` leg at `FLOOR_RATE_MIB_S` (default 10) reports the generator's own
+  latency floor next to every window, never subtracted.
 - `result.json` also carries the sparse latency histogram (`chunk_latency.hist`, LatBag buckets,
   `hist_sub_bits`) so windows from several generator processes ((B) split) can be merged exactly.
 
