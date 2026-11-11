@@ -89,6 +89,21 @@ public final class EmbeddedServerControl implements ServerControl {
                 Duration.between(this.startedAt, this.clock.instant()), summary, view);
     }
 
+    /** The local node only; a stopped server or a failed snapshot reports 0 of 1 nodes. */
+    @Override
+    public MetricsView.Report metrics() {
+        var s = this.server;
+        if (s == null) {
+            return new MetricsView.Report(java.util.List.of(), 1);
+        }
+        try {
+            return new MetricsView.Report(java.util.List.of(new MetricsView.Node("local", s.metricsSnapshot())), 1);
+        } catch (IOException | RuntimeException e) {
+            this.log.add("metrics snapshot failed: " + e.getMessage());
+            return new MetricsView.Report(java.util.List.of(), 1);
+        }
+    }
+
     /**
      * Attaches the control-plane aggregate the TUI reads, and the same view on {@code /metrics}
      * when that endpoint is enabled. Null detaches both. A board attached before {@link #start}

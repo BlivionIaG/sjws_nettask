@@ -38,6 +38,14 @@ public interface ServerControl extends AutoCloseable {
         return null;
     }
 
+    /**
+     * Metrics for the Metrics view (#366): the nodes that reported and how many are known, or null
+     * when this control has none. Never throws.
+     */
+    default MetricsView.Report metrics() {
+        return null;
+    }
+
     /** Starts the server if stopped. @throws ControlException if it cannot start */
     void start() throws ControlException;
 
