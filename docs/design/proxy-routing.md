@@ -389,10 +389,19 @@ These build on the control-plane review on PR #38 (`UpstreamSet` snapshots swapp
 
 Local GCRA is done and remains the default. A cluster-wide (v2) limit is a **global** rate that
 is split across ready gateways: `share = configured_rate / ready_gateway_count` (and the same
-split for `burst`, at least 1 per node). Remainders from integer division are assigned by a
-stable hash of the node id so the shares sum to the configured totals. The share is recomputed
-when ready-gateway membership changes. **This is not implemented.** Implementation is blocked on
-a CP/HA API that publishes the share; the data plane must not invent gossip in `routing`.
+integer split for `burst`). Remainders from integer division are assigned by a stable hash of
+the node id so the shares sum to the configured totals. The share is recomputed when
+ready-gateway membership changes. **This is not implemented.** Implementation is blocked on a
+CP/HA API that publishes the share; the data plane must not invent gossip in `routing`.
+
+**Burst when there are more ready gateways than the configured burst.** The shares must sum to
+the configured burst. The earlier "at least 1 per node" floor is rejected here: with burst 1 and
+two ready gateways it would admit two requests at once and exceed the global burst. Some nodes
+therefore receive a burst share of 0. A zero-burst share means that node never admits a new
+request for that key. Today's `GcraTable` constructor rejects `burst < 1`, so the
+implementation must either accept a zero burst (treat it as "admit nothing") or apply a
+zero-admission share without constructing a GCRA table that forbids it. Rate shares may also
+be 0 when the ready count exceeds the configured rate; the same "admit nothing" rule applies.
 
 **Owners.** HA owns ready-gateway membership. The control plane owns computing the per-node
 share from that set and publishing it. The HTTP data plane (`routing.RateLimitFilter` /
