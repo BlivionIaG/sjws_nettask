@@ -115,7 +115,24 @@ else
 fi
 
 if command -v h2load >/dev/null 2>&1 && [ -n "${H2C_URL:-}" ]; then
-  h2load --h2c -n 10 -c 2 "$H2C_URL/hello.txt"
+  h2out=$(h2load --no-tls-proto=h2c -n 10 -c 2 "$H2C_URL/hello.txt" 2>&1) || {
+    printf '%s\n' "$h2out" >&2
+    echo "h2load failed" >&2
+    exit 1
+  }
+  printf '%s\n' "$h2out"
+  echo "$h2out" | grep -Eq 'requests:.*[[:space:]]10 succeeded' || {
+    echo "h2load did not report 10 succeeded" >&2
+    exit 1
+  }
+  echo "$h2out" | grep -Eq 'requests:.*, 0 failed' || {
+    echo "h2load did not report 0 failed" >&2
+    exit 1
+  }
+  echo "$h2out" | grep -Eq 'status codes:.*[[:space:]]10 2xx' || {
+    echo "h2load did not report 10 2xx" >&2
+    exit 1
+  }
   echo "h2load smoke: ok"
 else
   echo "skip h2load (not on PATH or no H2C_URL)"

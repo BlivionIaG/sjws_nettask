@@ -24,8 +24,9 @@ In scope:
   curl: HTTP/1.1 200, 404 and a byte range; curl `--http2-prior-knowledge` against
   h2c and curl `--http3-only` against the QUIC listener when curl was built with those
   features; `h2load` and a quiche or ngtcp2 client when those binaries are on `PATH`.
-  A missing optional client skips that case. A failed curl HTTP/1.1 check fails the
-  run. HTTPS on the main TCP port is still out of scope.
+  curl is required for the HTTP/1.1 smoke: a missing curl fails that case. A missing
+  optional client (`h2load`, HTTP/3 curl, quiche or ngtcp2) skips that case. A failed
+  curl HTTP/1.1 check fails the run. HTTPS on the main TCP port is still out of scope.
 
 Out of scope for the FileServing JDK-client harness (it is HTTP/1.1 only; `h2/*` and
 `h3/*` cover the in-process listeners, and `ExternalClientEndToEndTest` covers curl /
@@ -179,8 +180,8 @@ The rest of the suite:
   agent), and the coverage gate. `FileServingEndToEndTest` is part of that
   default Surefire run (it is not in the `jar` exclude).
 - The following step runs the harness on its own and fails if the `e2e` group
-  matches nothing (FileServing plus the external-client suite; optional clients
-  skip when the binary is missing):
+  matches nothing (FileServing plus the external-client suite; curl is required
+  for HTTP/1.1, and optional clients skip when the binary is missing):
 
   `mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test`
 

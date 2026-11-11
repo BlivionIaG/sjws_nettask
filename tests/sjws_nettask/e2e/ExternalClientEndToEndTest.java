@@ -30,6 +30,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
@@ -83,7 +85,7 @@ class ExternalClientEndToEndTest {
 
     @Test
     void curlHttp11ServesFileAnd404AndRange() throws Exception {
-        assumeTrue(onPath("curl"), "curl is required for the HTTP/1.1 external-client smoke");
+        assertTrue(onPath("curl"), "curl is required for the HTTP/1.1 external-client smoke");
         var ok = run(List.of("curl", "-sS", "--http1.1", "-w", "%{http_code}", h1("/hello.txt")));
         assertEquals(0, ok.exit, ok.detail());
         assertTrue(ok.stdout.endsWith("200"), ok.detail());
@@ -119,12 +121,10 @@ class ExternalClientEndToEndTest {
         assumeTrue(onPath("h2load"), "h2load (nghttp2-client) is not on PATH");
         int h2c = h2cPort();
         assumeTrue(h2c > 0, "h2c listener did not bind" + h2Hint());
-        var result = run(List.of("h2load", "--h2c", "-n", "10", "-c", "2",
+        var result = run(List.of("h2load", "--no-tls-proto=h2c", "-n", "10", "-c", "2",
                 "http://127.0.0.1:" + h2c + "/hello.txt"), CLIENT_TIMEOUT);
         assertEquals(0, result.exit, result.detail());
-        var text = (result.stdout + "\n" + result.stderr).toLowerCase(Locale.ROOT);
-        assertTrue(text.contains("2xx"), "expected 2xx statuses in h2load output:\n" + result.detail());
-        assertTrue(!text.contains("10 5xx") && !text.contains("10 4xx"), result.detail());
+        assertH2loadAllSucceeded(result, 10);
     }
 
     @Test
@@ -191,6 +191,30 @@ class ExternalClientEndToEndTest {
     private static boolean curlFeature(String feature) {
         var result = run(List.of("curl", "--version"), Duration.ofSeconds(3));
         return result.exit == 0 && result.stdout.toUpperCase(Locale.ROOT).contains(feature.toUpperCase(Locale.ROOT));
+    }
+
+    private static void assertH2loadAllSucceeded(CommandResult result, int expected) {
+        var text = result.stdout + "\n" + result.stderr;
+        Integer succeeded = h2loadRequestCount(text, "succeeded");
+        Integer failed = h2loadRequestCount(text, "failed");
+        Integer twoXx = h2loadStatusCount(text, "2xx");
+        assertTrue(succeeded != null && failed != null && twoXx != null,
+                "expected h2load requests/status summary:\n" + result.detail());
+        assertEquals(expected, succeeded, "h2load succeeded count:\n" + result.detail());
+        assertEquals(0, failed, "h2load failed count:\n" + result.detail());
+        assertEquals(expected, twoXx, "h2load 2xx count:\n" + result.detail());
+    }
+
+    private static Integer h2loadRequestCount(String text, String field) {
+        Matcher m = Pattern.compile("requests:[^\\n]*\\b(\\d+)\\s+" + Pattern.quote(field) + "\\b",
+                Pattern.CASE_INSENSITIVE).matcher(text);
+        return m.find() ? Integer.valueOf(m.group(1)) : null;
+    }
+
+    private static Integer h2loadStatusCount(String text, String category) {
+        Matcher m = Pattern.compile("status codes:[^\\n]*\\b(\\d+)\\s+" + Pattern.quote(category) + "\\b",
+                Pattern.CASE_INSENSITIVE).matcher(text);
+        return m.find() ? Integer.valueOf(m.group(1)) : null;
     }
 
     private static boolean onPath(String binary) {
