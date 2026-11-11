@@ -9,7 +9,8 @@ metrics observe wrapper, or non-static terminal is armed — and leaves it empty
 path. Gateway filters therefore see headers such as `x-api-key` and `authorization` over h2/h2c
 once a chain is live. The HTTP/1.1 ALPN fallback on the HTTP/2 TLS listener uses the same
 `attachBodies` gate (#446).
-`GatewayFilters.install(registry)` binds all six. `SjwsServer.chainControl` still does not
+`GatewayFilters.install(registry)` binds the built-in factories (`api-key`, `basic-auth`, `jwt`,
+`rate-limit`, `cors`, `request-size`, and `header-rewrite`). `SjwsServer.chainControl` still does not
 change the request path until the first successful `apply`.
 
 ```java
@@ -46,9 +47,11 @@ file is at most 64 KiB.
 
 Each `user:password` is hashed with SHA-256 when the filter is built; the raw password is not
 kept. A presented credential is hashed once and compared with every stored hash. `realm`
-defaults to `sjws` and is quoted in `WWW-Authenticate: Basic realm="..."`. A miss, a missing
-header, a non-Basic scheme, or a malformed token is 401 with that challenge. The request path
-does no I/O. A control-plane proposal must use `users-file`; inline `users` is refused with 400.
+defaults to `sjws` and is quoted in `WWW-Authenticate: Basic realm="...", charset="UTF-8"`.
+A miss, a missing header, a non-Basic scheme, or a malformed token is 401 with that
+challenge and `Cache-Control: no-store`. When more than one `Authorization` value is
+present, only the first is used. The request path does no I/O. A control-plane proposal must
+use `users-file`; inline `users` is refused with 400.
 Local config may still use inline `users` (a WARN points at the file form). Viewer reads mask
 any retained inline `users` values.
 

@@ -23,7 +23,6 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
-import java.util.Locale;
 import sjws_nettask.core.MiddlewareSpec;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestFilter;
@@ -39,7 +38,8 @@ import sjws_nettask.core.StaticFileHandler;
  * no newline), and/or {@code users-file} (the same format, read through
  * {@link sjws_nettask.config.SecureKeyFile}). Exactly one of the two is required. {@code realm}
  * is optional (default {@code sjws}). A miss is 401 with
- * {@code WWW-Authenticate: Basic realm="...", charset="UTF-8"}.
+ * {@code WWW-Authenticate: Basic realm="...", charset="UTF-8"} and
+ * {@code Cache-Control: no-store}. Only the first {@code Authorization} value is used.
  */
 public final class BasicAuthFilter implements RequestFilter {
 
@@ -78,12 +78,14 @@ public final class BasicAuthFilter implements RequestFilter {
         }
         var response = StaticFileHandler.error(401, request.headOnly());
         response.headers().set("www-authenticate", this.challenge);
+        response.headers().set("cache-control", "no-store");
         return response;
     }
 
     /**
      * @return UTF-8 {@code user:password} bytes when the request carries a well-formed Basic
-     *         credential, otherwise null (a miss, not an exception)
+     *         credential in the first {@code Authorization} value, otherwise null (a miss, not
+     *         an exception). Later {@code Authorization} values are ignored.
      */
     static byte[] authorization(Request request) {
         var values = request.headers().values("authorization");

@@ -26,9 +26,10 @@ class BasicAuthFilterTest {
     void acceptsAMatchingUserAndRejectsTheRest() {
         var filter = BasicAuthFilter.create(GatewayTestSupport.spec("basic-auth",
                 Map.of("users", "alice:secret,bob:other:with:colons")));
-        assertEquals(401, GatewayTestSupport.call(filter, new Request("GET", "/")).status());
-        assertEquals("Basic realm=\"sjws\", charset=\"UTF-8\"",
-                GatewayTestSupport.call(filter, new Request("GET", "/")).headers().get("www-authenticate"));
+        var challenge = GatewayTestSupport.call(filter, new Request("GET", "/"));
+        assertEquals(401, challenge.status());
+        assertEquals("Basic realm=\"sjws\", charset=\"UTF-8\"", challenge.headers().get("www-authenticate"));
+        assertEquals("no-store", challenge.headers().get("cache-control"));
 
         var wrong = GatewayTestSupport.call(filter, GatewayTestSupport.request("GET", "/",
                 Map.of("authorization", List.of(basic("alice", "nope")))));
@@ -125,6 +126,19 @@ class BasicAuthFilterTest {
     }
 
     @Test
+    void onlyTheFirstAuthorizationValueIsUsed() {
+        var filter = BasicAuthFilter.create(GatewayTestSupport.spec("basic-auth",
+                Map.of("users", "alice:secret")));
+        var firstGood = GatewayTestSupport.call(filter, GatewayTestSupport.request("GET", "/",
+                Map.of("authorization", List.of(basic("alice", "secret"), basic("alice", "nope")))));
+        assertEquals(200, firstGood.status());
+        var firstBad = GatewayTestSupport.call(filter, GatewayTestSupport.request("GET", "/",
+                Map.of("authorization", List.of(basic("alice", "nope"), basic("alice", "secret")))));
+        assertEquals(401, firstBad.status());
+        assertEquals("no-store", firstBad.headers().get("cache-control"));
+    }
+
+    @Test
     void factoryIsInstalled() {
         var filters = GatewayFilters.install(sjws_nettask.core.RequestFilters.create())
                 .add(GatewayTestSupport.spec("basic-auth", Map.of("users", "a:b")));
@@ -134,6 +148,7 @@ class BasicAuthFilterTest {
         var miss = filters.wrapping(GatewayTestSupport::ok).handle(new Request("GET", "/"));
         assertEquals(401, miss.status());
         assertEquals("Basic realm=\"sjws\", charset=\"UTF-8\"", miss.headers().get("www-authenticate"));
+        assertEquals("no-store", miss.headers().get("cache-control"));
     }
 
     private static String basic(String user, String password) {

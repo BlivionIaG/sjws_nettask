@@ -41,6 +41,7 @@ class BasicAuthHttp1Test {
         var miss = HttpTestSupport.get(port, "/hello.txt", 4000);
         assertEquals(401, miss.statusCode());
         assertEquals("Basic realm=\"files\", charset=\"UTF-8\"", miss.headers().get("www-authenticate"));
+        assertEquals("no-store", miss.headers().get("cache-control"));
         assertTrue(miss.bodyText().contains("401 Unauthorized"), miss.bodyText());
 
         var token = "Basic " + Base64.getEncoder()
