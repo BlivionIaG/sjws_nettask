@@ -162,6 +162,11 @@ public final class EmbeddedServerControl implements ServerControl {
                 this.server = null;
                 s.close();
             }
+            if (this.drain != op) {
+                // a hard stop already ended this operation; a late finish must not overwrite that
+                this.log.add(op.id() + ": drainer returned after stop");
+                return;
+            }
             this.drain = end;
             this.log.add(op.id() + (end.state() == DrainOperation.State.DONE ? ": drained" : ": failed: " + end.error()));
         } finally {
@@ -208,6 +213,12 @@ public final class EmbeddedServerControl implements ServerControl {
             s.close();
             this.lastError = null;
             this.log.add("stopped");
+            var running = this.drain;
+            if (running != null && running.state() == DrainOperation.State.RUNNING) {
+                // the server is closed, so the drain cannot finish anything; do not block start/reload on it
+                this.drain = running.finish(DrainOperation.State.FAILED, this.clock.instant(), "stopped during drain");
+                this.log.add(running.id() + ": failed: stopped during drain");
+            }
         } finally {
             this.lock.unlock();
         }
