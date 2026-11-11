@@ -72,9 +72,22 @@ jobs:
         run: mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test
       - name: Multi-node cluster harness (live scenarios)
         run: mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test
+      - name: wrk cache key
+        if: runner.os == 'Linux'
+        id: wrk-cache
+        run: |
+          . /etc/os-release
+          echo "key=wrk-${ID}-${VERSION_ID}-${RUNNER_ARCH}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        if: runner.os == 'Linux'
+        with:
+          path: ${{ runner.temp }}/wrk-cache
+          key: ${{ steps.wrk-cache.outputs.key }}
       - name: Install wrk
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y wrk
+        env:
+          WRK_CACHE: ${{ runner.temp }}/wrk-cache
+        run: tools/ci/install-wrk.sh
       - name: wrk standalone vs gateway-off
         if: runner.os == 'Linux'
         run: GATEWAY_BENCH_WARMUP=1s GATEWAY_BENCH_DURATION=3s tools/gateway-bench.sh
