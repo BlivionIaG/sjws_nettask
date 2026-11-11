@@ -797,6 +797,7 @@ public final class SjwsServer implements AutoCloseable {
                 dataPlane().clearLastGood();
                 return false;
             }
+            syncCredentialQueryParamsFromConfig(published.snapshot().document());
             dataPlane().applied(snapshot, false);
             var pushed = published.snapshot().document().node().maxStaleness();
             if (pushed != null) {
