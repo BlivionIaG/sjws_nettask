@@ -1013,8 +1013,9 @@ public final class SjwsServer implements AutoCloseable {
         }
         var replaced = this.live.get();
         var next = result.snapshot();
-        // Mask the incoming config's credential query names before any transport serves it.
-        syncCredentialQueryParamsFromConfig(next.document());
+        // Union of outgoing and incoming names, before any transport is armed with the new
+        // config, so a request that still enters the outgoing generation stays masked.
+        syncCredentialQueryParamsUnion(replaced.document(), next.document());
         // HTTP/2: one atomic generation = fully armed chain (filters/metrics) + attachBodies (#301
         // P1/P2a). In-flight Tasks keep the generation they captured; defer closing replaced pools
         // until those Tasks leave (P2b).
@@ -1094,6 +1095,9 @@ public final class SjwsServer implements AutoCloseable {
         } else if (this.acme != null) {
             this.acme.update(result.snapshot().document().acme());
         }
+        // The previous generation has been swapped out and can no longer start requests.
+        // Outgoing-only names can drop; incoming names stay.
+        syncCredentialQueryParamsFromConfig(next.document());
         return result;
     }
 
@@ -1440,6 +1444,17 @@ public final class SjwsServer implements AutoCloseable {
             return;
         }
         this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromMiddleware(document.middleware()));
+    }
+
+    private void syncCredentialQueryParamsUnion(sjws_nettask.config.ConfigDocument outgoing,
+            sjws_nettask.config.ConfigDocument incoming) {
+        var control = this.control;
+        if (control != null && control.isLive()) {
+            return;
+        }
+        this.slot.attachCredentialQueryParams(AccessTargetMask.union(
+                AccessTargetMask.namesFromMiddleware(outgoing.middleware()),
+                AccessTargetMask.namesFromMiddleware(incoming.middleware())));
     }
 
     /**
