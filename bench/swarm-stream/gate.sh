@@ -14,6 +14,9 @@ STREAMS=${STREAMS:-1000}
 GATE_GROUPS=${GATE_GROUPS:-64}  # Architecture 2026-10-30 15:13 / inceptor 15:14
 ACCEPT=${ACCEPT:-binary}
 PHASE=${PHASE:-all}
+# #415: the gate drives the Java generator (drive.py saturates CPython at 1k streams; one.sh's
+# own default stays python for the small SDK checks). RATE_MIB_S / LEAN_CONSUMER pass through.
+export LOADGEN=${LOADGEN:-java}
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
 # Bench lock convention (AGENTS.md / shared box):
@@ -25,7 +28,7 @@ if [ "${SKIP_FLOCK:-0}" != 1 ]; then
   exec 9>>/tmp/sjws-bench.lock
   flock 9
 fi
-echo "gate phase=$PHASE start $(date -Is) load=$(cat /proc/loadavg) streams=$STREAMS groups=$GATE_GROUPS" | tee -a "$OUT/gate.log"
+echo "gate phase=$PHASE start $(date -Is) load=$(cat /proc/loadavg) streams=$STREAMS groups=$GATE_GROUPS loadgen=$LOADGEN rate=${RATE_MIB_S:-closed} lean_consumer=${LEAN_CONSUMER:-1}" | tee -a "$OUT/gate.log"
 # 07:05 addendum: start gate load1 < 3 (also rechecked before every leg).
 LOAD_PRE=$(awk '{print $1}' /proc/loadavg)
 python3 -c "import sys; sys.exit(0 if float('$LOAD_PRE') < 3.0 else 1)" || {

@@ -41,8 +41,10 @@ if [ "${CREDIT_OFF:-0}" = 1 ]; then
   CREDIT_FLAGS=(-Dsjws.swarm.stream.credit.enabled=false)
 fi
 HEAP=${HEAP:--Xms2g -Xmx2g}
+# #414: optional extra server JVM flags (profile-414.sh passes JFR here). Empty for gate windows.
+read -r -a SERVER_JAVA_ARGS <<< "${SERVER_JAVA_OPTS:-}"
 # shellcheck disable=SC2086
-taskset -c "$SRV_CPUS" nice -n 10 java -XX:+UseZGC $HEAP \
+taskset -c "$SRV_CPUS" nice -n 10 java -XX:+UseZGC $HEAP "${SERVER_JAVA_ARGS[@]}" \
   -Dsjws.swarm.enabled=true -Dsjws.swarm.stream.enabled=true \
   "${CREDIT_FLAGS[@]}" \
   -Dsjws.swarm.pool.shards=4 -Dsjws.swarm.stream.shards=4 \
@@ -67,7 +69,14 @@ if [ "$LOADGEN" = java ]; then
   if [ "${LEAN_HTTP:-1}" = 0 ]; then LEAN_HTTP_FLAG=--no-lean-http; else LEAN_HTTP_FLAG=--lean-http; fi
   # B1: drain timeout ≥ GRACE_MS + 15s (StreamHttp.GRACE_MS=60000 → ≥75s). Do not use 40.
   DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-75}
-  taskset -c "$GEN_CPUS" nice -n 10 java "$HERE_DIR/StreamLoad.java" \
+  # #415: RATE_MIB_S>0 paces producers to an aggregate offered rate (0/unset = closed loop).
+  # LEAN_CONSUMER=0 keeps the HttpClient consumer (A/B the generator change itself).
+  GEN_EXTRA=()
+  if [ -n "${RATE_MIB_S:-}" ]; then GEN_EXTRA+=(--rate-mib-s "$RATE_MIB_S"); fi
+  if [ "${LEAN_CONSUMER:-1}" = 0 ]; then GEN_EXTRA+=(--no-lean-consumer); fi
+  # #415/#414: optional generator JVM flags (e.g. JFR on the generator to find its own hot spots).
+  read -r -a GEN_JAVA_ARGS <<< "${GEN_JAVA_OPTS:-}"
+  taskset -c "$GEN_CPUS" nice -n 10 java "${GEN_JAVA_ARGS[@]}" "$HERE_DIR/StreamLoad.java" \
     --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
     --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
     --groups "$GATE_GROUPS" \
@@ -75,7 +84,8 @@ if [ "$LOADGEN" = java ]; then
     ${LEAN_HTTP_FLAG:-} \
     --out "$OUT" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}" \
     --server-pid "$SPID" \
-    --max-connections-per-ip "${GATE_MAX_CONN_PER_IP:-4096}" &
+    --max-connections-per-ip "${GATE_MAX_CONN_PER_IP:-4096}" \
+    "${GEN_EXTRA[@]}" &
   GENPID=$!
   echo "$GENPID" >> "$WD/bench.pids"
   wait "$GENPID"

@@ -70,3 +70,26 @@ flag-off emits nothing). Validate a scrape with `promtool check metrics`.
 - `agg.py` and `gate.sh` discard NOISY legs (never counted). A/A remains mandatory in `PHASE=aa|all`.
 - On completion `gate.sh` writes `$OUT/DONE` (`DONE swarm-stream-gate <time> …`). Queue owners still
   append `DONE <item> <time> <PR comment URL>` to `/workspace/bench-queue.md`.
+
+
+## Generator slim-down and pacing (#415) / profile (#414)
+
+`gate.sh` now defaults `LOADGEN=java` (StreamLoad). Two generator changes, both harness-only:
+
+- **Lean consumer** (`LEAN_CONSUMER=1`, default; `--lean-consumer`): for binary drains the `:stream`
+  POST and the `replies` GET run on one raw keep-alive socket per consumer, de-chunked in place,
+  frames decoded from one reused buffer, stamps parsed from bytes. `LEAN_CONSUMER=0` keeps the
+  `HttpClient` consumer so the generator change can be A/B'd on its own. SSE keeps `HttpClient`.
+- **Pacing** (`RATE_MIB_S=<aggregate MiB/s>`, `--rate-mib-s`; unset = closed loop as before):
+  each stream sends one chunk per `streams × chunk_bytes / rate` seconds, random phase, late slots
+  caught up (wrk2-style). The send stamp (data bytes 0–20) is unchanged and is what `p99_us`
+  reports; a schedule stamp (bytes 20–40) gives `chunk_latency_co` (coordinated-omission view).
+  `offered_mib_s`, `sched_late_pct` (sends > 1 ms behind their slot) and `sched_lag_max_us` are
+  reported. Pacing is a **rule question for inceptor/Architecture** (see `PLAN-415-414.md`);
+  validity rules are unchanged by it.
+- `result.json` also carries the sparse latency histogram (`chunk_latency.hist`, LatBag buckets,
+  `hist_sub_bits`) so windows from several generator processes ((B) split) can be merged exactly.
+
+`profile-414.sh <jar> <out>` records JFR on the server (and the generator with `GEN_JFR=1`) for one
+1k/64 window and writes `server-attribution.md` via `jfr_top.py`. It exits 5 when the window is not
+valid: a profile from a self-loaded or NOISY window is not evidence. Never a gate window.

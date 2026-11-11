@@ -17,6 +17,7 @@ import java.util.*;
 import java.util.Locale;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.LockSupport;
 import java.util.regex.*;
 
 public class StreamLoad {
@@ -38,10 +39,12 @@ public class StreamLoad {
     static final int SUB_BITS = 6;
     static final int SUB = 1 << SUB_BITS; // 64
     static final int BUCKETS = 64 * SUB;  // 4096
-    static final ThreadLocal<long[]> TL = ThreadLocal.withInitial(() -> new long[BUCKETS]);
-    static final ConcurrentLinkedQueue<long[]> ALL = new ConcurrentLinkedQueue<>();
-    static final ThreadLocal<Boolean> REG = ThreadLocal.withInitial(() -> Boolean.FALSE);
-    static final LongAdder TOTAL = new LongAdder();
+    // #415: instance histograms so the consumer can record both the send-stamp latency (LAT, the
+    // §13 number) and the schedule-stamp latency (LAT_CO, coordinated-omission view) per chunk.
+    final ThreadLocal<long[]> TL = ThreadLocal.withInitial(() -> new long[BUCKETS]);
+    final ConcurrentLinkedQueue<long[]> ALL = new ConcurrentLinkedQueue<>();
+    final ThreadLocal<Boolean> REG = ThreadLocal.withInitial(() -> Boolean.FALSE);
+    final LongAdder TOTAL = new LongAdder();
 
     static int index(long us) {
       if (us < 1) us = 1;
@@ -72,16 +75,14 @@ public class StreamLoad {
       return base + (sub + 1.0) * width;
     }
 
-    static void add(double us) {
+    void add(double us) {
       long[] a = TL.get();
       if (!REG.get()) { ALL.add(a); REG.set(Boolean.TRUE); }
       long u = us < 1 ? 1 : (long) us;
       a[index(u)]++;
       TOTAL.increment();
     }
-    /** Unused after pctFromBuckets; kept for API compat. */
-    static List<Double> drain() { return List.of(); }
-    static double pctFromBuckets(double p) {
+    double pctFromBuckets(double p) {
       long[] sum = new long[BUCKETS];
       long n = 0;
       for (long[] a : ALL) {
@@ -97,17 +98,39 @@ public class StreamLoad {
       }
       return upper(BUCKETS - 1);
     }
-    static long count() {
+    long count() {
       long n = 0;
       for (long[] a : ALL) for (long c : a) n += c;
       return n;
     }
-    static void clearAll() {
+    /** Sparse [[bucket, count], ...] JSON so several generator processes can be merged ((B) split). */
+    String sparseJson() {
+      long[] sum = new long[BUCKETS];
+      for (long[] a : ALL) for (int i = 0; i < BUCKETS; i++) sum[i] += a[i];
+      StringBuilder sb = new StringBuilder("[");
+      boolean first = true;
+      for (int i = 0; i < BUCKETS; i++) {
+        if (sum[i] == 0) continue;
+        if (!first) sb.append(',');
+        first = false;
+        sb.append('[').append(i).append(',').append(sum[i]).append(']');
+      }
+      return sb.append(']').toString();
+    }
+    void clearAll() {
       for (long[] a : ALL) Arrays.fill(a, 0);
       ALL.clear();
       TOTAL.reset();
     }
   }
+  /** Send-stamp chunk latency (the §13 gate number, unchanged semantics). */
+  static final LatBag LAT = new LatBag();
+  /** Schedule-stamp chunk latency: only differs from LAT when --rate-mib-s paces producers. */
+  static final LatBag LAT_CO = new LatBag();
+  /** #415 pacing: sends during measure, sends that started > 1 ms after their slot, worst lag. */
+  static final LongAdder SCHED_SENDS = new LongAdder(), SCHED_LATE = new LongAdder();
+  static final LongAccumulator SCHED_LAG_MAX_NS = new LongAccumulator(Long::max, 0L);
+  static final long LATE_NS = 1_000_000L;
 
   static final class Args {
     String base, tokensFile, out, accept = "binary";
@@ -127,6 +150,16 @@ public class StreamLoad {
     double genSatPct = 0;
     /** Lean keep-alive Socket POST for :chunk (harness-only; claim/stream still HttpClient). */
     boolean leanHttp = true;
+    /**
+     * #415: aggregate offered rate in MiB/s. 0 = closed loop (legacy: every stream POSTs as fast as
+     * its round trip allows). > 0 = each stream sends on a fixed schedule of
+     * streams × chunkBytes / rate seconds per chunk (wrk2-style: late slots are caught up, never
+     * dropped, so LAT_CO keeps the backlog).
+     */
+    double rateMibS = 0;
+    /** #415: raw-socket :stream + replies GET for binary drains (HttpClient off the hot path). */
+    boolean leanConsumer = true;
+    boolean leanConsumerActive() { return leanHttp && leanConsumer && "binary".equals(accept); }
   }
 
   public static void main(String[] a) throws Exception {
@@ -147,7 +180,7 @@ public class StreamLoad {
 
     LongAdder bytesRx = new LongAdder();
     ConcurrentLinkedQueue<Double> creditWaits = new ConcurrentLinkedQueue<>();
-    LatBag.clearAll();
+    LAT.clearAll(); LAT_CO.clearAll();
     ConcurrentLinkedQueue<String> measureErr = new ConcurrentLinkedQueue<>();
     ConcurrentLinkedQueue<String> teardownErr = new ConcurrentLinkedQueue<>();
     AtomicBoolean producersStop = new AtomicBoolean();
@@ -164,7 +197,8 @@ public class StreamLoad {
     wave(http, args, tokens, Math.min(32, args.streams), args.warmup, "w",
         producersStop, consumersStop, inTeardown, measureActive, bytesRx, creditWaits,
         measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries, groupOpenRefusals);
-    bytesRx.reset(); LatBag.clearAll(); creditWaits.clear(); measureErr.clear(); teardownErr.clear();
+    bytesRx.reset(); LAT.clearAll(); LAT_CO.clearAll(); creditWaits.clear();
+    SCHED_SENDS.reset(); SCHED_LATE.reset(); SCHED_LAG_MAX_NS.reset(); measureErr.clear(); teardownErr.clear();
     requests.set(0); credit429.set(0);
     producerTransportRetries.set(0); consumerConnectRetries.set(0);
 
@@ -226,11 +260,19 @@ public class StreamLoad {
     r.generatorSaturated = genSat;
     r.genCores = args.genCores;
     r.genSatLimitPct = satLim;
-    r.chunkSamples = (int) Math.min(Integer.MAX_VALUE, LatBag.count());
+    r.chunkSamples = (int) Math.min(Integer.MAX_VALUE, LAT.count());
     r.bytes = bytesRx.sum();
     r.mibS = (r.bytes / (1024.0 * 1024.0)) / Math.max(1e-6, args.secs);
-    r.p50 = LatBag.pctFromBuckets(0.50); r.p90 = LatBag.pctFromBuckets(0.90); r.p99 = LatBag.pctFromBuckets(0.99);
-    LatBag.clearAll();
+    r.p50 = LAT.pctFromBuckets(0.50); r.p90 = LAT.pctFromBuckets(0.90); r.p99 = LAT.pctFromBuckets(0.99);
+    r.p50Co = LAT_CO.pctFromBuckets(0.50); r.p90Co = LAT_CO.pctFromBuckets(0.90); r.p99Co = LAT_CO.pctFromBuckets(0.99);
+    r.latHist = LAT.sparseJson(); r.latHistCo = LAT_CO.sparseJson();
+    LAT.clearAll(); LAT_CO.clearAll();
+    r.rateMibS = args.rateMibS;
+    r.leanConsumer = args.leanConsumerActive();
+    long ss = SCHED_SENDS.sum();
+    r.schedSends = ss;
+    r.schedLatePct = ss == 0 ? 0 : 100.0 * SCHED_LATE.sum() / ss;
+    r.schedLagMaxUs = SCHED_LAG_MAX_NS.get() / 1e3;
     List<Double> cw = new ArrayList<>(creditWaits); Collections.sort(cw);
     r.creditWaitN = cw.size(); r.creditWaitTotal = cw.stream().mapToDouble(d->d).sum();
     r.creditWaitP50 = pct(cw, 0.50); r.creditWaitP99 = pct(cw, 0.99);
@@ -289,7 +331,7 @@ public class StreamLoad {
       }));
       if (i % 8 == 0) Thread.sleep(20); // slower admit ramp at 1k (was 10ms/32)
       threads.add(Thread.startVirtualThread(() -> {
-        try { producer(http, args, tok, pool, producersStop, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries, groupOpenRefusals); }
+        try { producer(http, args, tok, pool, producersStop, inTeardown, measureActive, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries, groupOpenRefusals); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "producer " + pool, e); }
       }));
     }
@@ -310,7 +352,8 @@ public class StreamLoad {
   }
 
   static void producer(HttpClient http, Args args, String token, String pool,
-      AtomicBoolean stop, AtomicBoolean inTeardown, ConcurrentLinkedQueue<Double> creditWaits,
+      AtomicBoolean stop, AtomicBoolean inTeardown, AtomicBoolean measureActive,
+      ConcurrentLinkedQueue<Double> creditWaits,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong requests, AtomicLong credit429, AtomicLong producerTransportRetries,
       AtomicLong groupOpenRefusals) throws Exception {
@@ -331,7 +374,8 @@ public class StreamLoad {
     int pad = args.chunkBytes - 20;
     if (pad < 0) throw new IllegalArgumentException("chunk-bytes");
     // Sync one-POST-at-a-time per stream (f9215f7). Match SDK #261 Q9 on 429.
-    // Pad is zero-filled once; single nanoTime stamp into the payload (was double-write).
+    // Pad is zero-filled once; the frame carries the send stamp at data[0..20) and (#415) the
+    // schedule stamp at data[20..40) (equal to the send stamp when unpaced).
     byte[] payload = new byte[args.chunkBytes]; // zeros = pad
     byte[] frameScratch = null; // reused after first tokenFrame size known
     int mode = 0; // 0=unknown slow-start, 1=credit, 2=none (204)
@@ -339,8 +383,16 @@ public class StreamLoad {
     int zeroTries = 0;
     java.util.concurrent.ThreadLocalRandom rnd = java.util.concurrent.ThreadLocalRandom.current();
     LeanHttp lean = null;
+    byte[] dataHdr = null; // #415: request head for data frames, built once per stream (fixed length)
+    // #415 pacing: per-stream slot = streams × chunkBytes / rate; random phase so 1k streams do not
+    // fire in lockstep. Slots are never skipped: a late stream catches up (one sync POST at a time).
+    final long intervalNs = args.rateMibS > 0
+        ? Math.max(1L, (long) (args.streams * (double) args.chunkBytes * 1e9 / (args.rateMibS * 1048576.0)))
+        : 0L;
+    long nextNs = intervalNs > 0 ? System.nanoTime() + rnd.nextLong(intervalNs) : 0L;
+    final boolean coStamp = args.chunkBytes >= 40; // second 20-digit stamp fits in the payload
     try {
-      if (args.leanHttp) lean = new LeanHttp(URI.create(args.base));
+      if (args.leanHttp) lean = new LeanHttp(URI.create(args.base), 60_000);
       while (!stop.get()) {
         if (mode == 1 && creditChunks < 1) {
           double wait = creditBackoffS(zeroTries++, 1.0, rnd);
@@ -348,12 +400,32 @@ public class StreamLoad {
           Thread.sleep((long) Math.max(1, wait * 1000));
           if (stop.get()) break;
         }
+        long slotNs;
+        if (intervalNs > 0) {
+          long now = System.nanoTime();
+          while (now < nextNs && !stop.get()) {
+            LockSupport.parkNanos(nextNs - now);
+            now = System.nanoTime();
+          }
+          if (stop.get()) break;
+          slotNs = nextNs;
+          nextNs += intervalNs;
+          if (measureActive.get()) {
+            long lag = now - slotNs;
+            SCHED_SENDS.increment();
+            if (lag > LATE_NS) SCHED_LATE.increment();
+            SCHED_LAG_MAX_NS.accumulate(lag);
+          }
+        } else {
+          slotNs = -1;
+        }
         long emitNs = System.nanoTime();
-        writeAsciiNs(payload, 0, emitNs);
+        if (slotNs < 0) slotNs = emitNs; // closed loop: schedule stamp == send stamp
         int flags = (seq == 0 ? FIRST : 0);
         byte[] frame = tokenFrameInto(lease.streamHi, lease.streamLo, lease.attempt, seq, flags, payload, frameScratch);
         frameScratch = frame;
-        writeAsciiNs(frame, FRAME_HDR + CHUNK_HDR, emitNs); // same stamp (consumer e2e)
+        writeAsciiNs(frame, FRAME_HDR + CHUNK_HDR, emitNs); // send stamp (consumer e2e, §13 number)
+        if (coStamp) writeAsciiNs(frame, FRAME_HDR + CHUNK_HDR + 20, slotNs); // schedule stamp (LAT_CO)
         int tries = 0;
         while (!stop.get()) {
           try {
@@ -361,7 +433,8 @@ public class StreamLoad {
             byte[] body;
             String raHdr = null;
             if (lean != null) {
-              LeanResp lr = lean.post(path, token, frame);
+              if (dataHdr == null) dataHdr = lean.head("POST", path, token, CT, null, frame.length);
+              LeanResp lr = lean.post(dataHdr, frame);
               sc = lr.status; body = lr.body; raHdr = lr.retryAfter;
               if (lr.recoveredAttempts > 0 && !inTeardown.get())
                 producerTransportRetries.addAndGet(lr.recoveredAttempts);
@@ -517,6 +590,46 @@ public class StreamLoad {
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
     Exception last = null;
     for (int attempt = 0; attempt < 3 && !stop.get(); attempt++) {
+      if (args.leanConsumerActive()) {
+        // #415: :stream POST and the replies GET on one raw keep-alive socket; frames are decoded
+        // from a reused buffer (no HttpClient selector hop, no per-frame byte[] or String).
+        LeanHttp lh = null;
+        try {
+          lh = new LeanHttp(URI.create(args.base), 200_000);
+          String spath = "/swarm/v1/tasks/" + enc(pool) + ":stream?deadlineMs=180000";
+          LeanResp sr = lh.postOnce(lh.head("POST", spath, token, CT, CT, task.length), task);
+          if (sr.status == 503) {
+            groupOpenRefusals.incrementAndGet();
+            note(inTeardown, measureErr, teardownErr, "consumer-stream-refused " + pool, new IOException("stream 503"));
+            return;
+          }
+          if (sr.status != 201 && sr.status != 200) throw new IOException("stream " + sr.status);
+          String loc = sr.location;
+          if (loc == null) {
+            Frame f = decodeFrame(ByteBuffer.wrap(sr.body));
+            loc = "/swarm/v1/replies/" + hex(f.payload);
+          }
+          if (loc.startsWith("http")) {
+            URI u = URI.create(loc);
+            loc = u.getRawPath() + (u.getRawQuery() == null ? "" : "?" + u.getRawQuery());
+          }
+          int gsc = lh.startGet(lh.head("GET", loc, token, null, CT, -1));
+          if (gsc != 200) throw new IOException("replies " + gsc);
+          readBinaryLean(lh.bodyStream(), stop, measureActive, bytesRx);
+          return;
+        } catch (Exception e) {
+          last = e;
+          if (!inTeardown.get()) consumerConnectRetries.incrementAndGet();
+          if (attempt < 2 && !stop.get()) {
+            try { Thread.sleep(20L << attempt); } catch (InterruptedException ie) {
+              Thread.currentThread().interrupt(); throw ie;
+            }
+          }
+          continue;
+        } finally {
+          if (lh != null) lh.close();
+        }
+      }
       try {
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(args.base + "/swarm/v1/tasks/" + enc(pool) + ":stream?deadlineMs=180000"))
             .timeout(Duration.ofSeconds(200))
@@ -597,13 +710,56 @@ public class StreamLoad {
         try {
           long emit = Long.parseLong(new String(payload, CHUNK_HDR, 20, StandardCharsets.US_ASCII));
           if (measureActive.get()) {
-            LatBag.add((recv - emit) / 1e3);
+            LAT.add((recv - emit) / 1e3);
+            long slot = payload.length >= CHUNK_HDR + 40 ? asciiLong(payload, CHUNK_HDR + 20) : -1;
+            LAT_CO.add((recv - (slot > 0 ? slot : emit)) / 1e3);
             bytesRx.add(payload.length - CHUNK_HDR);
           }
         } catch (NumberFormatException ignored) {}
       }
       if ((payload[CHUNK_HDR - 1] & LAST) != 0 || (flags & LAST) != 0) break;
     }
+  }
+
+  /**
+   * #415 binary drain over {@link LeanHttp#bodyStream()}: one reused payload buffer, stamps parsed
+   * from bytes. Same accounting as {@link #readBinary} (bytes = chunk data, latency in µs).
+   */
+  static void readBinaryLean(InputStream in, AtomicBoolean stop, AtomicBoolean measureActive, LongAdder bytesRx) throws IOException {
+    byte[] hdr = new byte[FRAME_HDR];
+    byte[] buf = new byte[4096];
+    while (!stop.get()) {
+      if (!readFully(in, hdr, hdr.length)) break;
+      int type = hdr[1] & 0xff, flags = hdr[2] & 0xff;
+      int len = ((hdr[3] & 0xff) << 16) | ((hdr[4] & 0xff) << 8) | (hdr[5] & 0xff);
+      if (len > buf.length) buf = new byte[Math.max(len, buf.length * 2)];
+      if (!readFully(in, buf, len)) break;
+      if (type != TYPE_TOKEN) continue;
+      if (len < CHUNK_HDR + 20) {
+        if ((flags & LAST) != 0) break;
+        continue;
+      }
+      long recv = System.nanoTime();
+      long emit = asciiLong(buf, CHUNK_HDR);
+      if (emit > 0 && measureActive.get()) {
+        LAT.add((recv - emit) / 1e3);
+        long slot = len >= CHUNK_HDR + 40 ? asciiLong(buf, CHUNK_HDR + 20) : -1;
+        LAT_CO.add((recv - (slot > 0 ? slot : emit)) / 1e3);
+        bytesRx.add(len - CHUNK_HDR);
+      }
+      if ((buf[CHUNK_HDR - 1] & LAST) != 0 || (flags & LAST) != 0) break;
+    }
+  }
+
+  /** 20 ASCII digits at {@code off} (as written by {@link #writeAsciiNs}); -1 if any is not a digit. */
+  static long asciiLong(byte[] b, int off) {
+    long v = 0;
+    for (int i = 0; i < 20; i++) {
+      int d = b[off + i] - '0';
+      if (d < 0 || d > 9) return -1;
+      v = v * 10 + d;
+    }
+    return v;
   }
 
   static void readSse(InputStream in, AtomicBoolean stop, AtomicBoolean measureActive, LongAdder bytesRx) throws IOException {
@@ -621,7 +777,12 @@ public class StreamLoad {
               long emit = Long.parseLong(d.substring(0, 20).trim());
               long recv = System.nanoTime();
               if (measureActive.get()) {
-                LatBag.add((recv - emit) / 1e3);
+                LAT.add((recv - emit) / 1e3);
+                long slot = -1;
+                if (d.length() >= 40) {
+                  try { slot = Long.parseLong(d.substring(20, 40).trim()); } catch (NumberFormatException ignored) {}
+                }
+                LAT_CO.add((recv - (slot > 0 ? slot : emit)) / 1e3);
                 bytesRx.add(d.length());
               }
             } catch (NumberFormatException ignored) {}
@@ -730,9 +891,12 @@ public class StreamLoad {
   }
 
   static boolean readFully(InputStream in, byte[] buf) throws IOException {
+    return readFully(in, buf, buf.length);
+  }
+  static boolean readFully(InputStream in, byte[] buf, int len) throws IOException {
     int o = 0;
-    while (o < buf.length) {
-      int n = in.read(buf, o, buf.length - o);
+    while (o < len) {
+      int n = in.read(buf, o, len - o);
       if (n < 0) return false;
       o += n;
     }
@@ -784,33 +948,46 @@ public class StreamLoad {
   }
 
   /**
-   * Harness-only keep-alive HTTP/1.1 POST (inceptor 2026-10-30 18:46 (A)).
-   * One Socket per producer VT; claim/stream/GET still use java.net.http.HttpClient.
+   * Harness-only keep-alive HTTP/1.1 client (inceptor 2026-10-30 18:46 (A); #415 slim-down).
+   * One Socket per producer VT and (with --lean-consumer) one per consumer VT; only claim and the
+   * /metrics scrape still use java.net.http.HttpClient. #415: request heads are built once per
+   * stream ({@link #head}) and responses are parsed from bytes (no per-request String split,
+   * lower-casing or header map).
    */
   static final class LeanHttp implements AutoCloseable {
+    static final byte[] H_CONTENT_LENGTH = "content-length".getBytes(StandardCharsets.US_ASCII);
+    static final byte[] H_TRANSFER_ENCODING = "transfer-encoding".getBytes(StandardCharsets.US_ASCII);
+    static final byte[] H_RETRY_AFTER = "retry-after".getBytes(StandardCharsets.US_ASCII);
+    static final byte[] H_LOCATION = "location".getBytes(StandardCharsets.US_ASCII);
+    static final byte[] V_CHUNKED = "chunked".getBytes(StandardCharsets.US_ASCII);
     final String host;
     final int port;
+    final int soTimeoutMs;
     Socket sock;
     OutputStream out;
     InputStream in;
-    final byte[] hdrScratch = new byte[512];
-    final ByteArrayOutputStream respBuf = new ByteArrayOutputStream(256);
+    byte[] line = new byte[512];
+    int lineLen;
+    /** Set by {@link #startGet}: body framing of the streaming response. */
+    boolean bodyChunked;
+    long bodyLength = -1;
 
-    LeanHttp(URI base) throws IOException {
+    LeanHttp(URI base, int soTimeoutMs) throws IOException {
       this.host = base.getHost();
       int p = base.getPort();
       this.port = p > 0 ? p : ("https".equalsIgnoreCase(base.getScheme()) ? 443 : 80);
+      this.soTimeoutMs = soTimeoutMs;
       reconnect();
     }
     void reconnect() throws IOException {
       closeQuiet();
       sock = new Socket();
       sock.setTcpNoDelay(true);
-      sock.setSoTimeout(60_000);
+      sock.setSoTimeout(soTimeoutMs);
       sock.connect(new InetSocketAddress(host, port), 10_000);
       // Buffered I/O: byte-at-a-time readLine was saturating gen CPUs at N=16.
       out = new BufferedOutputStream(sock.getOutputStream(), 8192);
-      in = new BufferedInputStream(sock.getInputStream(), 8192);
+      in = new BufferedInputStream(sock.getInputStream(), 16384);
     }
     void closeQuiet() {
       try { if (sock != null) sock.close(); } catch (IOException ignored) {}
@@ -818,100 +995,262 @@ public class StreamLoad {
     }
     @Override public void close() { closeQuiet(); }
 
-    /** POST path with body; returns status + body. Auth bearer + CT fixed. */
+    /** Request head (request line + headers + blank line). {@code contentLength < 0}: no body. */
+    byte[] head(String method, String path, String token, String contentType, String accept, int contentLength) {
+      StringBuilder sb = new StringBuilder(256);
+      sb.append(method).append(' ').append(path).append(" HTTP/1.1\r\n")
+        .append("Host: ").append(host).append(':').append(port).append("\r\n")
+        .append("Authorization: Bearer ").append(token).append("\r\n");
+      if (contentType != null) sb.append("Content-Type: ").append(contentType).append("\r\n");
+      if (accept != null) sb.append("Accept: ").append(accept).append("\r\n");
+      if (contentLength >= 0) sb.append("Content-Length: ").append(contentLength).append("\r\n");
+      sb.append("Connection: keep-alive\r\n\r\n");
+      return sb.toString().getBytes(StandardCharsets.US_ASCII);
+    }
+
+    /** Legacy entry (LAST frame): builds the head per call. */
     LeanResp post(String path, String token, byte[] body) throws IOException {
+      return post(head("POST", path, token, CT, null, body.length), body);
+    }
+
+    /**
+     * POST with a prebuilt head; one reconnect-and-resend on IOException (counted in
+     * recoveredAttempts, Codex P2 #459). Only for :chunk, whose retry the server dedups (#248 r5 C2).
+     */
+    LeanResp post(byte[] head, byte[] body) throws IOException {
       int recovered = 0;
       for (int attempt = 0; attempt < 2; attempt++) {
         try {
           if (sock == null || sock.isClosed() || !sock.isConnected()) reconnect();
-          // Request (ASCII, no StringBuilder alloc beyond header once-ish)
-          byte[] h = ("POST " + path + " HTTP/1.1\r\n"
-              + "Host: " + host + ":" + port + "\r\n"
-              + "Authorization: Bearer " + token + "\r\n"
-              + "Content-Type: " + CT + "\r\n"
-              + "Content-Length: " + body.length + "\r\n"
-              + "Connection: keep-alive\r\n\r\n").getBytes(StandardCharsets.US_ASCII);
-          out.write(h);
+          out.write(head);
           out.write(body);
           out.flush();
-          LeanResp r = readResponse();
-          return recovered == 0 ? r : new LeanResp(r.status, r.body, r.retryAfter, recovered);
+          LeanResp r = readResponse(true);
+          return recovered == 0 ? r : new LeanResp(r.status, r.body, r.retryAfter, r.location, recovered);
         } catch (IOException e) {
           closeQuiet();
           if (attempt == 1) throw e;
-          recovered++; // failed attempt recovered by reconnect (Codex P2 #459)
+          recovered++;
         }
       }
       throw new IOException("lean post failed");
     }
 
-    LeanResp readResponse() throws IOException {
-      // Status line
-      String statusLine = readLine();
-      if (statusLine == null || statusLine.isEmpty()) throw new EOFException("empty status");
-      String[] sp = statusLine.split(" ", 3);
-      int sc = Integer.parseInt(sp[1]);
-      // Headers
+    /** One POST, no resend: for :stream, where a resend could open a second session. */
+    LeanResp postOnce(byte[] head, byte[] body) throws IOException {
+      if (sock == null || sock.isClosed() || !sock.isConnected()) reconnect();
+      out.write(head);
+      out.write(body);
+      out.flush();
+      return readResponse(true);
+    }
+
+    /** Send a GET head and read status + headers only; the body is then read via {@link #bodyStream}. */
+    int startGet(byte[] head) throws IOException {
+      if (sock == null || sock.isClosed() || !sock.isConnected()) reconnect();
+      out.write(head);
+      out.flush();
+      LeanResp r = readResponse(false);
+      return r.status;
+    }
+
+    /** Body of the response opened by {@link #startGet}: de-chunked, length-bounded, or until EOF. */
+    InputStream bodyStream() {
+      if (bodyChunked) return new ChunkedIn(this);
+      if (bodyLength >= 0) return new BoundedIn(in, bodyLength);
+      return in;
+    }
+
+    /** Parse status line and headers; when {@code readBody}, also the (small) body. */
+    LeanResp readResponse(boolean readBody) throws IOException {
+      if (!readLine()) throw new EOFException("empty status");
+      int sc = parseStatus();
       long contentLen = -1;
       boolean chunked = false;
-      String retryAfter = null;
+      String retryAfter = null, location = null;
       while (true) {
-        String line = readLine();
-        if (line == null) throw new EOFException("headers");
-        if (line.isEmpty()) break;
-        int c = line.indexOf(':');
+        if (!readLine()) throw new EOFException("headers");
+        if (lineLen == 0) break;
+        int c = indexOf((byte) ':');
         if (c < 0) continue;
-        String k = line.substring(0, c).trim().toLowerCase(Locale.ROOT);
-        String v = line.substring(c + 1).trim();
-        if (k.equals("content-length")) contentLen = Long.parseLong(v);
-        else if (k.equals("transfer-encoding") && v.toLowerCase(Locale.ROOT).contains("chunked")) chunked = true;
-        else if (k.equals("retry-after")) retryAfter = v;
+        int vs = c + 1, ve = lineLen;
+        while (vs < ve && (line[vs] == ' ' || line[vs] == '\t')) vs++;
+        while (ve > vs && (line[ve - 1] == ' ' || line[ve - 1] == '\t')) ve--;
+        if (nameIs(c, H_CONTENT_LENGTH)) contentLen = parseLong(vs, ve);
+        else if (nameIs(c, H_TRANSFER_ENCODING)) chunked = containsIgnoreCase(vs, ve, V_CHUNKED);
+        else if (nameIs(c, H_RETRY_AFTER)) retryAfter = new String(line, vs, ve - vs, StandardCharsets.US_ASCII);
+        else if (nameIs(c, H_LOCATION)) location = new String(line, vs, ve - vs, StandardCharsets.US_ASCII);
       }
+      bodyChunked = chunked;
+      bodyLength = contentLen;
+      if (!readBody) return new LeanResp(sc, null, retryAfter, location, 0);
       byte[] body;
-      if (chunked) body = readChunked();
-      else if (contentLen >= 0) {
+      if (chunked) body = readChunkedBody();
+      else if (contentLen > 0) {
         body = in.readNBytes((int) contentLen);
         if (body.length != contentLen) throw new EOFException("short body");
       } else {
-        body = new byte[0]; // 204 etc.
+        body = EMPTY; // 204, or Content-Length: 0
       }
-      return new LeanResp(sc, body, retryAfter);
+      return new LeanResp(sc, body, retryAfter, location, 0);
     }
+    static final byte[] EMPTY = new byte[0];
 
-    String readLine() throws IOException {
-      respBuf.reset();
+    /** Next CRLF- (or LF-) terminated line into {@link #line}; false on EOF before any byte. */
+    boolean readLine() throws IOException {
+      lineLen = 0;
       int b;
+      boolean any = false;
       while ((b = in.read()) >= 0) {
+        any = true;
         if (b == '\n') break;
-        if (b != '\r') respBuf.write(b);
+        if (b == '\r') continue;
+        if (lineLen == line.length) line = Arrays.copyOf(line, line.length * 2);
+        line[lineLen++] = (byte) b;
       }
-      if (b < 0 && respBuf.size() == 0) return null;
-      return respBuf.toString(StandardCharsets.US_ASCII);
+      return any;
     }
-
-    byte[] readChunked() throws IOException {
+    int parseStatus() throws IOException {
+      // "HTTP/1.1 200 OK": three digits after the first space
+      int sp = indexOf((byte) ' ');
+      if (sp < 0 || sp + 4 > lineLen) throw new IOException("bad status line");
+      int v = 0;
+      for (int i = sp + 1; i < sp + 4; i++) {
+        int d = line[i] - '0';
+        if (d < 0 || d > 9) throw new IOException("bad status code");
+        v = v * 10 + d;
+      }
+      return v;
+    }
+    int indexOf(byte x) {
+      for (int i = 0; i < lineLen; i++) if (line[i] == x) return i;
+      return -1;
+    }
+    boolean nameIs(int nameEnd, byte[] lowerName) {
+      int e = nameEnd;
+      while (e > 0 && (line[e - 1] == ' ' || line[e - 1] == '\t')) e--;
+      if (e != lowerName.length) return false;
+      for (int i = 0; i < e; i++) {
+        int ch = line[i];
+        if (ch >= 'A' && ch <= 'Z') ch += 32;
+        if (ch != lowerName[i]) return false;
+      }
+      return true;
+    }
+    boolean containsIgnoreCase(int s, int e, byte[] lowerNeedle) {
+      outer:
+      for (int i = s; i + lowerNeedle.length <= e; i++) {
+        for (int j = 0; j < lowerNeedle.length; j++) {
+          int ch = line[i + j];
+          if (ch >= 'A' && ch <= 'Z') ch += 32;
+          if (ch != lowerNeedle[j]) continue outer;
+        }
+        return true;
+      }
+      return false;
+    }
+    long parseLong(int s, int e) throws IOException {
+      if (s >= e) throw new IOException("empty number");
+      long v = 0;
+      for (int i = s; i < e; i++) {
+        int d = line[i] - '0';
+        if (d < 0 || d > 9) throw new IOException("bad number");
+        v = v * 10 + d;
+      }
+      return v;
+    }
+    /** Chunk-size line (hex, optional ;ext); -1 on EOF. */
+    int readChunkSize() throws IOException {
+      if (!readLine()) return -1;
+      int e = indexOf((byte) ';');
+      if (e < 0) e = lineLen;
+      while (e > 0 && (line[e - 1] == ' ' || line[e - 1] == '\t')) e--;
+      if (e == 0) throw new IOException("empty chunk size");
+      int v = 0;
+      for (int i = 0; i < e; i++) {
+        int ch = line[i], d;
+        if (ch >= '0' && ch <= '9') d = ch - '0';
+        else if (ch >= 'a' && ch <= 'f') d = ch - 'a' + 10;
+        else if (ch >= 'A' && ch <= 'F') d = ch - 'A' + 10;
+        else throw new IOException("bad chunk size");
+        if (v > (Integer.MAX_VALUE >> 4)) throw new IOException("chunk too large");
+        v = (v << 4) | d;
+      }
+      return v;
+    }
+    void skipTrailers() throws IOException {
+      while (readLine() && lineLen > 0) { /* trailer field */ }
+    }
+    void expectCrlf() throws IOException {
+      if (in.read() != '\r' || in.read() != '\n') throw new IOException("bad chunk crlf");
+    }
+    byte[] readChunkedBody() throws IOException {
       ByteArrayOutputStream all = new ByteArrayOutputStream();
       while (true) {
-        String szLine = readLine();
-        if (szLine == null) throw new EOFException("chunk size");
-        int semi = szLine.indexOf(';');
-        String hex = (semi >= 0 ? szLine.substring(0, semi) : szLine).trim();
-        int n = Integer.parseInt(hex, 16);
-        if (n == 0) {
-          // trailers
-          while (true) {
-            String t = readLine();
-            if (t == null || t.isEmpty()) break;
-          }
-          break;
-        }
+        int n = readChunkSize();
+        if (n < 0) throw new EOFException("chunk size");
+        if (n == 0) { skipTrailers(); break; }
         byte[] chunk = in.readNBytes(n);
         if (chunk.length != n) throw new EOFException("short chunk");
         all.write(chunk);
-        // CRLF after chunk
-        if (in.read() != '\r' || in.read() != '\n') throw new IOException("bad chunk crlf");
+        expectCrlf();
       }
       return all.toByteArray();
+    }
+  }
+
+  /** De-chunking view over a {@link LeanHttp} connection (no copies beyond the caller's buffer). */
+  static final class ChunkedIn extends InputStream {
+    final LeanHttp h;
+    int left; // bytes left in the current chunk
+    boolean eof;
+    ChunkedIn(LeanHttp h) { this.h = h; }
+    boolean ensure() throws IOException {
+      if (eof) return false;
+      if (left > 0) return true;
+      int n = h.readChunkSize();
+      if (n <= 0) {
+        if (n == 0) h.skipTrailers();
+        eof = true;
+        return false;
+      }
+      left = n;
+      return true;
+    }
+    @Override public int read() throws IOException {
+      if (!ensure()) return -1;
+      int b = h.in.read();
+      if (b < 0) { eof = true; return -1; }
+      if (--left == 0) h.expectCrlf();
+      return b;
+    }
+    @Override public int read(byte[] b, int off, int len) throws IOException {
+      if (len == 0) return 0;
+      if (!ensure()) return -1;
+      int n = h.in.read(b, off, Math.min(len, left));
+      if (n < 0) { eof = true; return -1; }
+      left -= n;
+      if (left == 0) h.expectCrlf();
+      return n;
+    }
+  }
+
+  /** Content-Length-bounded view. */
+  static final class BoundedIn extends InputStream {
+    final InputStream in;
+    long left;
+    BoundedIn(InputStream in, long len) { this.in = in; this.left = len; }
+    @Override public int read() throws IOException {
+      if (left <= 0) return -1;
+      int b = in.read();
+      if (b >= 0) left--;
+      return b;
+    }
+    @Override public int read(byte[] b, int off, int len) throws IOException {
+      if (left <= 0) return -1;
+      int n = in.read(b, off, (int) Math.min(len, left));
+      if (n > 0) left -= n;
+      return n;
     }
   }
 
@@ -919,11 +1258,12 @@ public class StreamLoad {
     final int status;
     final byte[] body;
     final String retryAfter;
+    final String location;
     /** IOExceptions recovered inside LeanHttp.post by reconnecting (counted as transport retries). */
     final int recoveredAttempts;
-    LeanResp(int s, byte[] b, String ra) { this(s, b, ra, 0); }
-    LeanResp(int s, byte[] b, String ra, int recovered) {
-      status = s; body = b; retryAfter = ra; recoveredAttempts = recovered;
+    LeanResp(int s, byte[] b, String ra) { this(s, b, ra, null, 0); }
+    LeanResp(int s, byte[] b, String ra, String loc, int recovered) {
+      status = s; body = b; retryAfter = ra; location = loc; recoveredAttempts = recovered;
     }
   }
 
@@ -949,11 +1289,15 @@ public class StreamLoad {
         case "--gen-cores" -> args.genCores = Integer.parseInt(a[++i]);
         case "--lean-http" -> args.leanHttp = true;
         case "--no-lean-http" -> args.leanHttp = false;
+        case "--rate-mib-s" -> args.rateMibS = Double.parseDouble(a[++i]);
+        case "--lean-consumer" -> args.leanConsumer = true;
+        case "--no-lean-consumer" -> args.leanConsumer = false;
         default -> throw new IllegalArgumentException(a[i]);
       }
     }
     if (args.base == null || args.tokensFile == null || args.out == null) throw new IllegalArgumentException("need --base --tokens-file --out");
     if ("chunked".equals(args.accept)) args.accept = "binary";
+    if (args.rateMibS < 0) throw new IllegalArgumentException("--rate-mib-s must be >= 0");
     if (args.groups <= 0) args.groups = args.streams; // 1:1 legacy
     if (args.groups > args.streams) args.groups = args.streams;
     String heapEnv = System.getenv("HEAP");
@@ -977,6 +1321,11 @@ public class StreamLoad {
     boolean selfLoaded, stallFlag, generatorSaturated, transportRetryFlag, drainTimedOut;
     int genCores;
     double genSatLimitPct;
+    Double p50Co, p90Co, p99Co;
+    String latHist = "[]", latHistCo = "[]";
+    double rateMibS, schedLatePct, schedLagMaxUs;
+    long schedSends;
+    boolean leanConsumer;
     Map<String, Double> counters, hardZeros;
     List<String> errors, teardownErrors;
     String summary() {
@@ -1014,6 +1363,12 @@ public class StreamLoad {
       field(sb, "generator_saturated", generatorSaturated, true);
       field(sb, "gen_cores", genCores, true);
       field(sb, "gen_sat_limit_pct", genSatLimitPct, true);
+      field(sb, "offered_mib_s", rateMibS, true);
+      field(sb, "sched_sends", schedSends, true);
+      field(sb, "sched_late_pct", schedLatePct, true);
+      field(sb, "sched_lag_max_us", schedLagMaxUs, true);
+      field(sb, "lean_consumer", leanConsumer, true);
+      field(sb, "p99_co_us", p99Co, true);
       field(sb, "requests", requests, true);
       field(sb, "producer_transport_retries", producerTransportRetries, true);
       field(sb, "consumer_connect_retries", consumerConnectRetries, true);
@@ -1049,6 +1404,14 @@ public class StreamLoad {
         .append(",\"p50_us\":").append(p50)
         .append(",\"p90_us\":").append(p90)
         .append(",\"p99_us\":").append(p99)
+        .append(",\"hist_sub_bits\":").append(LatBag.SUB_BITS)
+        .append(",\"hist\":").append(latHist)
+        .append("},\n");
+      sb.append("  \"chunk_latency_co\":{")
+        .append("\"p50_us\":").append(p50Co)
+        .append(",\"p90_us\":").append(p90Co)
+        .append(",\"p99_us\":").append(p99Co)
+        .append(",\"hist\":").append(latHistCo)
         .append("},\n");
       sb.append("  \"hard_zeros\":").append(mapJson(hardZeros)).append(",\n");
       sb.append("  \"counters\":").append(mapJson(counters)).append(",\n");
