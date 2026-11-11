@@ -25,6 +25,7 @@ import java.net.URI;
 import java.time.Duration;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -195,6 +196,34 @@ class RouteResilienceTest {
             assertEquals(502, wrap.handle(new Request("GET", "/")).status());
         } finally {
             deadProxy.close();
+        }
+    }
+
+    @Test
+    void balancerConnectRetryUsesTheOtherEndpointAndKeepsTheFailureKind() throws Exception {
+        URI dead;
+        try (var s = new ServerSocket(0)) {
+            dead = URI.create("http://127.0.0.1:" + s.getLocalPort());
+        }
+        var deadEp = new Endpoint("dead", "127.0.0.1", dead.getPort(), 1_000_000, Map.of(),
+                Endpoint.Health.READY, null);
+        var liveEp = new Endpoint("live", "127.0.0.1", this.upstream.getAddress().getPort(), 1, Map.of(),
+                Endpoint.Health.READY, null);
+        var src = new StaticUpstreamSource(new UpstreamSet("api", 1, new Endpoint[] {deadEp, liveEp},
+                LbPolicy.WEIGHTED_RANDOM));
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofMillis(150), Duration.ofSeconds(1), 1024, "http",
+                null), ByteBudget.shared(), null);
+        var balancer = new EndpointBalancer(src, pools, null, new EndpointBalancer.Outlier(100, 100, 1_000_000,
+                Duration.ofSeconds(10), Duration.ofSeconds(30), 100));
+        try {
+            var wrap = new RouteResilience(balancer,
+                    new Resilience(new Resilience.Retry(1, EnumSet.of(On.CONNECT), 100), null));
+            assertEquals(200, wrap.handle(new Request("GET", "/")).status(),
+                    "a connect failure must be retried on the other endpoint, not classified as 502");
+            assertEquals(1, this.hits.get());
+        } finally {
+            balancer.close();
         }
     }
 }

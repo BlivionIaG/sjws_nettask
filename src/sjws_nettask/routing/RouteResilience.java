@@ -58,13 +58,16 @@ public final class RouteResilience implements Handler {
         if (retry != null) {
             this.budget.deposit();
         }
+        int cap = Math.max(1, (retry == null ? 0 : retry.attempts()) + 1);
+        int[] tried = new int[cap];
+        int[] nTried = {0};
         int tries = 0;
         while (true) {
             Resilience.On failed;
             Response response = null;
             int errorStatus = 0;
             try {
-                response = oneShot(request);
+                response = oneShot(request, tried, nTried);
                 if (ProxyHandler.isLocalRefusal(response)) {
                     if (this.breaker != null) {
                         this.breaker.release();
@@ -109,15 +112,15 @@ public final class RouteResilience implements Handler {
         return this.breaker == null ? "NONE" : this.breaker.state().name();
     }
 
-    private Response oneShot(Request request) throws IOException, InterruptedException {
+    private Response oneShot(Request request, int[] tried, int[] nTried) throws IOException, InterruptedException {
         if (this.inner instanceof ProxyHandler proxy) {
             return proxy.attempt(request);
         }
         if (this.inner instanceof EndpointBalancer balancer) {
-            return balancer.oneShot(request);
+            return balancer.oneShot(request, tried, nTried);
         }
         if (this.inner instanceof WeightedHandler weighted) {
-            return weighted.oneShot(request);
+            return weighted.oneShot(request, tried, nTried);
         }
         return this.inner.handle(request);
     }

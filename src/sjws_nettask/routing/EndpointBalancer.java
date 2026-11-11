@@ -268,11 +268,35 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
     }
 
     /** One try, no balancer retry: used by a per-route {@link RouteResilience} wrapper. */
-    Response oneShot(Request request) {
-        return dispatch(request, null);
+    Response oneShot(Request request) throws IOException, InterruptedException {
+        return oneShot(request, null, null);
+    }
+
+    /**
+     * One try that records the chosen endpoint in {@code tried} so a route-level retry can
+     * exclude it. Transport failures are thrown so the caller can classify {@code connect}/
+     * {@code reset}/{@code timeout} instead of a synthetic 502/504.
+     *
+     * @param nTried {@code nTried[0]} is the number of valid entries already in {@code tried};
+     *        updated after this attempt when both arrays are non-null
+     */
+    Response oneShot(Request request, int[] tried, int[] nTried) throws IOException, InterruptedException {
+        return dispatch(request, null, tried, nTried, true);
     }
 
     private Response dispatch(Request request, Resilience.Retry retry) {
+        try {
+            return dispatch(request, retry, null, null, false);
+        } catch (IOException e) {
+            return StaticFileHandler.error(ProxyHandler.status(e), request.headOnly());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return StaticFileHandler.error(502, request.headOnly());
+        }
+    }
+
+    private Response dispatch(Request request, Resilience.Retry retry, int[] tried, int[] nTried, boolean rethrow)
+            throws IOException, InterruptedException {
         var v = this.view;
         boolean head = request.headOnly();
         if (v == null) {
@@ -282,8 +306,11 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         if (retry != null) {
             this.budget.deposit();
         }
-        int[] tried = mayRetry ? new int[retry.attempts()] : null;
-        int tries = 0;
+        int tries = nTried != null && tried != null ? nTried[0] : 0;
+        if (tried == null) {
+            tried = mayRetry ? new int[retry.attempts()] : null;
+            tries = 0;
+        }
         while (true) {
             long now = this.clock.getAsLong();
             int i = pick(v, tried, tries, now);
@@ -291,16 +318,21 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
             Resilience.On failed;
             Response response = null;
             int errorStatus = 0;
+            IOException transport = null;
             pool.inflight.incrementAndGet();
             try {
                 response = pool.proxy.attempt(request);
                 failed = ProxyHandler.kind(response);
             } catch (IOException e) {
+                transport = e;
                 failed = ProxyHandler.kind(e);
                 errorStatus = ProxyHandler.status(e);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 pool.health.release();
+                if (rethrow) {
+                    throw e;
+                }
                 return StaticFileHandler.error(502, head);
             } finally {
                 pool.inflight.decrementAndGet();
@@ -316,14 +348,25 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                 return response;
             }
             pool.health.failure(this.clock.getAsLong());
+            if (tried != null && tries < tried.length) {
+                tried[tries] = i;
+            }
             boolean again = mayRetry && tries < retry.attempts() && retry.on().contains(failed) && this.budget.withdraw();
+            if (tried != null && tries < tried.length) {
+                tries++;
+                if (nTried != null) {
+                    nTried[0] = tries;
+                }
+            }
             if (!again) {
+                if (rethrow && transport != null) {
+                    throw transport;
+                }
                 return response != null ? response : StaticFileHandler.error(errorStatus, head);
             }
             if (response != null) {
                 Body.discard(response.body());
             }
-            tried[tries++] = i;
         }
     }
 

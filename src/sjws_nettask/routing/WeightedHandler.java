@@ -110,12 +110,16 @@ public final class WeightedHandler implements Handler {
      * {@link RouteResilience} wrapper can apply a per-route policy without nesting.
      */
     Response oneShot(Request request) throws IOException, InterruptedException {
+        return oneShot(request, null, null);
+    }
+
+    Response oneShot(Request request, int[] tried, int[] nTried) throws IOException, InterruptedException {
         var handler = this.handlers[select(request.headers())];
         if (handler instanceof ProxyHandler proxy) {
             return proxy.attempt(request);
         }
         if (handler instanceof EndpointBalancer balancer) {
-            return balancer.oneShot(request);
+            return balancer.oneShot(request, tried, nTried);
         }
         return handler.handle(request);
     }
