@@ -65,6 +65,10 @@ class IpAclFilterTest {
                 () -> IpAclFilter.create(GatewayTestSupport.spec("ip-acl", java.util.Map.of("allow", "example.com"))));
         assertThrows(IllegalArgumentException.class,
                 () -> IpAclFilter.create(GatewayTestSupport.spec("ip-acl", java.util.Map.of("deny", "10.0.0.0/99"))));
+        var emptyAllow = assertThrows(IllegalArgumentException.class,
+                () -> IpAclFilter.create(GatewayTestSupport.spec("ip-acl",
+                        java.util.Map.of("allow", "# last entry removed\n", "deny", "10.0.0.1"))));
+        assertTrue(emptyAllow.getMessage().contains("allow is empty"), emptyAllow.getMessage());
     }
 
     @Test

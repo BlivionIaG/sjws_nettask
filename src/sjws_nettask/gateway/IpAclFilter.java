@@ -46,8 +46,15 @@ public final class IpAclFilter implements RequestFilter {
     }
 
     public static RequestFilter create(MiddlewareSpec spec) {
-        var allow = parseList(spec.option("allow"), "allow");
-        var deny = parseList(spec.option("deny"), "deny");
+        var allowRaw = spec.option("allow");
+        var denyRaw = spec.option("deny");
+        var allow = parseList(allowRaw, "allow");
+        var deny = parseList(denyRaw, "deny");
+        // An explicit empty allow list is not the same as an omitted one: omitted
+        // means deny-only, empty would otherwise silently admit every non-denied peer.
+        if (allowRaw != null && allow.length == 0) {
+            throw new IllegalArgumentException("ip-acl allow is empty");
+        }
         if (allow.length == 0 && deny.length == 0) {
             throw new IllegalArgumentException("ip-acl needs allow or deny");
         }
