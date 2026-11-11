@@ -228,4 +228,21 @@ class CpHostTest {
         assertThrows(IllegalArgumentException.class, () -> CpWitness.open(dir.resolve("w"), CpLaunch.nodeId(c.self()),
                 CpLaunch.voters(c), sjws_nettask.cluster.Clock.SYSTEM, new SimTransport()));
     }
+
+    @Test
+    void adminListenerAddressIsReportedOnceBound() throws Exception {
+        var deps = new CpTestDeps();
+        try (var host = CpLaunch.start(config(yaml("cp-1", 0, 0)), deps, err)) {
+            var listen = host.adminListen();
+            assertTrue(listen.startsWith("127.0.0.1:") || listen.startsWith("[::1]:"), listen);
+            int port = Integer.parseInt(listen.substring(listen.lastIndexOf(':') + 1));
+            assertTrue(port > 0, listen);
+            assertEquals("listening", host.adminState());
+            assertEquals(listen, CpHost.formatListen(new java.net.InetSocketAddress("127.0.0.1", port)));
+            var v6 = CpHost.formatListen(new java.net.InetSocketAddress("::1", 9));
+            assertTrue(v6.startsWith("[") && v6.endsWith("]:9"), v6);
+            assertEquals("", CpHost.formatListen(null));
+        }
+    }
+
 }

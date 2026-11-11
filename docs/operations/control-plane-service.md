@@ -149,6 +149,7 @@ process starts the watch client. `SjwsServer.drain()` remains the only drain.
 
 ```
 running pid=123 role=data data-role=gateway connection=pending config-version=0
+running pid=123 role=control connection=pending config-version=0 admin=127.0.0.1:9443 admin-state=listening
 ```
 
 The sidecar is `<pid-file>.status`. It is trusted only when `pid` and `start` match the pid
@@ -178,7 +179,8 @@ implemented outside this daemon slice, in `sjws_nettask.cp`.
 3. **systemd active is the process, not `leaderReady()`.** The pid file is written when
    the process is up, including a control process that has not bound a content port.
    There is no `sd_notify`. Readiness is `/readyz` and `--status` (`role`, `connection`,
-   `config-version`). `--status` stays `connection=pending` until something calls
+   `config-version`, and for a control process `admin` / `admin-state` when the admin
+   listener is bound). `--status` stays `connection=pending` until something calls
    `attach`. Do not treat "service started" as "config applied".
 
 4. **Data node, control plane down.** Decided behaviour, implemented by the control-plane
@@ -210,7 +212,8 @@ implemented outside this daemon slice, in `sjws_nettask.cp`.
    or `server.bind_content: true`. The admin and watch listeners are bound from
    `cp.admin.listen` and `cp.watch.listen`. `listen=` in the bootstrap is stored and not bound. A control
    process with the content port off still writes the pid file, so the unit can be
-   active.
+   active. `--status` reports the bound admin listener as `admin=<host:port>` and
+   `admin-state=listening` (or `not-bound` / `failed`).
 
 8. **Role precedence is CLI, then environment, then `node.mode`.** Logged at startup.
    The schema key is `node.mode`. There is no `node.role` key.
