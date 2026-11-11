@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import sjws_nettask.config.ConfigException;
 import sjws_nettask.core.Request;
 
 class BasicAuthFilterTest {
@@ -26,7 +27,7 @@ class BasicAuthFilterTest {
         var filter = BasicAuthFilter.create(GatewayTestSupport.spec("basic-auth",
                 Map.of("users", "alice:secret,bob:other:with:colons")));
         assertEquals(401, GatewayTestSupport.call(filter, new Request("GET", "/")).status());
-        assertEquals("Basic realm=\"sjws\"",
+        assertEquals("Basic realm=\"sjws\", charset=\"UTF-8\"",
                 GatewayTestSupport.call(filter, new Request("GET", "/")).headers().get("www-authenticate"));
 
         var wrong = GatewayTestSupport.call(filter, GatewayTestSupport.request("GET", "/",
@@ -45,14 +46,14 @@ class BasicAuthFilterTest {
         var head = GatewayTestSupport.call(filter, GatewayTestSupport.request("HEAD", "/", Map.of()));
         assertEquals(401, head.status());
         assertTrue(head.headOnly());
-        assertEquals("Basic realm=\"sjws\"", head.headers().get("www-authenticate"));
+        assertEquals("Basic realm=\"sjws\", charset=\"UTF-8\"", head.headers().get("www-authenticate"));
     }
 
     @Test
     void realmIsQuotedAndSchemeParsingIsStrict() {
         var filter = BasicAuthFilter.create(GatewayTestSupport.spec("basic-auth",
                 Map.of("users", "alice:secret", "realm", "Site \"A\"")));
-        assertEquals("Basic realm=\"Site \\\"A\\\"\"",
+        assertEquals("Basic realm=\"Site \\\"A\\\"\", charset=\"UTF-8\"",
                 GatewayTestSupport.call(filter, new Request("GET", "/")).headers().get("www-authenticate"));
 
         assertEquals(401, GatewayTestSupport.call(filter, GatewayTestSupport.request("GET", "/",
@@ -86,7 +87,7 @@ class BasicAuthFilterTest {
         assertNotEquals("alice:secret", new String(hash, StandardCharsets.UTF_8));
 
         Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("rw-r-----"));
-        assertThrows(IllegalArgumentException.class, () -> BasicAuthFilter.create(
+        assertThrows(ConfigException.class, () -> BasicAuthFilter.create(
                 GatewayTestSupport.spec("basic-auth", Map.of("users-file", file.toString()))));
     }
 
@@ -108,9 +109,19 @@ class BasicAuthFilterTest {
         assertThrows(IllegalArgumentException.class,
                 () -> BasicAuthFilter.create(GatewayTestSupport.spec("basic-auth",
                         Map.of("users", "a:b", "realm", "bad\nrealm"))));
-        assertThrows(IllegalArgumentException.class,
+        assertThrows(ConfigException.class,
                 () -> BasicAuthFilter.create(GatewayTestSupport.spec("basic-auth",
                         Map.of("users-file", tmp.resolve("missing").toString()))));
+    }
+
+    @Test
+    void aPasswordMayEndWithASpace() {
+        var filter = BasicAuthFilter.create(GatewayTestSupport.spec("basic-auth",
+                Map.of("users", "alice:secret ")));
+        assertEquals(200, GatewayTestSupport.call(filter, GatewayTestSupport.request("GET", "/",
+                Map.of("authorization", List.of(basic("alice", "secret "))))).status());
+        assertEquals(401, GatewayTestSupport.call(filter, GatewayTestSupport.request("GET", "/",
+                Map.of("authorization", List.of(basic("alice", "secret"))))).status());
     }
 
     @Test
@@ -122,7 +133,7 @@ class BasicAuthFilterTest {
         assertEquals(200, ok.status());
         var miss = filters.wrapping(GatewayTestSupport::ok).handle(new Request("GET", "/"));
         assertEquals(401, miss.status());
-        assertEquals("Basic realm=\"sjws\"", miss.headers().get("www-authenticate"));
+        assertEquals("Basic realm=\"sjws\", charset=\"UTF-8\"", miss.headers().get("www-authenticate"));
     }
 
     private static String basic(String user, String password) {

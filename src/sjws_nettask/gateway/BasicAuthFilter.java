@@ -16,18 +16,14 @@
  */
 package sjws_nettask.gateway;
 
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.attribute.PosixFilePermission;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Locale;
-import java.util.Set;
 import sjws_nettask.core.MiddlewareSpec;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestFilter;
@@ -40,9 +36,10 @@ import sjws_nettask.core.StaticFileHandler;
  * stored hash, so the compare does not stop on the first match.
  * <p>
  * Params: {@code users} (one {@code user:password} per line, or comma-separated when there is
- * no newline), and/or {@code users-file} (the same format, a regular file that should be
- * {@code 0600}). Exactly one of the two is required. {@code realm} is optional (default
- * {@code sjws}). A miss is 401 with {@code WWW-Authenticate: Basic realm="..."}.
+ * no newline), and/or {@code users-file} (the same format, read through
+ * {@link sjws_nettask.config.SecureKeyFile}). Exactly one of the two is required. {@code realm}
+ * is optional (default {@code sjws}). A miss is 401 with
+ * {@code WWW-Authenticate: Basic realm="...", charset="UTF-8"}.
  */
 public final class BasicAuthFilter implements RequestFilter {
 
@@ -148,7 +145,7 @@ public final class BasicAuthFilter implements RequestFilter {
             }
         }
         var escaped = realm.replace("\\", "\\\\").replace("\"", "\\\"");
-        return "Basic realm=\"" + escaped + "\"";
+        return "Basic realm=\"" + escaped + "\", charset=\"UTF-8\"";
     }
 
     static java.util.List<String> parseUsers(String raw, String source) {
@@ -157,15 +154,20 @@ public final class BasicAuthFilter implements RequestFilter {
                 : raw.split(",", -1);
         var out = new ArrayList<String>();
         for (var line : lines) {
-            var text = line.trim();
-            if (text.isEmpty() || text.startsWith("#")) {
+            var trimmed = line.trim();
+            if (trimmed.isEmpty() || trimmed.startsWith("#")) {
                 continue;
             }
-            int colon = text.indexOf(':');
-            if (colon <= 0 || colon == text.length() - 1) {
+            int colon = line.indexOf(':');
+            if (colon < 0) {
                 throw new IllegalArgumentException(source + " entry needs user:password");
             }
-            out.add(text.substring(0, colon) + ":" + text.substring(colon + 1));
+            var user = line.substring(0, colon).trim();
+            var password = line.substring(colon + 1); // keep significant whitespace
+            if (user.isEmpty() || password.isEmpty()) {
+                throw new IllegalArgumentException(source + " entry needs user:password");
+            }
+            out.add(user + ":" + password);
             if (out.size() > MAX_USERS) {
                 throw new IllegalArgumentException(source + " has more than " + MAX_USERS + " users");
             }
@@ -177,35 +179,8 @@ public final class BasicAuthFilter implements RequestFilter {
     }
 
     private static java.util.List<String> readFile(String path) {
-        var file = Path.of(path);
-        try {
-            if (!Files.isRegularFile(file)) {
-                throw new IllegalArgumentException("basic-auth users-file is not a regular file");
-            }
-            try {
-                var perms = Files.getPosixFilePermissions(file);
-                if (readableByOthers(perms)) {
-                    throw new IllegalArgumentException("basic-auth users-file must not be group- or world-readable");
-                }
-            } catch (UnsupportedOperationException ignored) {
-                // non-POSIX: the 0600 check does not apply
-            }
-            if (Files.size(file) > MAX_FILE_BYTES) {
-                throw new IllegalArgumentException("basic-auth users-file is larger than " + MAX_FILE_BYTES + " bytes");
-            }
-            return parseUsers(Files.readString(file, StandardCharsets.UTF_8), "users-file");
-        } catch (IOException e) {
-            throw new IllegalArgumentException("basic-auth users-file could not be read: " + e.getMessage(), e);
-        }
-    }
-
-    private static boolean readableByOthers(Set<PosixFilePermission> perms) {
-        return perms.contains(PosixFilePermission.GROUP_READ)
-                || perms.contains(PosixFilePermission.GROUP_WRITE)
-                || perms.contains(PosixFilePermission.GROUP_EXECUTE)
-                || perms.contains(PosixFilePermission.OTHERS_READ)
-                || perms.contains(PosixFilePermission.OTHERS_WRITE)
-                || perms.contains(PosixFilePermission.OTHERS_EXECUTE);
+        var bytes = sjws_nettask.config.SecureKeyFile.read(Path.of(path), "basic-auth users-file", MAX_FILE_BYTES);
+        return parseUsers(new String(bytes, StandardCharsets.UTF_8), "users-file");
     }
 
     private static byte[] sha256(byte[] data) {
