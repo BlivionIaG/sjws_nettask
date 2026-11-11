@@ -28,6 +28,7 @@ import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.Set;
 
@@ -43,9 +44,12 @@ import java.util.Set;
  */
 public final class LastGoodStore {
 
-    private static final Set<PosixFilePermission> OWNER_RW = PosixFilePermissions.fromString("rw-------");
-    private static final Set<PosixFilePermission> OWNER_RWX = EnumSet.of(PosixFilePermission.OWNER_READ,
-            PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE);
+    /** 0600; unmodifiable so no caller can widen the shared mode. */
+    static final Set<PosixFilePermission> OWNER_RW = Collections.unmodifiableSet(
+            EnumSet.copyOf(PosixFilePermissions.fromString("rw-------")));
+    /** 0700; unmodifiable so no caller can widen the shared mode. */
+    static final Set<PosixFilePermission> OWNER_RWX = Collections.unmodifiableSet(EnumSet.of(
+            PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE));
 
     private LastGoodStore() {
     }
