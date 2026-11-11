@@ -342,10 +342,14 @@ class PrometheusScrapeTest {
                 d = json.load(open(sys.argv[1]))
                 assert d["title"] == "sjws" and d["uid"] == "sjws-observe"
                 assert d["schemaVersion"] >= 39
-                assert len(d["panels"]) >= 16
+                assert len(d["panels"]) >= 27
                 titles = [p["title"] for p in d["panels"]]
                 for need in ["Request rate", "Latency p50", "Latency p99", "Errors by status", "Response bytes",
-                             "Connections", "Access-log drops", "Cluster request rate", "Route request rate"]:
+                             "Connections", "Access-log drops", "Cluster request rate", "Route request rate",
+                             "Messaging lag", "Messaging in-flight", "Messaging DLQ depth",
+                             "Messaging oldest pending age", "Messaging produce latency", "Messaging fetch latency",
+                             "Messaging topics folded", "Swarm stream memory", "Swarm stream tickets",
+                             "Swarm stream refusals", "Swarm stream trims and drops"]:
                     assert need in titles, titles
                 """, json.toString()).redirectErrorStream(true).start();
         var pyOut = new String(py.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
@@ -353,7 +357,7 @@ class PrometheusScrapeTest {
         assertEquals(0, py.exitValue(), pyOut);
 
         var exprs = exprs(Files.readString(json));
-        assertTrue(exprs.size() >= 16, exprs.toString());
+        assertTrue(exprs.size() >= 27, exprs.toString());
         assertTrue(exprs.stream().anyMatch(e -> e.contains("histogram_quantile(0.50")));
         assertTrue(exprs.stream().anyMatch(e -> e.contains("histogram_quantile(0.99")));
         assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_http_requests_total")));
@@ -362,6 +366,14 @@ class PrometheusScrapeTest {
         assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_access_log_dropped_total")));
         assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_gateway_route_requests_total")));
         assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_cluster_requests_per_second")));
+        assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_lag_messages")));
+        assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_inflight")));
+        assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_dlq_depth")));
+        assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_oldest_pending_age_ms")));
+        assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_produce_duration_seconds_bucket")));
+        assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_messaging_fetch_duration_seconds_bucket")));
+        assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_swarm_stream_charged_bytes")));
+        assertTrue(exprs.stream().anyMatch(e -> e.contains("sjws_swarm_stream_node_refusals_total")));
         var rules = dir.resolve("dashboard.yml");
         var yaml = new StringBuilder("groups:\n  - name: sjws_dashboard\n    rules:\n");
         for (int i = 0; i < exprs.size(); i++) {
