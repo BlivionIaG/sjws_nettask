@@ -35,6 +35,13 @@ jobs:
         run: mvn -B -q -DskipTests package
       - name: Cluster harness scenarios
         run: mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test
+      - name: Install optional external clients
+        run: |
+          tools/ci/apt-get.sh update -q
+          tools/ci/apt-get.sh install -y -q nghttp2-client \
+            || echo "h2load not installed; ExternalClientEndToEndTest will skip that case"
+      - name: External-client e2e (curl; h2load / HTTP/3 skip if missing)
+        run: mvn -B -Dgroups=e2e-clients -Dsurefire.failIfNoSpecifiedTests=true test
       - name: wrk cache key
         id: wrk-cache
         run: |
