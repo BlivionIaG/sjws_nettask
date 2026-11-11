@@ -26,28 +26,40 @@ import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
+import sjws_nettask.core.buf.BufferPool;
+import sjws_nettask.core.buf.NoBufferLeaks;
 
 /** {@link Http1Connection}'s streamed request body and {@link Body.Stream} framing. */
 @org.junit.jupiter.api.extension.ExtendWith(sjws_nettask.core.buf.NoBufferLeaks.class)
 class Http1RequestBodyTest {
 
     private static String exchange(Handler handler, String raw, boolean halfClose) throws Exception {
-        return exchange(handler, raw, halfClose, Duration.ofSeconds(5));
+        return exchange(handler, raw, halfClose, Duration.ofSeconds(5), null);
     }
 
     private static String exchange(Handler handler, String raw, boolean halfClose, Duration headTimeout)
             throws Exception {
+        return exchange(handler, raw, halfClose, headTimeout, null);
+    }
+
+    private static String exchange(Handler handler, String raw, boolean halfClose, Duration headTimeout,
+            BufferPool pool) throws Exception {
         var reaper = new ConnectionReaper(headTimeout, headTimeout, headTimeout);
         try (var server = ServerSocketChannel.open().bind(new InetSocketAddress("127.0.0.1", 0));
                 var client = SocketChannel.open(server.getLocalAddress())) {
             var accepted = server.accept();
-            var thread = Thread.ofVirtual().start(new Http1Connection(accepted, handler, ResponseHeaders::of, reaper));
+            var connection = new Http1Connection(accepted, handler, ResponseHeaders::of, reaper);
+            if (pool != null) {
+                connection = connection.withPool(pool);
+            }
+            var thread = Thread.ofVirtual().start(connection);
             client.write(ByteBuffer.wrap(raw.getBytes(StandardCharsets.ISO_8859_1)));
             if (halfClose) {
                 client.shutdownOutput();
@@ -237,6 +249,43 @@ class Http1RequestBodyTest {
                 "4\r\nabcd\r\n0\r\n\r\n");
         assertTrue(text.startsWith("HTTP/1.1 200 "), text);
         assertTrue(text.contains("ok"), text);
+    }
+
+    @Test
+    void aChunkedGetWithContinueIsDrainedAfterTheInterimResponse() throws Exception {
+        var text = exchange(ok(),
+                "GET / HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                        + "4\r\nabcd\r\n0\r\n\r\n",
+                false);
+        assertTrue(text.startsWith("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 "), text);
+        assertTrue(text.contains("ok"), text);
+    }
+
+    @Test
+    void aSplitChunkedPostBodyIsReadAfterASecondFill() throws Exception {
+        var text = exchangeSplit(echo(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                "7\r\nabcdefg\r\n0\r\n\r\n");
+        assertTrue(text.contains("got:abcdefg"), text);
+    }
+
+    @Test
+    void aChunkedPostBodyIsReadFromADirectPooledBuffer() throws Exception {
+        var pool = NoBufferLeaks.watch(BufferPool.create(new BufferPool.Settings(true, 8L << 20, Map.of(), true, 1, 0)));
+        var text = exchange(echo(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                        + "7\r\nabcdefg\r\n0\r\n\r\n",
+                false, Duration.ofSeconds(5), pool);
+        assertTrue(text.contains("got:abcdefg"), text);
+    }
+
+    @Test
+    void aPostWithoutABodyCanKeepTheConnection() throws Exception {
+        var text = exchange(ok(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n"
+                        + "GET /b HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+                false);
+        assertEquals(2, text.split("HTTP/1.1 200 ", -1).length - 1, text);
     }
 
     private static Handler ok() {

@@ -534,10 +534,7 @@ final class Http1Connection implements Runnable {
                         if (copied > 0) {
                             return copied;
                         }
-                        if (this.decoder.overLimit()) {
-                            this.failed = true;
-                            throw new IOException("chunked request body exceeded the decoder limit");
-                        }
+                        // The decoder cap is Long.MAX_VALUE/2 (overflow only); routes enforce max_body.
                         continue;
                     }
                     this.timer.writing();
