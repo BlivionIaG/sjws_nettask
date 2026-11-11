@@ -17,13 +17,18 @@
 package sjws_nettask.observe;
 
 import java.io.BufferedOutputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.OpenOption;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.EnumSet;
@@ -87,61 +92,78 @@ final class AccessLog implements Runnable, AutoCloseable {
      * existing file logs a WARN and is still appended. After an external rename/replace, the writer
      * thread reopens the configured path (#406) so new lines hit the new inode (and a newly created
      * file gets {@code 0640} again).
+     * <p>
+     * Directory and nested symlinks are resolved to a real leaf path once; the leaf is opened with
+     * {@link LinkOption#NOFOLLOW_LINKS} so create/append bind to that inode (not a follow-through
+     * of the configured link that could race a rotator).
      */
     static OutputStream openFile(Path path) throws IOException {
-        Path absolute = path.toAbsolutePath();
-        ensureParent(absolute);
-        if (Files.isSymbolicLink(absolute)) {
-            // Missing symlink targets must not be created by FileOutputStream (umask default);
-            // create the resolved target with 0640 / CREATE_NEW first (#428 Security P2).
-            ensureSymlinkTargetCreated(absolute);
-        } else if (Files.exists(absolute, LinkOption.NOFOLLOW_LINKS)) {
-            warnIfWorldReadable(absolute);
-        } else {
-            try {
-                createNew(absolute);
-            } catch (FileAlreadyExistsException e) {
-                // Raced with another creator; open the existing file and warn if needed.
-                warnIfWorldReadable(absolute);
-            }
-        }
-        return new FileOutputStream(absolute.toFile(), true);
+        return openFileWithKey(path).stream;
     }
 
+    private static final int SYMLINK_HOP_CAP = 40;
+
     /**
-     * If {@code link}'s target is missing, create that target with {@code 0640} using
-     * {@link Files#createFile} (CREATE_NEW / O_EXCL). Does not create via a follow-then-open race
-     * on the symlink itself. Existing targets are left unchanged (WARN if world-readable).
+     * Resolves {@code configured} to the real leaf path to create or open. The parent is
+     * {@link Path#toRealPath()} (follows directory symlinks). Trailing symlink components are
+     * walked with {@link Files#readSymbolicLink}, each relative target resolved against the real
+     * parent of that link (parent re-realpathed every hop). No whole-path lexical {@code normalize()}.
      */
-    static void ensureSymlinkTargetCreated(Path link) throws IOException {
-        Path target = Files.readSymbolicLink(link);
-        Path parent = link.toAbsolutePath().getParent();
-        Path resolved = (parent != null ? parent.resolve(target) : target).normalize();
-        if (Files.exists(resolved, LinkOption.NOFOLLOW_LINKS)) {
-            if (!Files.isSymbolicLink(resolved)) {
-                warnIfWorldReadable(resolved);
+    static Path resolveLogLeaf(Path configured) throws IOException {
+        Path absolute = configured.toAbsolutePath();
+        Path parent = absolute.getParent();
+        if (parent == null) {
+            throw new IOException("access log path has no parent: " + absolute);
+        }
+        ensureParent(absolute);
+        Path realParent = parent.toRealPath();
+        Path leaf = realParent.resolve(absolute.getFileName());
+        for (int hop = 0; hop < SYMLINK_HOP_CAP; hop++) {
+            if (!Files.isSymbolicLink(leaf)) {
+                return leaf;
             }
-            return;
+            Path target = Files.readSymbolicLink(leaf);
+            Path linkParent = leaf.toAbsolutePath().getParent();
+            if (linkParent == null) {
+                throw new IOException("symlink has no parent: " + leaf);
+            }
+            Path realLinkParent = linkParent.toRealPath();
+            Path next;
+            if (target.isAbsolute()) {
+                Path tParent = target.getParent();
+                Path tName = target.getFileName();
+                if (tParent == null || tName == null) {
+                    throw new IOException("symlink target has no parent: " + target);
+                }
+                ensureParent(tParent.resolve(tName));
+                next = tParent.toRealPath().resolve(tName);
+            } else {
+                Path resolved = realLinkParent.resolve(target);
+                Path nextParent = resolved.getParent();
+                Path nextName = resolved.getFileName();
+                if (nextParent == null || nextName == null) {
+                    throw new IOException("symlink target has no parent: " + target);
+                }
+                ensureParent(resolved);
+                next = nextParent.toRealPath().resolve(nextName);
+            }
+            leaf = next;
         }
-        ensureParent(resolved);
-        try {
-            createNew(resolved);
-        } catch (FileAlreadyExistsException e) {
-            warnIfWorldReadable(resolved);
-        }
+        throw new FileSystemException(absolute.toString(), null, "Too many levels of symbolic links");
     }
 
     /**
-     * Opens {@code path} and records a file key that belongs to the opened stream. If the path's
-     * key changes across the open (rotator replaced the inode under us), close and retry so
-     * {@code openedKey} never describes a different inode than the stream we keep writing to.
+     * Opens {@code path} and records a file key that belongs to the opened stream. Resolves to a
+     * real leaf, then opens that leaf with {@link LinkOption#NOFOLLOW_LINKS}. If the leaf key
+     * changes across the open, close and retry so {@code openedKey} matches the stream inode.
      */
     static Opened openFileWithKey(Path path) throws IOException {
         IOException lastClose = null;
         for (int attempt = 0; attempt < 3; attempt++) {
-            Object before = fileKey(path);
-            OutputStream stream = openFile(path);
-            Object after = fileKey(path);
+            Path leaf = resolveLogLeaf(path);
+            Object before = fileKeyNoFollow(leaf);
+            OutputStream stream = openLeaf(leaf);
+            Object after = fileKeyNoFollow(leaf);
             boolean raced = before != null && after != null && !before.equals(after);
             if (openKeyRaceProbe.consumeForceRace()) {
                 raced = true;
@@ -159,8 +181,45 @@ final class AccessLog implements Runnable, AutoCloseable {
         if (lastClose != null) {
             System.err.println("WARN: access log close after raced open: " + lastClose);
         }
-        OutputStream stream = openFile(path);
-        return new Opened(stream, fileKey(path));
+        Path leaf = resolveLogLeaf(path);
+        OutputStream stream = openLeaf(leaf);
+        return new Opened(stream, fileKeyNoFollow(leaf));
+    }
+
+    /** CREATE_NEW+0640 or append-open the resolved leaf; never follows the leaf path. */
+    static OutputStream openLeaf(Path leaf) throws IOException {
+        ensureParent(leaf);
+        if (!Files.exists(leaf, LinkOption.NOFOLLOW_LINKS)) {
+            try {
+                return openChannel(leaf, true);
+            } catch (FileAlreadyExistsException e) {
+                // Create raced; append only if the winner is a regular file, never a planted link.
+                if (!Files.exists(leaf, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(leaf)) {
+                    throw e;
+                }
+            }
+        }
+        if (Files.isSymbolicLink(leaf)) {
+            // Dangling or unexpected link at leaf after resolve — do not follow.
+            throw new IOException("access log leaf is still a symbolic link: " + leaf);
+        }
+        warnIfWorldReadable(leaf);
+        return openChannel(leaf, false);
+    }
+
+    private static OutputStream openChannel(Path leaf, boolean createNew) throws IOException {
+        Set<OpenOption> opts = createNew
+                ? Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, StandardOpenOption.APPEND,
+                        LinkOption.NOFOLLOW_LINKS)
+                : Set.of(StandardOpenOption.WRITE, StandardOpenOption.APPEND, LinkOption.NOFOLLOW_LINKS);
+        FileChannel ch;
+        if (createNew && posix(leaf)) {
+            FileAttribute<?> perms = PosixFilePermissions.asFileAttribute(FILE_0640);
+            ch = FileChannel.open(leaf, opts, perms);
+        } else {
+            ch = FileChannel.open(leaf, opts);
+        }
+        return Channels.newOutputStream(ch);
     }
 
     /** Stream plus the path file key observed to be stable across that open. */
@@ -185,23 +244,24 @@ final class AccessLog implements Runnable, AutoCloseable {
     }
 
     /**
-     * Creates each missing ancestor of {@code file} with mode {@code 0750}.
-     * {@link Files#createDirectories} would apply the attribute only to the last segment.
+     * Creates each missing ancestor of {@code file} with mode {@code 0750}. An existing directory
+     * symlink is accepted (followed). {@link Files#createDirectories} would apply the attribute
+     * only to the last segment.
      */
     private static void ensureParent(Path file) throws IOException {
         Path parent = file.getParent();
-        if (parent == null || Files.isDirectory(parent, LinkOption.NOFOLLOW_LINKS)) {
+        if (parent == null || Files.isDirectory(parent)) {
             return;
         }
-        createAncestors(parent.toAbsolutePath().normalize());
+        createAncestors(parent.toAbsolutePath());
     }
 
     private static void createAncestors(Path dir) throws IOException {
-        if (Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
+        if (Files.isDirectory(dir)) {
             return;
         }
         Path parent = dir.getParent();
-        if (parent != null && !Files.isDirectory(parent, LinkOption.NOFOLLOW_LINKS)) {
+        if (parent != null && !Files.isDirectory(parent)) {
             createAncestors(parent);
         }
         try {
@@ -211,24 +271,13 @@ final class AccessLog implements Runnable, AutoCloseable {
                 Files.createDirectory(dir);
             }
         } catch (FileAlreadyExistsException e) {
-            if (!Files.isDirectory(dir, LinkOption.NOFOLLOW_LINKS)) {
+            // Symlink-to-directory or raced create: accept a directory after following.
+            if (!Files.isDirectory(dir)) {
                 throw e;
             }
         } catch (UnsupportedOperationException e) {
             Files.createDirectory(dir);
         }
-    }
-
-    private static void createNew(Path path) throws IOException {
-        try {
-            if (posix(path)) {
-                Files.createFile(path, PosixFilePermissions.asFileAttribute(FILE_0640));
-                return;
-            }
-        } catch (UnsupportedOperationException e) {
-            // fall through
-        }
-        Files.createFile(path);
     }
 
     private static void warnIfWorldReadable(Path path) {
@@ -365,6 +414,13 @@ final class AccessLog implements Runnable, AutoCloseable {
                 }
             }
             buffered.flush();
+        } catch (java.nio.channels.ClosedByInterruptException e) {
+            // FileChannel write/flush is interruptible; close() may interrupt a shutdown flush.
+            Thread.currentThread().interrupt();
+            if (!this.stopped) {
+                this.failed = true;
+                System.err.println("WARN: access log write failed: " + e);
+            }
         } catch (IOException | RuntimeException e) {
             this.failed = true;
             System.err.println("WARN: access log write failed: " + e);
@@ -395,7 +451,7 @@ final class AccessLog implements Runnable, AutoCloseable {
         }
         this.nextReopenCheckNanos = now + REOPEN_CHECK_NANOS;
         this.reopenRequested = false;
-        // Follow links: FileOutputStream writes through a symlink; compare that target's key.
+        // Follow the configured path for rotation detection; openedKey is the resolved leaf inode.
         boolean exists = Files.exists(this.path);
         Object current = exists ? fileKey(this.path) : null;
         boolean missing = !exists;
@@ -427,7 +483,7 @@ final class AccessLog implements Runnable, AutoCloseable {
         }
     }
 
-    /** File key of the path after following symlinks (matches what {@link FileOutputStream} writes). */
+    /** File key after following symlinks (configured-path rotation poll). */
     private static Object fileKey(Path path) {
         try {
             return Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class).fileKey();
@@ -436,14 +492,29 @@ final class AccessLog implements Runnable, AutoCloseable {
         }
     }
 
+    /** File key of the leaf without following (matches the NOFOLLOW open). */
+    private static Object fileKeyNoFollow(Path path) {
+        try {
+            return Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS)
+                    .fileKey();
+        } catch (IOException | UnsupportedOperationException e) {
+            return null;
+        }
+    }
+
     @Override
     public void close() {
         this.stopped = true;
-        this.thread.interrupt();
+        // Unpark first: FileChannel write/flush is interruptible, and aborting a shutdown
+        // flush would drop the last queued lines. Interrupt only if the join times out.
+        LockSupport.unpark(this.thread);
         try {
             this.thread.join(2_000);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+        if (this.thread.isAlive()) {
+            this.thread.interrupt();
         }
     }
 
