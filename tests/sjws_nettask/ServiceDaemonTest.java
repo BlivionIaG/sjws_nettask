@@ -320,8 +320,8 @@ class ServiceDaemonTest {
         var seen = new AtomicReference<String>();
         int port = freePort();
         int code = Sjws_nettask.run(new String[] {"--role=data", "--bootstrap=" + fix, "--pid-file=" + pid,
-                "--state-dir=" + tmp.resolve("last-good"), "--shutdown-timeout=2", Integer.toString(port),
-                html.toString()}, Map.of(), out, err, NO_H3, server -> {
+                "--bind-content=true", "--state-dir=" + tmp.resolve("last-good"), "--shutdown-timeout=2",
+                Integer.toString(port), html.toString()}, Map.of(), out, err, NO_H3, server -> {
                     try {
                         var buf = new ByteArrayOutputStream();
                         assertEquals(0, Daemon.status(pid, new PrintStream(buf, true, StandardCharsets.UTF_8), err));
@@ -895,4 +895,79 @@ class ServiceDaemonTest {
             return ((InetSocketAddress) channel.getLocalAddress()).getPort();
         }
     }
+
+    @Test
+    void dataRoleDefersContentBindUntilVerifiedLastGood() throws Exception {
+        var html = Files.createDirectory(tmp.resolve("defer-html"));
+        Files.writeString(html.resolve("index.html"), "hi");
+        var state = tmp.resolve("defer-state");
+        var yaml = tmp.resolve("defer-data.yaml");
+        Files.writeString(yaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + state.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var loaded = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        errBytes.reset();
+        assertFalse(Sjws_nettask.resolveBind(Daemon.parse(new String[] {}, Map.of()), loaded, err));
+        assertEquals("", err());
+
+        Files.createDirectories(state.resolve("config"));
+        Files.writeString(state.resolve("config").resolve("last-good.json"), signedLastGoodJson(6, 1_000, 2_000));
+        var again = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of());
+        errBytes.reset();
+        assertTrue(Sjws_nettask.resolveBind(Daemon.parse(new String[] {}, Map.of()), again, err));
+        assertEquals("", err());
+        errBytes.reset();
+        assertTrue(Sjws_nettask.resolveBind(Daemon.parse(new String[] {"--bind-content=true"}, Map.of()), loaded, err));
+        assertEquals("", err(), "forcing bind on data matches the historical role default, so no override warn");
+
+        var empty = tmp.resolve("empty-state");
+        var hookDir = tmp.resolve("hook-state");
+        Files.createDirectories(hookDir.resolve("config"));
+        Files.writeString(hookDir.resolve("config").resolve("last-good.json"), signedLastGoodJson(7, 1_000, 2_000));
+        var hookYaml = tmp.resolve("hook-data.yaml");
+        Files.writeString(hookYaml, "schema: 1\nnode:\n  mode: data\n  state_dir: " + empty.toAbsolutePath()
+                + "\nserver:\n  port: 0\n  root: " + html.toAbsolutePath() + "\n");
+        var hookLoaded = sjws_nettask.config.ConfigLoader.load(new String[] {"--config=" + hookYaml}, Map.of());
+        errBytes.reset();
+        assertFalse(Sjws_nettask.resolveBind(Daemon.parse(new String[] {}, Map.of()), hookLoaded, err));
+        ServiceHooks hooks = new ServiceHooks() {
+            @Override
+            public void onListening(SjwsServer server, Path pidFile, java.time.Duration shutdownTimeout) {
+            }
+
+            @Override
+            public void onShutdown() {
+            }
+
+            @Override
+            public String startupLine() {
+                return null;
+            }
+
+            @Override
+            public Path stateDir() {
+                return hookDir;
+            }
+        };
+        errBytes.reset();
+        assertTrue(Sjws_nettask.resolveBind(Daemon.parse(new String[] {}, Map.of()), hookLoaded, err, hooks));
+        assertEquals("", err());
+        assertFalse(Sjws_nettask.hasVerifiedLastGood(null, null));
+        assertTrue(Sjws_nettask.hasVerifiedLastGood(null, hooks));
+    }
+
+    private static String signedLastGoodJson(long version, long issued, long expires) {
+        var body = "schema: 1\nnode:\n  mode: data\n";
+        var hash = "00".repeat(32);
+        return "{\"schema\":1,\"version\":" + version + ",\"raftIndex\":1,\"canonicalHash\":\"" + hash
+                + "\",\"keyId\":\"k1\",\"epoch\":1,\"parentVersion\":0,\"kind\":1,\"projectionId\":\"\","
+                + "\"issuedAtMillis\":" + issued + ",\"expiresAtMillis\":" + expires
+                + ",\"nonce\":\"AAAAAAAAAAAAAAAAAAAAAA==\",\"signature\":\""
+                + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\","
+                + "\"rollbackOf\":0,\"canonicalYaml\":" + jsonString(body) + "}";
+    }
+
+    private static String jsonString(String value) {
+        return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\"";
+    }
+
 }

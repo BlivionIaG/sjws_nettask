@@ -109,6 +109,16 @@ class ConfigModelTest {
         }
         tooMany.append("server:\n  root: ").append(abs).append('\n');
         assertTrue(error(tooMany.toString()).contains("at most"));
+        assertTrue(error("node:\n  max_staleness: 0\nserver:\n  root: " + abs + "\n").contains("max_staleness"));
+        assertTrue(error("node:\n  max_staleness: 8d\nserver:\n  root: " + abs + "\n").contains("7d"));
+        var stale = dir.resolve("stale.yaml");
+        Files.writeString(stale, "schema: 1\nnode:\n  mode: data\n  max_staleness: 15m\nserver:\n  port: 0\n  root: "
+                + abs + "\n");
+        var withStale = ConfigLoader.load(new String[] {"--config=" + stale}, Map.of());
+        assertTrue(withStale.ok(), withStale.errors().toString());
+        assertEquals(Duration.ofMinutes(15), withStale.document().node().maxStaleness());
+        assertTrue(withStale.document().canonicalText().contains("max_staleness: 15m")
+                || sjws_nettask.config.ConfigCodec.text(withStale.document()).contains("max_staleness: 15m"));
     }
 
     @Test

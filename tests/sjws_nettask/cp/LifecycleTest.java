@@ -58,6 +58,15 @@ class LifecycleTest {
         assertFalse(staleDown.ready());
         assertTrue(staleDown.retrying());
         assertFalse(staleDown.drain());
+        assertFalse(NodeLifecycle.dataBindsContentPort(false, false));
+        assertTrue(NodeLifecycle.dataBindsContentPort(true, false));
+        assertTrue(NodeLifecycle.dataBindsContentPort(false, true));
+        assertFalse(NodeLifecycle.pastMaxStaleness(1_000, 0, 0, 0));
+        assertFalse(NodeLifecycle.pastMaxStaleness(1_000, 1_000, 0, 0), "equal to expires is still fresh");
+        assertTrue(NodeLifecycle.pastMaxStaleness(1_001, 1_000, 0, 0));
+        assertFalse(NodeLifecycle.pastMaxStaleness(1_500, 2_000, 1_000, 0), "no ceiling, expiry still in the future");
+        assertTrue(NodeLifecycle.pastMaxStaleness(1_500, 2_000, 1_000, 400), "operator ceiling is tighter");
+        assertFalse(NodeLifecycle.pastMaxStaleness(1_300, 2_000, 1_000, 400));
         assertEquals(NodeLifecycle.DRAIN_BUDGET_MS, NodeLifecycle.drainBudgetMillis(false, 60_000, 60_000));
         assertEquals(NodeLifecycle.DRAIN_BUDGET_MS, NodeLifecycle.drainBudgetMillis(true, 5_000, 15_000));
         assertThrows(IllegalArgumentException.class, () -> NodeLifecycle.drainBudgetMillis(true, 20_000, 20_000));

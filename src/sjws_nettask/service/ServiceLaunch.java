@@ -184,6 +184,11 @@ public final class ServiceLaunch {
             return this.bootstrap.role().wire();
         }
 
+        @Override
+        public Path stateDir() {
+            return this.bootstrap.stateDir();
+        }
+
         private void reloadLocal() {
             try {
                 var fresh = Bootstrap.load(this.bootstrap.source(), this.bootstrap.role().wire());

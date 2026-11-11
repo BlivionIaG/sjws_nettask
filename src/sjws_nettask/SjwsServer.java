@@ -139,6 +139,14 @@ public final class SjwsServer implements AutoCloseable {
     private Thread acceptThread;
     /** Released by {@link #close()} so a control process with no content port can leave {@link #awaitTermination()}. */
     private final CountDownLatch contentless = new CountDownLatch(1);
+    private Transport.Factory contentH3Factory;
+    private Transport.Factory contentH2Factory;
+    /**
+     * {@code sjws_nettask.cp.DataPlaneGuard} on a data node. Untyped so constructing a
+     * standalone server does not resolve that class.
+     */
+    private Object dataPlane;
+    private final ReentrantLock contentBindLock = new ReentrantLock();
     /** Set after a data node accepts a control-plane document. SIGHUP then keeps that document. */
     private final AtomicBoolean remoteApplied = new AtomicBoolean();
     /** Re-reads bootstrap local settings. Null until the service hook attaches one. */
@@ -205,9 +213,10 @@ public final class SjwsServer implements AutoCloseable {
         }
         this.chain = built;
         this.chainLeaf = chainLeaf;
+        Handler published;
         if (haSettings == null) {
             this.ha = null;
-            this.override = selected;
+            published = selected;
         } else {
             // One handler read. The config snapshot is that handler until a generation is published.
             Supplier<Handler> generationLeaf;
@@ -219,8 +228,20 @@ public final class SjwsServer implements AutoCloseable {
                 generationLeaf = this.live::handler;
             }
             this.ha = HaRuntime.create(haSettings, generationLeaf);
-            this.override = this.ha.handler();
+            published = this.ha.handler();
         }
+        if (snapshot.document().node().mode() == NodeSettings.Mode.DATA) {
+            var guard = sjws_nettask.cp.DataPlaneGuard.forDocument(snapshot.document());
+            this.dataPlane = guard;
+            if (this.ha != null) {
+                this.ha.health().setDataPlaneReady(guard::ready);
+            } else {
+                Handler current = published;
+                published = new DataReadyHandler(
+                        () -> current != null ? current : this.live.handler(), guard::ready);
+            }
+        }
+        this.override = published;
         if (config.cacheBytes() > Runtime.getRuntime().maxMemory() / 2) {
             System.err.println("WARN: --cache-bytes=" + config.cacheBytes()
                     + " is more than half of the maximum heap (" + Runtime.getRuntime().maxMemory()
@@ -417,6 +438,11 @@ public final class SjwsServer implements AutoCloseable {
         return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, null);
     }
 
+    /** Config-file startup with HA attached (data-role {@code /readyz} still follows last-good). */
+    public static SjwsServer start(ConfigLoader.Loaded loaded, HaSettings ha) throws IOException {
+        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, ha, null, true, null);
+    }
+
     /** Package-visible so same-package tests can wire a custom {@code h2Factory} with a file-backed reload. */
     static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal)
@@ -445,48 +471,20 @@ public final class SjwsServer implements AutoCloseable {
         }
         var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal, ha, verifier,
                 contributors);
+        server.contentH3Factory = h3Factory;
+        server.contentH2Factory = h2Factory;
         if (bindContent) {
-            if (snapshot.document().server().h3Enabled()) {
-                server.startH3(h3Factory, storedCertificate(snapshot));
-            }
-            if (snapshot.document().server().h2Enabled()) {
-                server.startH2(h2Factory);
-            }
             try {
-                server.tcp = bind(snapshot.document().server().port(), snapshot.document().server().backlog());
-            } catch (IOException e) {
-                server.close();
-                throw e;
-            }
-            Supplier<Handler> handlers = server.override != null ? () -> server.override : server.live::handler;
-            server.manager = new ClientManager(server.tcp, snapshot.document().server(), handlers, server.altSvc,
-                    null, server.armed);
-            server.attachGauges(server.slot.get().metrics());
-            if (server.ha != null) {
-                server.manager.setDrainSignal(server.ha.lifecycle()::closeAfterResponse);
-                server.manager.onAcceptLoopExit(() -> server.ha.health().setAlive(false));
-                IntSupplier pause = server.ha.settings().acceptPause();
-                if (pause != null) {
-                    server.manager.setAcceptPause(pause);
+                if (!server.bindContentPort()) {
+                    server.close();
+                    throw new IOException("content port was not bound");
                 }
-            }
-            server.acceptThread = new Thread(server.manager, "accept-loop");
-            server.acceptThread.start();
-            try {
-                server.openChallenge(snapshot);
             } catch (IOException e) {
                 server.close();
                 throw e;
             }
         } else {
-            server.acceptThread = new Thread(() -> {
-                try {
-                    server.contentless.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }, "service-idle");
-            server.acceptThread.start();
+            server.startIdleAccept();
         }
         server.leadership = leadershipFor(snapshot);
         server.reloadHook = ReloadHook.register(server::onReload);
@@ -771,6 +769,16 @@ public final class SjwsServer implements AutoCloseable {
                     System.err.println("WARN: control-plane last-good was not saved: " + e.getMessage());
                 }
                 persistLastGood(published.snapshot().document());
+                dataPlane().applied(snapshot, true);
+                var pushed = published.snapshot().document().node().maxStaleness();
+                if (pushed != null) {
+                    dataPlane().maxStaleness(pushed);
+                }
+                try {
+                    bindContentPort();
+                } catch (IOException e) {
+                    System.err.println("WARN: content port was not bound after last-good: " + e.getMessage());
+                }
                 var appliedMw = published.snapshot().document().middleware();
                 syncCredentialQueryParamsFromConfig(published.snapshot().document());
                 sjws_nettask.config.MiddlewareSecrets.logStartupWarn(
@@ -951,6 +959,10 @@ public final class SjwsServer implements AutoCloseable {
 
     private void persistLastGood(ConfigDocument document) {
         if (document.node().mode() != NodeSettings.Mode.DATA) {
+            return;
+        }
+        // Do not overwrite a signed control-plane last-good (readiness and expiry live there).
+        if (sjws_nettask.cp.DataApply.tryReadLastGood(document.stateDir()).isPresent()) {
             return;
         }
         try {
@@ -1449,7 +1461,123 @@ public final class SjwsServer implements AutoCloseable {
         return this.altSvc;
     }
 
-    public int tcpPort() {
+    /** True when the content TCP listener is bound. */
+    public boolean contentBound() {
+        return this.tcp != null && this.tcp.isOpen();
+    }
+
+    /**
+     * Data-role last-good / max-staleness guard. {@link sjws_nettask.cp.DataPlaneGuard#INACTIVE}
+     * when this process is not a data node.
+     */
+    public sjws_nettask.cp.DataPlaneGuard dataPlane() {
+        return this.dataPlane instanceof sjws_nettask.cp.DataPlaneGuard guard
+                ? guard
+                : sjws_nettask.cp.DataPlaneGuard.inactive();
+    }
+
+    /**
+     * Bind the content port if it is not bound yet. Idempotent. A data node calls this after
+     * the first verified last-good is applied. Returns false if the server is already closed.
+     */
+    public boolean bindContentPort() throws IOException {
+        this.contentBindLock.lock();
+        try {
+            if (this.closed.get()) {
+                return false;
+            }
+            if (contentBound()) {
+                return true;
+            }
+            var snapshot = this.live.get();
+            startIdleAccept();
+            try {
+                if (snapshot.document().server().h3Enabled()) {
+                    startH3(this.contentH3Factory, storedCertificate(snapshot));
+                }
+                if (snapshot.document().server().h2Enabled()) {
+                    startH2(this.contentH2Factory);
+                }
+                this.tcp = bind(snapshot.document().server().port(), snapshot.document().server().backlog());
+                Supplier<Handler> handlers = this.override != null ? () -> this.override : this.live::handler;
+                this.manager = new ClientManager(this.tcp, snapshot.document().server(), handlers, this.altSvc,
+                        null, this.armed);
+                attachGauges(this.slot.get().metrics());
+                if (this.ha != null) {
+                    this.manager.setDrainSignal(this.ha.lifecycle()::closeAfterResponse);
+                    this.manager.onAcceptLoopExit(() -> this.ha.health().setAlive(false));
+                    IntSupplier pause = this.ha.settings().acceptPause();
+                    if (pause != null) {
+                        this.manager.setAcceptPause(pause);
+                    }
+                }
+                openChallenge(snapshot);
+                this.contentless.countDown();
+                Thread idle = this.acceptThread;
+                this.acceptThread = new Thread(this.manager, "accept-loop");
+                this.acceptThread.start();
+                if (idle != null && idle != this.acceptThread) {
+                    try {
+                        idle.join(1_000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                return true;
+            } catch (IOException | RuntimeException e) {
+                rollbackContentBind();
+                if (e instanceof IOException io) {
+                    throw io;
+                }
+                throw new IOException("content port was not bound: " + e.getMessage(), e);
+            }
+        } finally {
+            this.contentBindLock.unlock();
+        }
+    }
+
+    private void startIdleAccept() {
+        if (this.acceptThread != null) {
+            return;
+        }
+        this.acceptThread = new Thread(() -> {
+            try {
+                this.contentless.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "service-idle");
+        this.acceptThread.start();
+    }
+
+    /** Undo a failed late bind without shutting the process down. */
+    private void rollbackContentBind() {
+        this.challengeHttp = closeQuietly(this.challengeHttp);
+        if (this.manager != null) {
+            try {
+                this.manager.close();
+            } catch (RuntimeException e) {
+                System.err.println("WARN: " + e);
+            }
+            this.manager = null;
+        }
+        this.tcp = closeQuietly(this.tcp);
+        this.h2 = closeQuietly(this.h2);
+        this.h3 = closeQuietly(this.h3);
+    }
+
+    private static <T extends AutoCloseable> T closeQuietly(T resource) {
+        if (resource != null) {
+            try {
+                resource.close();
+            } catch (Exception e) {
+                System.err.println("WARN: " + e);
+            }
+        }
+        return null;
+    }
+
+        public int tcpPort() {
         if (this.tcp == null) {
             return -1;
         }

@@ -181,15 +181,21 @@ implemented outside this daemon slice, in `sjws_nettask.cp`.
    `config-version`). `--status` stays `connection=pending` until something calls
    `attach`. Do not treat "service started" as "config applied".
 
-4. **Data node, control plane down.** Decided behaviour, implemented by the control-plane
-   and HA workstream: boot from last-good when that
-   snapshot is present; otherwise not-ready (`503` on `/readyz`, content port not bound)
-   and retry with backoff. Past max-staleness, readiness is false and the process keeps
-   serving. There is no automatic drain. For role data this daemon starts the watch client
-   (`cp.DataWatch`, a long poll), which moves `connection` between `pending`, `connected`
-   and `disconnected`. A missing config file on a data
+4. **Data node, control plane down.** Boot from a verified signed last-good when
+   that snapshot is present; otherwise not-ready (content port not bound, so
+   `/readyz` is unreachable until the first apply, then `503` if still not ready)
+   and retry with backoff. Past max-staleness, readiness is false and the process
+   keeps serving. There is no automatic drain. Readiness is `NodeLifecycle.dataPlane`
+   against the signed `expiresAtMillis` and an optional `node.max_staleness`
+   ceiling on `issuedAtMillis` (no default ceiling). The data-role content port
+   binds only after that signed last-good exists, unless `--bind-content` or
+   `server.bind_content` forces a bind. For role data this daemon starts the watch
+   client (`cp.DataWatch`, a long poll), which moves `connection` between
+   `pending`, `connected` and `disconnected`, and late-binds the content port after
+   the first applied snapshot. A missing config file on a data
    node already boots from `<stateDir>/config/last-good.json` when the envelope hash
-   matches and `node.mode` is `data`. A leftover sibling `<file>.last-good` is read
+   matches and `node.mode` is `data`. An unsigned `LastGoodStore` boot file is not
+   a verified last-good for readiness. A leftover sibling `<file>.last-good` is read
    once when that JSON file is absent (`LastGoodStore`). `Requires=` stays off the data unit.
 
 5. **SIGHUP is reload.** The daemon child installs `ReloadHook`. `ExecReload` is

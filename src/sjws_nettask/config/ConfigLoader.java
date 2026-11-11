@@ -261,12 +261,19 @@ public final class ConfigLoader {
             return NodeSettings.STANDALONE;
         }
         var map = YamlValues.mapping(node, "node");
-        YamlValues.knownKeys(map, List.of("mode", "labels", "state_dir"), "node");
+        YamlValues.knownKeys(map, List.of("mode", "labels", "state_dir", "max_staleness"), "node");
         var mode = map.containsKey("mode")
                 ? NodeSettings.Mode.parse(text(map.get("mode"), "node.mode"))
                 : NodeSettings.Mode.STANDALONE;
         var labels = map.containsKey("labels") ? labels(map.get("labels")) : Map.<String, String>of();
-        return new NodeSettings(mode, labels);
+        Duration maxStaleness = null;
+        if (map.containsKey("max_staleness")) {
+            maxStaleness = Durations.parse(text(map.get("max_staleness"), "node.max_staleness"), "node.max_staleness");
+            if (maxStaleness.compareTo(NodeSettings.MAX_STALENESS) > 0) {
+                throw new ConfigException("node.max_staleness: must be at most 7d");
+            }
+        }
+        return new NodeSettings(mode, labels, maxStaleness);
     }
 
     private static Path stateDirKey(Map<String, Object> root, Path base) {

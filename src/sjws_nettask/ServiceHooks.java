@@ -46,4 +46,12 @@ public interface ServiceHooks {
     default String nodeMode() {
         return null;
     }
+
+    /**
+     * Bootstrap {@code state-dir} for a signed last-good lookup, or null when this hook does
+     * not name one. The request path does not call this.
+     */
+    default Path stateDir() {
+        return null;
+    }
 }

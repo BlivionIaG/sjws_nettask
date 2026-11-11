@@ -652,7 +652,7 @@ public class Sjws_nettask {
             }
         }
         loaded = applyProcessMode(loaded, choice, hooks);
-        boolean bindContent = resolveBind(opt, loaded, err);
+        boolean bindContent = resolveBind(opt, loaded, err, hooks);
         if (child) {
             ReloadHook.installSighup();
         }
@@ -741,14 +741,21 @@ public class Sjws_nettask {
             return loaded;
         }
         return loaded.withDocument(loaded.document().withNode(
-                new sjws_nettask.config.NodeSettings(sjws_nettask.config.NodeSettings.Mode.parse(mode), node.labels())));
+                new sjws_nettask.config.NodeSettings(sjws_nettask.config.NodeSettings.Mode.parse(mode), node.labels(),
+                        node.maxStaleness())));
     }
 
     /**
      * Content port: an explicit flag or variable, then {@code server.bind_content}, then off for
-     * {@code control} and on otherwise. A difference from the role default is logged.
+     * {@code control} and on for standalone. Data binds only when a verified last-good is present,
+     * unless the operator forced a bind. A difference from the role default is logged.
      */
     static boolean resolveBind(Daemon.Options opt, sjws_nettask.config.ConfigLoader.Loaded loaded, PrintStream err) {
+        return resolveBind(opt, loaded, err, null);
+    }
+
+    static boolean resolveBind(Daemon.Options opt, sjws_nettask.config.ConfigLoader.Loaded loaded, PrintStream err,
+            ServiceHooks hooks) {
         var mode = loaded.document().node().mode();
         boolean byRole = mode != sjws_nettask.config.NodeSettings.Mode.CONTROL;
         Boolean chosen = opt.bindContent();
@@ -758,6 +765,9 @@ public class Sjws_nettask {
             source = "server.bind_content";
         }
         if (chosen == null) {
+            if (mode == sjws_nettask.config.NodeSettings.Mode.DATA) {
+                return hasVerifiedLastGood(loaded, hooks);
+            }
             return byRole;
         }
         if (chosen.booleanValue() != byRole) {
@@ -765,6 +775,14 @@ public class Sjws_nettask {
                     + " content-port default");
         }
         return chosen;
+    }
+
+    /** Signed {@code last-good.json} in the document state dir or the bootstrap {@code state-dir}. */
+    static boolean hasVerifiedLastGood(sjws_nettask.config.ConfigLoader.Loaded loaded, ServiceHooks hooks) {
+        if (loaded != null && sjws_nettask.cp.DataApply.tryReadLastGood(loaded.document().stateDir()).isPresent()) {
+            return true;
+        }
+        return hooks != null && sjws_nettask.cp.DataApply.tryReadLastGood(hooks.stateDir()).isPresent();
     }
 
     /**

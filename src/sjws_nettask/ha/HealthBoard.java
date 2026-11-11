@@ -17,6 +17,7 @@
 package sjws_nettask.ha;
 
 import java.nio.charset.StandardCharsets;
+import java.util.function.BooleanSupplier;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
@@ -44,6 +45,7 @@ public final class HealthBoard {
     private volatile boolean draining;
     private volatile boolean quorumOk = true;
     private volatile boolean requireQuorum;
+    private volatile BooleanSupplier dataPlaneReady = () -> true;
     private volatile Runnable onChange = () -> {
     };
 
@@ -83,7 +85,17 @@ public final class HealthBoard {
     }
 
     public boolean readyNow() {
-        return this.snapshotLoaded && !this.draining && (!this.requireQuorum || this.quorumOk);
+        return this.snapshotLoaded && !this.draining && (!this.requireQuorum || this.quorumOk)
+                && this.dataPlaneReady.getAsBoolean();
+    }
+
+    /**
+     * Data-role last-good / max-staleness gate. Null or absent means ready for this bit
+     * (standalone and HA without a data plane).
+     */
+    public void setDataPlaneReady(BooleanSupplier ready) {
+        this.dataPlaneReady = ready == null ? () -> true : ready;
+        changed();
     }
 
     public void setAlive(boolean alive) {

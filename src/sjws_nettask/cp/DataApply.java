@@ -19,6 +19,7 @@ package sjws_nettask.cp;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Optional;
 import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Base64;
@@ -251,6 +252,31 @@ public final class DataApply {
     /** Reads a snapshot back out of {@code last-good.json}. The caller still runs {@link #decide}. */
     public static SignedSnapshot readLastGood(Path stateDir) throws IOException {
         return parseSnapshot(Files.readString(LastGoodFiles.configDir(stateDir).resolve("last-good.json")));
+    }
+
+    /**
+     * Signed last-good when {@code <stateDir>/config/last-good.json} parses as a control-plane
+     * snapshot with {@code version > 0}. Empty for a missing file, an unsigned
+     * {@code LastGoodStore} envelope, or any parse error. This is the readiness definition of
+     * "has last-good"; the unsigned boot file is not.
+     */
+    public static Optional<SignedSnapshot> tryReadLastGood(Path stateDir) {
+        if (stateDir == null) {
+            return Optional.empty();
+        }
+        try {
+            var path = LastGoodFiles.configDir(stateDir).resolve("last-good.json");
+            if (!Files.isRegularFile(path)) {
+                return Optional.empty();
+            }
+            var snapshot = parseSnapshot(Files.readString(path));
+            if (snapshot.version() <= 0) {
+                return Optional.empty();
+            }
+            return Optional.of(snapshot);
+        } catch (RuntimeException | IOException e) {
+            return Optional.empty();
+        }
     }
 
     /** Parses {@link LastGoodFiles#snapshotJson}. Fields are not verified here; {@link #decide} does that. */
