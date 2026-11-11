@@ -68,6 +68,9 @@ git -C "$SRC/wrk2" checkout --quiet "$WRK2_COMMIT"
 rm -rf "$SRC/wrk2/deps/luajit"
 git clone --quiet https://github.com/LuaJIT/LuaJIT.git "$SRC/wrk2/deps/luajit"
 git -C "$SRC/wrk2/deps/luajit" checkout --quiet "$LUAJIT_COMMIT"
+# LuaJIT 2.1 dropped the luaL_reg alias that wrk2's script.c still uses.
+# The official name (luaL_Reg) has been in the API since Lua 5.1.
+find "$SRC/wrk2/src" -type f \( -name '*.c' -o -name '*.h' \) -print0   | xargs -0 grep -l 'luaL_reg'   | xargs -r sed -i 's/struct luaL_reg/luaL_Reg/g; s/luaL_reg/luaL_Reg/g'
 # wrk2 vendors LuaJIT; -j1 avoids a known parallel build race in that tree.
 make -C "$SRC/wrk2" -j1
 install -m 0755 "$SRC/wrk2/wrk" "$DEST"
