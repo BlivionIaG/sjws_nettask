@@ -4,8 +4,9 @@
 `setsid` when a new session is available, SIGTERM to drain, SIGKILL after the
 drain budget. Those signals are not available as on Linux. The supported way to
 run as a Windows service is a wrapper that starts the jar in the **foreground**
-and stops it with a console control event (CTRL_C / CTRL_BREAK), which runs the
-JVM shutdown hook and therefore `SjwsServer.drain()`.
+and stops it with a console control event (CTRL_C), which runs the
+JVM shutdown hook and therefore `SjwsServer.drain()`. CTRL_BREAK is a thread
+dump on HotSpot, not a shutdown request. WinSW 2.x sends Ctrl+C by default.
 
 Do not pass `--daemon` on Windows. That parent/child split needs `setsid` and
 is not the service manager's process.
@@ -44,10 +45,12 @@ Control and data roles use the same foreground shape. Point `--config` and
 ## Alternatives
 
 [Apache Commons Daemon procrun](https://commons.apache.org/proper/commons-daemon/procrun.html)
-(`prunsrv.exe`) can also host the jar. Use a `StopMode` that signals the JVM
-(for example `StdOutput` / console control), not a hard kill. `sc.exe` plus a
-manual `java -jar` command does not provide a drain on stop unless something
-else sends CTRL_C to that console.
+(`prunsrv.exe`) can also host the jar, but this tree does not ship a
+`StopClass`. procrun `StopMode` is only `jvm`, `Java`, or `exe`; there is no
+`StdOutput` stop mode. Until a first-party stop entry exists, use the WinSW
+sample above, which sends CTRL_C. `sc.exe` plus a manual `java -jar` command
+does not provide a drain on stop unless something else sends CTRL_C to that
+console.
 
 This sample was not executed on Windows in the change that added it; treat path
 and WinSW version details as starting points and verify install/start/stop on

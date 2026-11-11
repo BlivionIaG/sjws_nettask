@@ -90,8 +90,8 @@ sequenceDiagram
 manifest `Class-Path`. macOS launchd and Windows service wrappers start the jar in the foreground
 and must not pass `--daemon`; see [launchd.md](launchd.md) and
 [windows-service.md](windows-service.md). On Windows, `--stop` uses `ProcessHandle.destroy()`
-(`TerminateProcess`), so the drain hook does not run; use a service manager that sends CTRL_C or
-CTRL_BREAK to the JVM.
+(`TerminateProcess`), so the drain hook does not run; use a service manager that sends CTRL_C
+to the JVM. CTRL_BREAK is a thread dump on HotSpot, not a shutdown request.
 The daemon child handles `SIGHUP` by calling `ReloadHook.run()`. `contrib/sjws_nettask.service`
 and the role units set `ExecReload=/bin/kill -HUP $MAINPID`. systemd `active` is the process
 being up; readiness is `/readyz` and `--status`. The units do not call `sd_notify`.

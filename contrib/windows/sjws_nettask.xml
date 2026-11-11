@@ -7,8 +7,9 @@
 
   The built-in stop command uses ProcessHandle.destroy(), which on Windows is
   TerminateProcess and does not run the JVM shutdown hook, so the drain path
-  is skipped. Let WinSW stop the process (it sends CTRL_C / CTRL_BREAK by
-  default, which does run the hook). Keep stoptimeout at least as long as the
+  is skipped. Let WinSW stop the process (WinSW 2.x sends CTRL_C by default,
+  which runs the hook). Do not use CTRL_BREAK: HotSpot treats that as a thread
+  dump, not a shutdown. Keep stoptimeout at least as long as the
   drain budget (default 30s) plus the 5s stop margin, matching the Linux
   units' TimeoutStopSec=45.
 

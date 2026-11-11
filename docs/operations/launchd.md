@@ -21,7 +21,10 @@ works the same as on Linux. `--stop` can also be used (it sends SIGTERM), but
 (default drain budget 30 s plus the 5 s SIGKILL margin, plus headroom). If you
 raise `--drain-budget`, raise `ExitTimeOut` by the same amount.
 
-Reload is SIGHUP, the same hook as `ExecReload` on Linux:
+A normal foreground process still dies on `SIGHUP` (terminal hangup). The
+sample plist sets `SJWS_RELOAD_SIGHUP=1` so the supervised process installs
+the same reload hook as the daemon child. Reload is then SIGHUP, the same
+hook as `ExecReload` on Linux:
 
     sudo launchctl kill HUP system/sjws_nettask
 

@@ -16,7 +16,8 @@
     sudo launchctl enable system/sjws_nettask
     sudo launchctl kickstart -k system/sjws_nettask
 
-  Reload (SIGHUP, same as systemd ExecReload):
+  Reload (SIGHUP, same as systemd ExecReload). This plist sets
+  SJWS_RELOAD_SIGHUP=1 so the foreground process treats hangup as reload:
     sudo launchctl kill HUP system/sjws_nettask
 
   Stop:
@@ -46,6 +47,11 @@
   <string>/usr/local/var/log/sjws_nettask.log</string>
   <key>StandardErrorPath</key>
   <string>/usr/local/var/log/sjws_nettask.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SJWS_RELOAD_SIGHUP</key>
+    <string>1</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

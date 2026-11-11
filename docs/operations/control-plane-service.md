@@ -33,7 +33,8 @@ that probe, and `--status`. Do not treat `systemctl is-active` as leader-ready o
 `ExecReload=/bin/kill -HUP $MAINPID` on the standalone unit and both role units. The
 daemon child handles `SIGHUP` by `ReloadHook.run()`. It is started in a new session
 (`setsid` when `/usr/bin/setsid` exists), so closing the terminal does not deliver
-`SIGHUP`. A foreground process is not given that handler and still dies on hangup.
+`SIGHUP`. A foreground process is not given that handler and still dies on hangup,
+unless `SJWS_RELOAD_SIGHUP=1` (the [launchd](launchd.md) sample sets it).
 On a data node that has accepted a pushed config, reload refreshes local bootstrap
 settings (listen, peers, labels, contact, pin) and does not replace that config.
 Before any push, reload re-reads the local YAML. `systemctl restart` is still a full

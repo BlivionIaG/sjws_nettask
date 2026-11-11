@@ -151,7 +151,7 @@ final class Daemon {
                 active follows that pid file only; it is not readiness. Readiness is /readyz when
                 high availability serves it, and --status. The daemon child handles SIGHUP by
                 reloading (ReloadHook). setsid, when present, still starts a new session so a
-                terminal hangup is not delivered. A foreground process is not given that handler.
+                terminal hangup is not delivered. A foreground process is not given that handler unless SJWS_RELOAD_SIGHUP=1 (the launchd sample sets it).
                 SIGTERM and SIGINT stop accepting new connections and let responses already in
                 progress finish until --shutdown-timeout elapses. HTTP/3's own drain stays 2 seconds
                 (GOAWAY). When high availability is attached, that signal runs the HA drain
