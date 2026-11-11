@@ -18,13 +18,21 @@ In scope:
   quiche natives load.
 - The harness `tests/sjws_nettask/e2e/FileServingEndToEndTest.java`: a real
   `SjwsServer` on port 0, a temporary document root, and `java.net.http.HttpClient`.
+- Real external clients in `tests/sjws_nettask/e2e/ExternalClientEndToEndTest.java`
+  (tags `e2e` and `e2e-clients`) and `tools/e2e-external-clients.sh`. The suite starts
+  a real server (HTTP/1.1, h2c, and HTTP/3 when the natives load) and drives it with
+  curl: HTTP/1.1 200, 404 and a byte range; curl `--http2-prior-knowledge` against
+  h2c and curl `--http3-only` against the QUIC listener when curl was built with those
+  features; `h2load` and a quiche or ngtcp2 client when those binaries are on `PATH`.
+  A missing optional client skips that case. A failed curl HTTP/1.1 check fails the
+  run. HTTPS on the main TCP port is still out of scope.
 
-Out of scope for the harness (it is HTTP/1.1 only; `h2/*` and `h3/*` cover the other
-listeners):
+Out of scope for the FileServing JDK-client harness (it is HTTP/1.1 only; `h2/*` and
+`h3/*` cover the in-process listeners, and `ExternalClientEndToEndTest` covers curl /
+h2load / quiche):
 
-- HTTP/2 (`--h2`, its own TCP port).
-- HTTPS. The main TCP port is cleartext; TLS exists on the HTTP/2 port and as QUIC for
-  HTTP/3.
+- HTTP/2 through `HttpClient` inside `FileServingEndToEndTest` itself.
+- HTTPS on the main TCP port. TLS exists on the HTTP/2 port and as QUIC for HTTP/3.
 
 `mvn test` runs every test except those tagged `jar`. `mvn verify` also packages
 the jar, runs the `jar` tests, and enforces the JaCoCo package gates in `pom.xml`.
@@ -171,7 +179,8 @@ The rest of the suite:
   agent), and the coverage gate. `FileServingEndToEndTest` is part of that
   default Surefire run (it is not in the `jar` exclude).
 - The following step runs the harness on its own and fails if the `e2e` group
-  matches nothing:
+  matches nothing (FileServing plus the external-client suite; optional clients
+  skip when the binary is missing):
 
   `mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test`
 
@@ -311,9 +320,10 @@ No test under `tests/` is `@Disabled`.
 
 Not implemented. Nothing above depends on these.
 
-- HTTP/2 inside `FileServingEndToEndTest`. The harness stays HTTP/1.1;
+- HTTP/2 inside `FileServingEndToEndTest`. The JDK-client harness stays HTTP/1.1;
   `h2/Http2ServerTest` already drives the real `Http2Server` (ALPN, h2c) with the JDK
-  `HttpClient`.
+  `HttpClient`. The external-client suite covers curl `--http2-prior-knowledge` and
+  optional `h2load` against h2c.
 - HTTPS on the main TCP port. The main listener stays cleartext; HTTPS exists only on
   the HTTP/2 listener's own port (`--h2-port`). A TLS accept path on the main port
   would be a new server path.
@@ -321,7 +331,9 @@ Not implemented. Nothing above depends on these.
   parsers keep `0` as ephemeral; startup prints `HTTP/1.1 on tcp/<bound>`. YAML
   `server.port: 0` already worked.
 - HTTP/3 inside `FileServingEndToEndTest`. The same temporary root and ephemeral
-  port are already covered by `h3/Http3ServerTest` and `h3/JarLaunchTest`.
+  port are already covered by `h3/Http3ServerTest` and `h3/JarLaunchTest`. The
+  external-client suite covers curl `--http3-only` (when curl was built with HTTP/3)
+  and a quiche or ngtcp2 client when one is on `PATH`.
 - Dropping fixed `Thread.sleep` calls that only poll for a condition, in favour
   of the deadline loops the transport tests already use. Sleeps that exist to
   outlast a deadline stay.
