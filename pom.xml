@@ -18,7 +18,7 @@
     <junit.version>6.1.3</junit.version>
     <!-- Run only the green suite with: mvn test -DexcludedGroups=bug -->
     <excludedGroups></excludedGroups>
-    <netty.version>4.2.19.Final</netty.version>
+    <netty.version>4.2.20.Final</netty.version>
     <!-- Coverage gate for the h3 and tls packages. Their tests need the QUIC natives, which Netty ships
          only for linux-x86_64/aarch64, osx-x86_64/aarch64 and windows-x86_64; the h3-gate-* profiles
          below raise these on exactly those platforms. Elsewhere the h3 tests skip themselves and the gate
@@ -145,7 +145,7 @@
       <plugin>
         <groupId>org.jacoco</groupId>
         <artifactId>jacoco-maven-plugin</artifactId>
-        <version>0.8.15</version>
+        <version>0.8.16</version>
         <executions>
           <execution>
             <id>prepare-agent</id>
@@ -458,7 +458,7 @@
           <plugin>
             <groupId>org.pitest</groupId>
             <artifactId>pitest-maven</artifactId>
-            <version>1.30.1</version>
+            <version>1.30.2</version>
             <dependencies>
               <dependency>
                 <groupId>org.pitest</groupId>
