@@ -98,9 +98,34 @@ jobs:
           # QUIC (HTTP/3) natives must load on the image's glibc.
           docker exec "$NAME" java --enable-native-access=ALL-UNNAMED \
             -cp '/opt/sjws/healthcheck:/opt/sjws/lib/*' HealthCheck --quic
+          # The default image stays distroless: no shell.
+          if docker exec "$NAME" sh -c 'echo unexpected-shell'; then
+            echo "default image must not have a shell"
+            exit 1
+          fi
       - name: Logs
         if: always()
         run: docker logs "$NAME" 2>&1 | tail -n 100 || true
       - name: Tear down
         if: always()
         run: docker rm -f "$NAME" || true
+      - name: Build debug image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          target: debug
+          tags: ${{ env.IMAGE }}-debug
+          cache-from: type=gha,scope=sjws-image
+      - name: Debug image has a shell and stays non-root
+        run: |
+          set -x
+          docker image ls "${IMAGE}-debug"
+          user="$(docker inspect -f '{{.Config.User}}' "${IMAGE}-debug")"
+          echo "debug image user: $user"
+          [ -n "$user" ] && [ "${user%%:*}" != 0 ] && [ "${user%%:*}" != root ]
+          # distroless debug-nonroot ships busybox as /busybox/sh.
+          out="$(docker run --rm --entrypoint /busybox/sh "${IMAGE}-debug" -c 'echo shell-ok')"
+          echo "$out"
+          [ "$out" = "shell-ok" ]

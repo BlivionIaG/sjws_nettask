@@ -116,15 +116,38 @@ class PeerLinkTest {
     }
 
     static String map(int n) throws IOException {
-        var sb = new StringBuilder();
-        for (int i = 1; i <= n; i++) {
-            int port;
-            try (var s = new ServerSocket(0)) {
-                port = s.getLocalPort();
+        // Hold every reservation open until the map is built so two peers cannot
+        // be assigned the same ephemeral port (PeerConfig rejects duplicate addresses).
+        var sockets = new ServerSocket[n];
+        try {
+            var seen = new java.util.HashSet<Integer>();
+            for (int i = 0; i < n; i++) {
+                while (true) {
+                    var s = new ServerSocket(0);
+                    int port = s.getLocalPort();
+                    if (seen.add(port)) {
+                        sockets[i] = s;
+                        break;
+                    }
+                    s.close();
+                }
             }
-            sb.append(i > 1 ? "," : "").append((char) ('a' + i - 1)).append('=').append(i).append("@127.0.0.1:").append(port);
+            var sb = new StringBuilder();
+            for (int i = 0; i < n; i++) {
+                if (i > 0) {
+                    sb.append(',');
+                }
+                sb.append((char) ('a' + i)).append('=').append(i + 1)
+                        .append("@127.0.0.1:").append(sockets[i].getLocalPort());
+            }
+            return sb.toString();
+        } finally {
+            for (var s : sockets) {
+                if (s != null) {
+                    s.close();
+                }
+            }
         }
-        return sb.toString();
     }
 
     /** Owner that serves {@code fwd.*} topics from a per-test directory and records the authenticated origins. */

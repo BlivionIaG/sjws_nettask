@@ -597,6 +597,27 @@ page such as `Allow`, `Content-Range` or `Retry-After` are kept. Routes without
 `listing: false` answers a directory without `index.html` with 404, as if it did
 not exist. The route still shares the document root, access policy and file cache.
 
+These three fields are per route today. Node labels exist (`node.labels`) and the
+filter document already has a label selector, but a control-plane envelope cannot
+yet set `errors`, `problem_type` or `listing` per label. The intended contract,
+when that envelope field exists, is:
+
+- A versioned overlay lists one or more entries, each with a label selector (the
+  same comma-separated syntax as a filter `scope.labels`: `edge,!internal`; `*` or
+  omit matches every node) and, optionally, a route pattern. Each entry may set
+  `errors`, `problem_type` and/or `listing`.
+- The overlay is compiled when the snapshot is applied, using this node's labels.
+  The request path does not look at labels. An entry that does not match this node
+  is ignored for the compiled routes (it is still validated, so a bad value fails
+  the whole document).
+- A value the route itself sets always wins. The overlay fills only a field the
+  route left at the default (`errors: html`, `listing: true`, no `problem_type`).
+- A later label change on the node re-applies the same config version, the same
+  way a filter document of equal version is applied again.
+
+Until the control plane publishes that field, every route keeps the settings
+written on it in YAML. This server does not invent a local label-overlay key.
+
 ## Middleware
 
 A list, stored and not applied. An empty list (or a missing key) is no chain and
