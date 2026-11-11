@@ -54,6 +54,8 @@ public final class EmbeddedServerControl implements ServerControl {
     private volatile Instant startedAt;
     private volatile String lastError;
     private volatile ClusterBoard cluster;
+    private volatile java.util.function.Supplier<java.util.Map<String, sjws_nettask.messaging.delivery.LedgerInspector>> queues;
+    private volatile java.util.function.LongSupplier queueClock = System::currentTimeMillis;
 
     public EmbeddedServerControl(Supplier<ServerConfig> configSource, LogBuffer log) {
         this(configSource, SjwsServer::start, log, Clock.systemUTC());
@@ -99,6 +101,52 @@ public final class EmbeddedServerControl implements ServerControl {
         var server = this.server;
         if (server != null) {
             server.attachClusterMetrics(board == null ? null : board::status);
+        }
+    }
+
+    /** Attaches the messaging topics the Queues view reads (#384); {@code null} detaches. */
+    public void attachQueues(
+            java.util.function.Supplier<java.util.Map<String, sjws_nettask.messaging.delivery.LedgerInspector>> topics) {
+        attachQueues(topics, System::currentTimeMillis);
+    }
+
+    /** As {@link #attachQueues(java.util.function.Supplier)}, dating ages with the topics' own clock. */
+    public void attachQueues(
+            java.util.function.Supplier<java.util.Map<String, sjws_nettask.messaging.delivery.LedgerInspector>> topics,
+            java.util.function.LongSupplier clockMs) {
+        this.queueClock = java.util.Objects.requireNonNull(clockMs);
+        this.queues = topics;
+    }
+
+    @Override
+    public java.util.List<QueueView> queues() {
+        var source = this.queues;
+        if (source == null) {
+            return java.util.List.of();
+        }
+        try {
+            return QueueView.read(source.get(), this.queueClock.getAsLong());
+        } catch (RuntimeException e) {
+            this.log.add("queue snapshot failed: " + e.getMessage());
+            return java.util.List.of();
+        }
+    }
+
+    @Override
+    public java.util.List<QueueView.Entry> deadLetters(String topic, String group, long fromOffset, int limit)
+            throws ControlException {
+        var source = this.queues;
+        if (source == null) {
+            throw new ControlException("messaging is not enabled");
+        }
+        var inspector = source.get().get(topic);
+        if (inspector == null) {
+            throw new ControlException("unknown topic " + topic);
+        }
+        try {
+            return QueueView.deadLetters(inspector, group, fromOffset, limit);
+        } catch (IllegalArgumentException e) {
+            throw new ControlException(e.getMessage(), e);
         }
     }
 

@@ -38,8 +38,9 @@ public final class AdminTui {
     static final String RESET = "\u001b[0m";
     static final int LOG_LINES = 15;
     static final int FILE_TAIL_BYTES = 256 * 1024;
+    static final int QUEUE_PAGE = 20;
 
-    enum View { STATUS, CONFIG, LOGS }
+    enum View { STATUS, CONFIG, LOGS, QUEUES }
 
     private final ServerControl control;
     private final LogBuffer log;
@@ -47,6 +48,8 @@ public final class AdminTui {
     private final boolean ansi;
     private View view = View.STATUS;
     private String message = "";
+    private String dlqTitle = "";
+    private java.util.List<QueueView.Entry> dlqPage = java.util.List.of();
 
     /** @param logFile extra file shown in the logs view (e.g. redirected server output), or null */
     public AdminTui(ServerControl control, LogBuffer log, Path logFile, boolean ansi) {
@@ -75,11 +78,16 @@ public final class AdminTui {
         var cmd = line.trim().toLowerCase(Locale.ROOT);
         this.message = "";
         try {
+            if (cmd.startsWith("d ")) {
+                deadLetters(line.trim().substring(2).trim());
+                return true;
+            }
             switch (cmd) {
                 case "", "u" -> this.message = "refreshed";
                 case "1", "v" -> this.view = View.STATUS;
                 case "2", "c" -> this.view = View.CONFIG;
                 case "3", "l" -> this.view = View.LOGS;
+                case "4", "m" -> this.view = View.QUEUES;
                 case "s" -> act("start", this.control::start);
                 case "x" -> act("stop", this.control::stop);
                 case "r" -> act("reload", this.control::reload);
@@ -89,7 +97,8 @@ public final class AdminTui {
                 default -> this.message = "unknown command '" + line.trim() + "' (h for help)";
             }
             if (cmd.equals("h") || cmd.equals("?")) {
-                this.message = "commands: s start, x stop, r reload, v/c/l status/config/logs, Enter refresh, q quit";
+                this.message = "commands: s start, x stop, r reload, v/c/l/m status/config/logs/queues,"
+                        + " d <topic> <group> [from] dead letters, Enter refresh, q quit";
             }
         } catch (ServerControl.ControlException e) {
             this.message = color(RED, "error: " + e.getMessage());
@@ -119,7 +128,8 @@ public final class AdminTui {
         sb.append(color(BOLD, "sjws admin")).append("  [")
                 .append(tab(View.STATUS, "v status")).append(" | ")
                 .append(tab(View.CONFIG, "c config")).append(" | ")
-                .append(tab(View.LOGS, "l logs")).append("]\n");
+                .append(tab(View.LOGS, "l logs")).append(" | ")
+                .append(tab(View.QUEUES, "m queues")).append("]\n");
         sb.append("State: ").append(stateText(status.state()));
         if (status.state() == ServerStatus.State.RUNNING) {
             sb.append("  up ").append(formatUptime(status.uptime()));
@@ -129,6 +139,7 @@ public final class AdminTui {
             case STATUS -> renderStatus(sb, status);
             case CONFIG -> status.config().forEach((k, v) -> sb.append(String.format("  %-22s %s%n", k, v)));
             case LOGS -> renderLogs(sb);
+            case QUEUES -> renderQueues(sb);
         }
         sb.append('\n');
         if (!this.message.isEmpty()) {
@@ -184,6 +195,71 @@ public final class AdminTui {
             sb.append(String.format(Locale.ROOT, "  api-key %s  requests %d  errors %d  p99 %s%n", key.name(),
                     key.requests(), key.errors(), latency(key.p99Nanos())));
         }
+    }
+
+    private void deadLetters(String args) throws ServerControl.ControlException {
+        var parts = args.split("\\s+");
+        if (parts.length < 2 || parts.length > 3) {
+            this.message = "usage: d <topic> <group> [fromOffset]";
+            return;
+        }
+        long from = 0;
+        if (parts.length == 3) {
+            try {
+                from = Long.parseLong(parts[2]);
+            } catch (NumberFormatException e) {
+                this.message = "fromOffset must be a number";
+                return;
+            }
+        }
+        this.dlqPage = this.control.deadLetters(parts[0], parts[1], from, QUEUE_PAGE);
+        this.dlqTitle = printable(parts[0]) + " / " + printable(parts[1]) + " from " + from;
+        this.view = View.QUEUES;
+        this.message = this.dlqPage.size() == QUEUE_PAGE
+                ? "next page: d " + parts[0] + " " + parts[1] + " " + (this.dlqPage.get(QUEUE_PAGE - 1).offset() + 1)
+                : "dead letters: " + this.dlqPage.size();
+    }
+
+    private void renderQueues(StringBuilder sb) {
+        var queues = this.control.queues();
+        if (queues.isEmpty()) {
+            sb.append("  messaging is not enabled or has no consumer groups\n");
+        } else {
+            renderQueueTable(sb, queues);
+        }
+        if (!this.dlqTitle.isEmpty()) {
+            sb.append("Dead letters ").append(this.dlqTitle).append(" (payloads not shown):\n");
+            for (var e : this.dlqPage) {
+                sb.append(String.format(Locale.ROOT, "  @%d attempts %d size %d consumer %s reason %s%n", e.offset(),
+                        e.attempts(), e.size(), e.consumer() == null || e.consumer().isBlank() ? "-" : printable(e.consumer()),
+                        e.reason() == null || e.reason().isBlank() ? "-" : printable(e.reason())));
+            }
+        }
+    }
+
+    private static void renderQueueTable(StringBuilder sb, java.util.List<QueueView> queues) {
+        sb.append(String.format(Locale.ROOT, "  %-20s %-16s %9s %9s %9s %10s%n", "topic", "group", "pending",
+                "in-flight", "dlq", "oldest"));
+        for (var q : queues) {
+            sb.append(String.format(Locale.ROOT, "  %-20s %-16s %9d %9d %9d %10s%s%n", printable(q.topic()),
+                    printable(q.group()),
+                    q.pending(), q.inFlight(), q.deadLettered(),
+                    q.oldestPendingAgeMs() < 0 ? "-" : formatUptime(Duration.ofMillis(q.oldestPendingAgeMs())),
+                    q.truncated() ? " (lists truncated)" : ""));
+        }
+    }
+
+    /** Names and reasons come from clients: control characters become '?', and long values are cut. */
+    static String printable(String s) {
+        var sb = new StringBuilder(Math.min(s.length(), 120));
+        for (int i = 0; i < s.length() && sb.length() < 120; i++) {
+            char c = s.charAt(i);
+            sb.append(c < 0x20 || (c >= 0x7f && c <= 0x9f) ? '?' : c);
+        }
+        if (s.length() > 120) {
+            sb.append("...");
+        }
+        return sb.toString();
     }
 
     private static String latency(long nanos) {

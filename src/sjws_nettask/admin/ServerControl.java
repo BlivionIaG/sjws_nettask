@@ -38,6 +38,23 @@ public interface ServerControl extends AutoCloseable {
         return null;
     }
 
+    /**
+     * Message queues for the Queues view (#384): one row per topic and consumer group, read from
+     * Messaging Core snapshots. Empty when messaging is not enabled. Never throws.
+     */
+    default java.util.List<QueueView> queues() {
+        return java.util.List.of();
+    }
+
+    /**
+     * One page of dead-lettered entries (no payloads) of {@code group} on {@code topic}.
+     * @throws ControlException when the topic or group is unknown or messaging is not enabled
+     */
+    default java.util.List<QueueView.Entry> deadLetters(String topic, String group, long fromOffset, int limit)
+            throws ControlException {
+        throw new ControlException("messaging is not enabled");
+    }
+
     /** Starts the server if stopped. @throws ControlException if it cannot start */
     void start() throws ControlException;
 
