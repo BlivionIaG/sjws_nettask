@@ -141,7 +141,7 @@ public final class ConfigLoader {
                 var source = json;
                 if (recovered == null) {
                     var legacy = LastGoodStore.beside(requested);
-                    recovered = unsignedLastGoodYaml(legacy);
+                    recovered = unsignedLastGoodYaml(legacy, recoveryPin);
                     source = legacy;
                 }
                 if (recovered == null) {
@@ -304,21 +304,14 @@ public final class ConfigLoader {
         return path;
     }
 
-    /**
-     * Missing-config recovery. A signed last-good is used only when it verifies under the
-     * resolved bootstrap pin (none: not a boot source); an unsigned boot envelope is still read.
-     */
+    /** Missing-config recovery from the state dir. The file checks and refusals are in {@link LastGoodStore}. */
     private static String recoverLastGoodYaml(Path json, Path state, Path pin) {
-        if (LastGoodStore.signature(json) != null) {
-            return sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(state, pin)
-                    .map(value -> value.snapshot().canonicalYaml()).orElse(null);
-        }
-        return LastGoodStore.dataPlaneYaml(json);
+        return LastGoodStore.recoveryYaml(json, state, pin);
     }
 
-    /** A signed file beside the config is only a boot source through the pinned path above. */
-    private static String unsignedLastGoodYaml(Path legacy) {
-        return LastGoodStore.signature(legacy) != null ? null : LastGoodStore.dataPlaneYaml(legacy);
+    /** The legacy file beside the config: unsigned, and only when no bootstrap pin is set. */
+    private static String unsignedLastGoodYaml(Path legacy, Path pin) {
+        return LastGoodStore.legacyRecoveryYaml(legacy, pin);
     }
 
     /**
