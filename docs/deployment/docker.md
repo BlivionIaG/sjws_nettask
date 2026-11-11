@@ -5,7 +5,7 @@ The repository's `Dockerfile` builds a two-stage image:
 * **build**: `maven:3.9-eclipse-temurin-25`. `pom.xml` is copied and dependencies are fetched first
   (BuildKit cache mount on `~/.m2`), then `src/` is compiled and packaged with `-DskipTests`
   (tests run in CI, not in the image build).
-* **runtime**: `gcr.io/distroless/cc-debian12` (glibc and libstdc++ for the QUIC natives, no shell)
+* **runtime** (default image): `gcr.io/distroless/cc-debian12` (glibc and libstdc++ for the QUIC natives, no shell)
   with a `jlink` runtime in `/opt/java` (modules from `jdeps` plus a fixed manual set; `tools/check-jlink-modules.sh` / docker.yml job `jlink-modules` fails on drift, see #411; debug info,
   man pages and headers stripped, zip-compressed), and `/opt/sjws/sjws_nettask.jar` and `/opt/sjws/lib/`
   (Netty and the Linux QUIC natives, on the manifest Class-Path; the macOS/Windows native jars are dropped). Runs as the non-root
@@ -31,9 +31,18 @@ Ports: `8080/tcp` is plain HTTP. `8443/tcp` and `8443/udp` are declared for TLS 
 certificate and key and pass the matching TLS options to use them. Files in a mounted document
 root must be readable by uid 10001.
 
+An optional **debug** variant adds a busybox shell from `gcr.io/distroless/cc-debian12:debug-nonroot`.
+It keeps the same jlink runtime, jar, document root, health check, and non-root uid 10001. The default
+`docker build` (no `--target`) is still the shell-less runtime image.
+
+    docker build --target debug -t sjws_nettask:debug .
+    docker run --rm -p 8080:8080 sjws_nettask:debug
+    docker run --rm --entrypoint /busybox/sh sjws_nettask:debug -c 'ls /opt/sjws'
+
 CI: `.github/workflows/docker.yml` builds the image with Buildx (GitHub Actions cache), starts it,
 waits for `healthy`, checks `/healthz`, a static file and that the process is not root, then removes
-it. Nothing is pushed to a registry.
+it. It also builds the debug target and checks that `/busybox/sh` runs as the non-root user. Nothing
+is pushed to a registry.
 
 
 See [JVM flag profiles](../operations/jvm-flags.md) for G1 / ZGC / Serial recommendations measured outside the image.

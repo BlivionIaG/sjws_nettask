@@ -27,6 +27,13 @@ In scope:
   curl is required for the HTTP/1.1 smoke: a missing curl fails that case. A missing
   optional client (`h2load`, HTTP/3 curl, quiche or ngtcp2) skips that case. A failed
   curl HTTP/1.1 check fails the run. HTTPS on the main TCP port is still out of scope.
+- Composed proxy + routing + middleware in
+  `tests/sjws_nettask/e2e/ProxyRoutingMiddlewareEndToEndTest.java` (tag `e2e`): a
+  real listener, a YAML route table (proxy `/api` plus static `/`), and at least two
+  gateway filters (`request-size`, `cors`, `header-rewrite`). It asserts filter
+  order and scoping, short-circuit (414 / CORS preflight) before the upstream,
+  upstream failure (502/504) without taking the process down, and a streamed body
+  plus a cancelled mid-response read.
 
 Out of scope for the FileServing JDK-client harness (it is HTTP/1.1 only; `h2/*` and
 `h3/*` cover the in-process listeners, and `ExternalClientEndToEndTest` covers curl /
@@ -190,10 +197,13 @@ The rest of the suite:
 
   `mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test`
 
-- `tools/gateway-bench.sh` then runs a short wrk comparison (warm-up 1 s, measure 3 s)
-  of standalone vs gateway-off on Linux, after `apt-get install wrk`. It fails if either mode
-  reports request errors or zero throughput. The 30 s comparison is local; see
-  `bench/README.md`. macOS CI (manual dispatch only) skips that step.
+- `tools/gateway-bench.sh` then runs a short wrk comparison (warm-up 1 s, measure 3 s,
+  `GATEWAY_BENCH_WRK2=0`) of standalone vs gateway-off on Linux, after `apt-get install wrk`.
+  It fails if either mode reports request errors, zero throughput, or a missing RSS reading.
+  The req/s ratio and the RSS kB are printed; they are not failed on magnitude (no measured
+  absolute floor is configured). The 30 s comparison, with wrk2, is the heavy set; see
+  `bench/README.md` and [perf-gate.md](perf-gate.md) (“Fast PR set vs heavy nightly/manual set”).
+  macOS CI (manual dispatch only) skips that step.
 
 - Job `mutation` (cron or `workflow_dispatch` only): `ubuntu-latest`, timeout
   120 minutes, PIT via `mvn -B -P pitest test-compile org.pitest:pitest-maven:mutationCoverage`.
@@ -217,6 +227,14 @@ flowchart TB
         m1["PIT mutation coverage<br/>never on a pull request"] --> m2["Upload target/pit-reports/"]
     end
 ```
+
+Which jobs are the fast PR set versus the heavy nightly/manual set, and which thresholds
+actually fail a run, is documented in [perf-gate.md](perf-gate.md). In short: every Linux PR
+runs the short wrk gateway-bench (RSS recorded, wrk2 off). PRs that touch `src/**` also run
+the A/B perf-gate with wrk2 p99 (relative-to-base thresholds only) and recorded RSS. The
+nightly / labelled `cluster-tests.yml` job runs the full-length wrk+wrk2 gateway-bench and
+records p99 and RSS without an absolute floor. Absolute wrk2 p99 and RSS budgets stay
+measurement-pending until a quiet-box or CI artifact run supplies the numbers.
 
 `.github/workflows/release.yml` is a tag workflow. It is not the test matrix.
 
