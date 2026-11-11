@@ -8,12 +8,21 @@ admin see its status and configuration, tail logs, and start, stop or reload it:
 It takes the server's option flags and `WEB_SERVER_*` variables (not a `--config` file, and not the daemon, role and bootstrap options), plus its own: `--log-file=PATH` (a file
 shown in the logs view, e.g. redirected output), `--no-color`, `--no-autostart`. Commands (letter +
 Enter): `s` start, `x` stop, `n` drain, `r` reload (re-reads arguments and environment; an invalid config
-leaves the server running, a config that fails to bind restores the previous one), `v`/`c`/`l`/`g`
-status/config/logs/metrics views, Enter refresh, `h` help, `q` quit (stops the server). The console talks to
+leaves the server running, a config that fails to bind restores the previous one), `v`/`c`/`l`/`g`/`k`
+status/config/logs/metrics/cluster views, Enter refresh, `h` help, `q` quit (stops the server). The console talks to
 the server only through `sjws_nettask.admin.ServerControl`, so another implementation (e.g. one
 controlling a daemon) can be plugged in. `clusterStatus()` is null until a control plane attaches
 a `ClusterBoard`; the status view then shows cluster requests per second, p99, errors, drifted
 nodes, and per-route totals.
+
+`k` (or `6`) opens the Cluster view (#363). It lists every node in `clusterStatus()` with a
+rolled-up health and named checks: `alive` (DOWN when unreachable), `ready`, `serving` (fails while
+draining) and `config` (fails when the applied version drifts from the desired one). A live node
+that fails any check is DEGRADED. `node <id>` opens one node's checks, and `node` alone clears the
+selection. The view reads the cluster status on a virtual thread and waits at most 2 seconds, so a
+slow status source shows as unavailable instead of stalling the console. Membership and the health
+flags come from the control plane's `ClusterBoard` (HA owns discovery). Opening a remote node's
+start/stop/reload controls needs a remote `ServerControl`, which does not exist yet.
 
 ## Drain
 
