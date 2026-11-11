@@ -568,6 +568,7 @@ class ServiceDaemonTest {
         assertTrue(plist.contains("--pid-file="), plist);
         assertTrue(winsw.contains("--pid-file="), winsw);
         assertTrue(plist.contains("<key>ExitTimeOut</key>"), plist);
+        assertTrue(plist.contains("SJWS_RELOAD_SIGHUP"), plist);
         assertTrue(winsw.contains("<stoptimeout>45sec</stoptimeout>"), winsw);
         assertTrue(Files.readString(Path.of("docs/operations/launchd.md")).contains("do not pass `--daemon`"));
         assertTrue(Files.readString(Path.of("docs/operations/windows-service.md")).contains("TerminateProcess"));
@@ -591,6 +592,8 @@ class ServiceDaemonTest {
         assertTrue(keys.contains("Label"), keys.toString());
         assertTrue(keys.contains("ProgramArguments"), keys.toString());
         assertTrue(keys.contains("ExitTimeOut"), keys.toString());
+        assertTrue(keys.contains("EnvironmentVariables"), keys.toString());
+        assertTrue(keys.contains("SJWS_RELOAD_SIGHUP"), keys.toString());
         var args = new java.util.ArrayList<String>();
         var stringNodes = plistDoc.getElementsByTagName("string");
         for (int i = 0; i < stringNodes.getLength(); i++) {
