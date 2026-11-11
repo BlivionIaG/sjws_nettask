@@ -18,6 +18,13 @@ In scope:
   quiche natives load.
 - The harness `tests/sjws_nettask/e2e/FileServingEndToEndTest.java`: a real
   `SjwsServer` on port 0, a temporary document root, and `java.net.http.HttpClient`.
+- Composed proxy + routing + middleware in
+  `tests/sjws_nettask/e2e/ProxyRoutingMiddlewareEndToEndTest.java` (tag `e2e`): a
+  real listener, a YAML route table (proxy `/api` plus static `/`), and at least two
+  gateway filters (`request-size`, `cors`, `header-rewrite`). It asserts filter
+  order and scoping, short-circuit (414 / CORS preflight) before the upstream,
+  upstream failure (502/504) without taking the process down, and a streamed body
+  plus a cancelled mid-response read.
 
 Out of scope for the harness (it is HTTP/1.1 only; `h2/*` and `h3/*` cover the other
 listeners):
