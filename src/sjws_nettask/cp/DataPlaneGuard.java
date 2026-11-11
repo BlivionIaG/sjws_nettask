@@ -41,7 +41,9 @@ public final class DataPlaneGuard {
     private volatile boolean injectedClock;
     private volatile long maxStalenessMs;
     /** The ceiling from the local YAML; a pushed snapshot without one falls back to this. */
-    private final long localMaxStalenessMs;
+    private volatile long localMaxStalenessMs;
+    /** True while the applied snapshot names its own ceiling. */
+    private volatile boolean pushedCeiling;
     private volatile boolean controlPlaneUp;
     private volatile boolean hasLastGood;
     private volatile long expiresAtMillis;
@@ -117,8 +119,24 @@ public final class DataPlaneGuard {
         if (!this.active) {
             return;
         }
+        this.pushedCeiling = pushed != null;
         this.maxStalenessMs = pushed == null ? this.localMaxStalenessMs : pushed.toMillis();
         refreshStaleDeadline();
+    }
+
+    /**
+     * Re-resolves the local YAML ceiling after a config reload. It takes effect at once unless the
+     * applied snapshot names its own ceiling; then it is only the fallback for a later one that does not.
+     */
+    public void localMaxStaleness(Duration local) {
+        if (!this.active) {
+            return;
+        }
+        this.localMaxStalenessMs = local == null ? 0L : local.toMillis();
+        if (!this.pushedCeiling) {
+            this.maxStalenessMs = this.localMaxStalenessMs;
+            refreshStaleDeadline();
+        }
     }
 
     /** Sets the ceiling directly; {@code null} turns it off. */

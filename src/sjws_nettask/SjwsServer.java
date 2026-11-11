@@ -742,6 +742,9 @@ public final class SjwsServer implements AutoCloseable {
                             && this.live.get().document().node().mode() == NodeSettings.Mode.DATA) {
                         this.remoteApplied.set(true);
                     }
+                    if (incoming == null && result.applied()) {
+                        dataPlane().localMaxStaleness(result.snapshot().document().node().maxStaleness());
+                    }
                 }
             } catch (ConfigException e) {
                 var message = e.getMessage() == null ? "configuration rejected" : e.getMessage();
@@ -975,6 +978,10 @@ public final class SjwsServer implements AutoCloseable {
             }
         }
         var current = this.live.get();
+        var localDocument = this.reloader.readLocal(current.document().configFile());
+        if (localDocument != null) {
+            dataPlane().localMaxStaleness(localDocument.node().maxStaleness());
+        }
         return new ReloadResult(false, current.generation(), warnings, java.util.List.of(), java.util.List.of(),
                 current, null);
     }
