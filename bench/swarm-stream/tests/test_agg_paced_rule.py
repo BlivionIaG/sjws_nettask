@@ -56,7 +56,7 @@ def case(abs_over=None, bad_tag="abs-03", floor=True, floor_p99=180.0, aa_over=N
 
 def main():
     out = case()
-    assert "VERDICT: PASS" in out, out
+    assert "VERDICT: TEST_ONLY_PASS" in out, out
     assert "closed-loop(info) mib_s=60.0 p99=9000.0" in out, out   # beside each window, info only
     assert "lowload-floor@10.0MiB/s p99=180.0" in out, out          # Q5: reported
     assert "lag_p50=" in out and "offered_actual=110.0" in out, out  # item 2/5 reporting
@@ -68,33 +68,79 @@ def main():
     # Item 2: exactly 110, not "any >= 100", not < 100, not closed loop.
     for off in (100.0, 105.0, 120.0, 95.0):
         out = case({"offered_mib_s": off})
-        assert "VERDICT: FAIL" in out and "not a paced gate window at 110" in out, (off, out)
+        assert "VERDICT: TEST_ONLY_FAIL" in out and "not a paced gate window at 110" in out, (off, out)
     out = case({"latency_basis": "send", "offered_mib_s": 0.0}, bad_tag="all")
-    assert "VERDICT: FAIL" in out, out
+    assert "VERDICT: TEST_ONLY_FAIL" in out, out
     out = case(aa_over={"offered_mib_s": 100.0})
-    assert "VERDICT: FAIL" in out and "A/A leg 0: not paced at 110" in out, out
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "A/A leg 0: not paced at 110" in out, out
 
     # Item 1: stall at window end. Slots of the last ~1.8 s never arrived; they used to vanish.
     out = case({"sched_received": 18200, "sched_unreceived_at_cutoff": 1800})
-    assert "VERDICT: FAIL" in out and "slot shortfall 1800 of 20000" in out, out
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "slot shortfall 1800 of 20000" in out, out
     # Item 1: ~9 % hung streams (never claimed -> phantom slots; drain cutoff hit).
     out = case({"sched_received": 18200, "sched_unreceived_at_cutoff": 1800,
                 "sched_phantom_streams": 90, "cutoff_hit": True})
-    assert "VERDICT: FAIL" in out and "drain cutoff hit" in out, out
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "drain cutoff hit" in out, out
     out = case({"sched_expected": None})
-    assert "VERDICT: FAIL" in out and "no slot accounting" in out, out
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "no slot accounting" in out, out
 
     # Optional: scheduled-stamp parse fallback is flagged on paced windows.
     out = case({"sched_stamp_fallback": 3})
-    assert "VERDICT: FAIL" in out and "scheduled stamps unparsable" in out, out
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "scheduled stamps unparsable" in out, out
 
     # Item 5: floor acceptance fixed in advance (<= 300 µs), missing floor, and rerun of an invalid one.
     out = case(floor_p99=450.0)
-    assert "VERDICT: FAIL" in out and "cannot resolve the 1 ms gate" in out, out
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "cannot resolve the 1 ms gate" in out, out
     out = case(floor=False)
-    assert "VERDICT: FAIL" in out and "no valid low-load" in out, out
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "no valid low-load" in out, out
     out = case(floor=False, extra=lambda r: (write_floor(r, tag="lowload-floor-1", noisy=True),
                                               write_floor(r, tag="lowload-floor-2")))
+    assert "VERDICT: TEST_ONLY_PASS" in out, out
+    # --assume-q4 never prints a countable verdict.
+    assert "VERDICT: PASS" not in case() and "VERDICT: FAIL" not in case({"offered_mib_s": 100.0})
+
+    # Re-review item 1: offered_actual_mib_s is checked against 110 (0.5 % allowance).
+    out = case({"offered_actual_mib_s": 100.1})
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "offered_actual_mib_s=100.1 not within" in out, out
+    assert "VERDICT: TEST_ONLY_PASS" in case({"offered_actual_mib_s": 109.6})
+    out = case({"offered_actual_mib_s": None})
+    assert "VERDICT: TEST_ONLY_FAIL" in out, out
+    # Optional: any stream short of its slots fails, not just the global count.
+    out = case({"sched_streams_short": 3})
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "3 streams short" in out, out
+    # Optional: generator saturated during the catch-up period.
+    out = case({"catchup_s": 2.0, "catchup_cpu_pct_of_wall": 190.0, "gen_sat_limit_pct": 160.0})
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "saturated during catch-up" in out, out
+    # Re-review fix: no p99 is reported for a window with a shortfall.
+    out = case({"sched_received": 18200, "sched_unreceived_at_cutoff": 1800})
+    assert "abs-03: valid=True mib_s=104.000 p50=100.0 p99=n/a (shortfall 1800)" in out, out
+    # Re-review item 2: every result.json must carry the harness commit.
+    out = case({"harness_commit": ""})
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "no harness_commit" in out, out
+
+    # Re-review item 2: once Q4 lands, pre-Q4 windows never count; q4-stamped ones do.
+    import contextlib
+    import io
+    sys.path.insert(0, str(HERE))
+    import agg as aggmod  # noqa: E402
+
+    def landed(marker):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            for i in range(1, 6):
+                write(root, f"abs-{i:02d}", validity_marker=marker)
+            write_floor(root, validity_marker=marker)
+            buf = io.StringIO()
+            old, aggmod.Q4_LANDED = aggmod.Q4_LANDED, True
+            try:
+                with contextlib.redirect_stdout(buf):
+                    aggmod.main([str(root)])
+            finally:
+                aggmod.Q4_LANDED = old
+            return buf.getvalue()
+    out = landed("pre-q4")
+    assert "VERDICT: FAIL" in out and "only 0 valid windows" in out, out
+    out = landed("q4")
     assert "VERDICT: PASS" in out, out
     print("ok")
 

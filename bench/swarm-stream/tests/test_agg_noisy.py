@@ -65,7 +65,7 @@ def main():
         for i in range(1, 6):
             write_abs(root, f"abs-0{i}")
         out = run_agg(root)
-        assert "VERDICT: PASS" in out, out
+        assert "VERDICT: TEST_ONLY_PASS" in out, out
 
         # Marker NOISY
         root2 = Path(td) / "m"
@@ -74,7 +74,7 @@ def main():
             write_abs(root2, f"abs-0{i}", noisy=True, noisy_marker="NOISY")
         out2 = run_agg(root2)
         assert "valid=False" in line(out2, "abs-01")
-        assert "VERDICT: FAIL" in out2
+        assert "VERDICT: TEST_ONLY_FAIL" in out2
 
         # foreign_cpu_avg_cores > 0.5
         root3 = Path(td) / "f"

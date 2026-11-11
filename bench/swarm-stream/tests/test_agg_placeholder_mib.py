@@ -40,7 +40,7 @@ def main():
                               capture_output=True, text=True, cwd=str(HERE.parent))
         assert proc.returncode == 0, proc.stderr + proc.stdout
         assert "TypeError" not in (proc.stderr + proc.stdout)
-        assert "VERDICT: FAIL" in proc.stdout
+        assert "VERDICT: TEST_ONLY_FAIL" in proc.stdout
         assert "mib_s=n/a" in proc.stdout
     print("OK test_agg_placeholder_mib")
 

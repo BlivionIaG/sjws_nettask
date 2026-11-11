@@ -38,6 +38,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # Architecture item 7: every DONE line records the harness commit (and whether the tree was dirty).
 HARNESS_COMMIT=$(git -C "$HERE" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 if [ -n "$(git -C "$HERE" status --porcelain -- . 2>/dev/null)" ]; then HARNESS_COMMIT="$HARNESS_COMMIT-dirty"; fi
+export HARNESS_COMMIT  # stamped into every result.json by StreamLoad (re-review item 2)
 # Architecture item 6: no gate window counts before generator calibration plus compile/smoke are
 # done and posted. abs/all phases refuse to start without CALIBRATION_REF (the result comment URL).
 case "$PHASE" in all|abs)

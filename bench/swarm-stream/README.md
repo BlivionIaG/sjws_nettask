@@ -89,7 +89,7 @@ flag-off emits nothing). Validate a scrape with `promtool check metrics`.
   `chunk_latency_send` / `chunk_latency_sched` are always reported side by side, with
   `offered_mib_s`, `sched_late_pct` (sends > 1 ms behind their slot) and `sched_lag_max_us`.
   Validity rules are unchanged.
-- **Gate-rule change (disclosed on PR 8 / #299 and #502; Q2 confirmed; Architecture sign-off pending):**
+- **Gate-rule change (disclosed on PR 8 / #299 and #502; Q2 per inceptor's ruling 2026-11-11 ~23:44, Architecture agrees; Architecture sign-off pending):**
   the bar moves from p99 at closed-loop saturation to p99 at a fixed 110 MiB/s offered operating point.
   - `gate.sh` runs abs and A/A windows paced at **exactly** `GATE_RATE_MIB_S=110`. `agg.py` rejects abs/A-A
     windows at any other offered rate or not on the scheduled basis.
@@ -101,7 +101,15 @@ flag-off emits nothing). Validate a scrape with `promtool check metrics`.
   - `result.json` reports these fields: `offered_actual_mib_s`, `sched_expected`, `sched_sent`,
     `sched_received`, `sched_unreceived_at_cutoff`, `sched_phantom_streams`, `sched_inflight_at_end`,
     `cutoff_hit`, `sched_stamp_fallback`, `sched_lag_p50_us` and `sched_lag_p99_us`.
-  - `agg.py` fails any slot shortfall, `cutoff_hit` or stamp fallback on a counted window.
+  - Slot schedules are anchored at the wave epoch, so a stream whose claim returns late still owns a full
+    window of slots and catches them up. Unmeasured slots (warmup, before the window) are skipped, never
+    caught up.
+  - `offered_actual_mib_s` = `sched_sends` (send starts of in-window slots) × chunk bytes / secs. It must be
+    within 0.5 % of 110.
+  - `agg.py` fails any slot shortfall, any stream short (`sched_streams_short`), `cutoff_hit`, a stamp
+    fallback, or a generator saturated during catch-up (`catchup_cpu_pct_of_wall`) on a counted window.
+  - A window with any shortfall shows `p99=n/a (shortfall N)`. The aged missing slots are only a lower
+    bound.
 - **Leg order:**
   1. `lowload-floor-N`, the low-load end-to-end floor at `FLOOR_RATE_MIB_S=10`. Its p99 must be ≤ 300 µs.
      An invalid floor leg is rerun, up to `FLOOR_TRIES`. It understates generator delay at 110.
@@ -114,7 +122,10 @@ flag-off emits nothing). Validate a scrape with `promtool check metrics`.
   - `PHASE=all|abs` refuses to start without `CALIBRATION_REF`, the posted smoke plus calibration result.
   - Every DONE line records `harness=<commit>` and `calibration=<ref>`.
   - Until the post-#465 merge flips `Q4_LANDED` in `agg.py`, the verdict is
-    `NOT_COUNTABLE (pre-Q4 harness, would be X)`. `--assume-q4` is for tests.
+    `NOT_COUNTABLE (pre-Q4 harness, would be X)`.
+  - Every `result.json` is stamped with `harness_commit` and `validity_marker` (`pre-q4` until the
+    post-#465 merge sets `q4`). Once Q4 lands, legs without the `q4` marker never count.
+  - `--assume-q4` is for tests only and prints `TEST_ONLY_PASS` / `TEST_ONLY_FAIL`.
 - `result.json` also carries the sparse latency histogram (`chunk_latency.hist`, LatBag buckets,
   `hist_sub_bits`) so windows from several generator processes ((B) split) can be merged exactly.
 

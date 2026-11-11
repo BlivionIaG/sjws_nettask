@@ -8,7 +8,10 @@ from pathlib import Path
 ACCOUNTING = {
     "sched_expected": 20000, "sched_sent": 20000, "sched_received": 20000,
     "sched_unreceived_at_cutoff": 0, "sched_phantom_streams": 0, "sched_stamp_fallback": 0,
-    "cutoff_hit": False, "offered_actual_mib_s": 110.0,
+    "cutoff_hit": False, "offered_actual_mib_s": 110.0, "sched_sends": 20000,
+    "sched_streams_short": 0, "catchup_s": 0.2, "catchup_cpu_pct_of_wall": 40.0,
+    # Stamped by StreamLoad (re-review item 2). Pre-Q4 marker: only --assume-q4 tests see these pass.
+    "harness_commit": "test0000", "validity_marker": "pre-q4",
 }
 
 HARD_ZEROS = {k: 0 for k in (

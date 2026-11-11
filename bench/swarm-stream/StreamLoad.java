@@ -142,8 +142,17 @@ public class StreamLoad {
   static final LongAdder SCHED_EXPECTED = new LongAdder(), SCHED_SENT = new LongAdder(),
       SCHED_RECEIVED = new LongAdder(), SCHED_UNRECEIVED = new LongAdder(),
       SCHED_PHANTOM_STREAMS = new LongAdder(), SCHED_STAMP_FALLBACK = new LongAdder(),
-      SCHED_INFLIGHT_AT_END = new LongAdder();
+      SCHED_INFLIGHT_AT_END = new LongAdder(), SCHED_STREAMS_SHORT = new LongAdder();
   static final AtomicBoolean CUTOFF_HIT = new AtomicBoolean();
+  /** #415 catch-up period (window end -> last producer done): generator CPU seconds and wall seconds. */
+  static volatile double CATCHUP_CPU_SEC = 0, CATCHUP_WALL_S = 0;
+  /**
+   * Architecture re-review of b47b7b26, item 2: every result.json carries the harness commit and this
+   * validity marker. "pre-q4" until the post-#465 merge folds in the stricter self_loaded check and
+   * --rate-mib-s; that commit changes it to "q4" (with agg.Q4_LANDED). agg.py rejects any window whose
+   * marker is missing or not "q4", so a window run before that commit can never count later.
+   */
+  static final String VALIDITY_MARKER = "pre-q4";
 
   record StreamKey(long hi, long lo) {}
 
@@ -154,11 +163,18 @@ public class StreamLoad {
     Track(long phaseNs, long intervalNs) { this.phaseNs = phaseNs; this.intervalNs = intervalNs; }
   }
 
-  /** One wave (warmup or measure). The measure window is [startNs, endNs); unset = Long.MAX_VALUE. */
+  /**
+   * One wave (warmup or measure). The measure window is [startNs, endNs); unset = Long.MAX_VALUE.
+   * Slot schedules are anchored at {@code epochNs} (wave creation, before the admit ramp), not at a
+   * stream's claim, so every registered stream owns slots across the whole window whenever its claim
+   * returned (Architecture re-review item 1: a late claim must not shrink its expected slots).
+   */
   static final class Win {
     final boolean account;
     final int n;
     final long intervalNs;
+    final long epochNs = System.nanoTime();
+    final ConcurrentLinkedQueue<InputStream> consumerStreams = new ConcurrentLinkedQueue<>();
     volatile long startNs = Long.MAX_VALUE, endNs = Long.MAX_VALUE;
     final AtomicBoolean hardStop = new AtomicBoolean();
     final ConcurrentHashMap<StreamKey, Track> tracks = new ConcurrentHashMap<>();
@@ -176,6 +192,11 @@ public class StreamLoad {
     return Math.max(1L, (long) (n * (double) args.chunkBytes * 1e9 / (args.rateMibS * 1048576.0)));
   }
 
+  /** First slot phase + k*interval (k >= 0) at or after {@code t}. Mirrored in tests/test_window_accounting.py. */
+  static long firstSlotAtOrAfter(long phase, long interval, long t) {
+    return phase + Math.max(0L, Math.ceilDiv(t - phase, interval)) * interval;
+  }
+
   /** Slots k >= 0 with phase + k*interval in [start, end). Mirrored in tests/test_window_accounting.py. */
   static long slotsInWindow(long phase, long interval, long start, long end) {
     long kLo = Math.max(0L, Math.ceilDiv(start - phase, interval));
@@ -185,19 +206,24 @@ public class StreamLoad {
 
   /**
    * After the wave: every in-window slot not received is recorded in LAT_CO at age cutoff - slot.
-   * Missing slots are taken as the stream's LAST ones (youngest, so the smallest ages: conservative
-   * for the reported p99 only in the generator's favour by at most the window length; every one is
-   * still >= cutoff - end). A stream whose producer never registered (never claimed) contributes
-   * floor(window / interval) phantom slots spread over the window.
+   * Every registered stream's phase is anchored before the window (Win.epochNs), so its expected
+   * slots span the whole window however late its claim returned. Missing slots are taken as the
+   * stream's LAST (youngest) ones, so each recorded age is a LOWER bound on the true age of the slot
+   * that is actually missing (the true age is at least this, never less); every one is still
+   * >= cutoff - end. Any shortfall fails the window in agg.py, which then reports no p99 at all.
+   * A stream whose producer never registered (never claimed) contributes floor(window / interval)
+   * phantom slots spread over the window.
    */
   static void accountWave(Win w, long cutoffNs) {
     if (!w.account || w.intervalNs <= 0 || w.startNs == Long.MAX_VALUE) return;
     long start = w.startNs, end = w.endNs, iv = w.intervalNs;
-    for (Track t : w.tracks.values()) {
+    List<Track> ts = new ArrayList<>(w.tracks.values()); // snapshot: tracks and phantoms from one view
+    for (Track t : ts) {
       long exp = slotsInWindow(t.phaseNs, iv, start, end);
       SCHED_EXPECTED.add(exp);
       long missing = exp - t.recv.get();
       if (missing <= 0) continue;
+      SCHED_STREAMS_SHORT.increment();
       SCHED_UNRECEIVED.add(missing);
       long kHi = Math.max(0L, Math.ceilDiv(end - t.phaseNs, iv));
       for (long j = 1; j <= missing; j++) {
@@ -205,9 +231,10 @@ public class StreamLoad {
         LAT_CO.add((cutoffNs - slot) / 1e3);
       }
     }
-    long phantom = Math.max(0, w.n - w.tracks.size());
+    long phantom = Math.max(0, w.n - ts.size());
     if (phantom > 0) {
       SCHED_PHANTOM_STREAMS.add(phantom);
+      SCHED_STREAMS_SHORT.add(phantom);
       long per = (end - start) / iv;
       SCHED_EXPECTED.add(phantom * per);
       SCHED_UNRECEIVED.add(phantom * per);
@@ -274,6 +301,8 @@ public class StreamLoad {
     /** #415: raw-socket :stream + replies GET for binary drains (HttpClient off the hot path). */
     boolean leanConsumer = true;
     boolean leanConsumerActive() { return leanHttp && leanConsumer && "binary".equals(accept); }
+    /** Harness commit stamped into result.json (--harness-commit, else env HARNESS_COMMIT). */
+    String harnessCommit = "";
   }
 
   public static void main(String[] a) throws Exception {
@@ -311,8 +340,8 @@ public class StreamLoad {
     bytesRx.reset(); LAT.clearAll(); LAT_CO.clearAll(); LAG.clearAll(); creditWaits.clear();
     SCHED_SENDS.reset(); SCHED_LATE.reset(); SCHED_LAG_MAX_NS.reset(); measureErr.clear(); teardownErr.clear();
     for (LongAdder c : List.of(SCHED_EXPECTED, SCHED_SENT, SCHED_RECEIVED, SCHED_UNRECEIVED,
-        SCHED_PHANTOM_STREAMS, SCHED_STAMP_FALLBACK, SCHED_INFLIGHT_AT_END)) c.reset();
-    CUTOFF_HIT.set(false);
+        SCHED_PHANTOM_STREAMS, SCHED_STAMP_FALLBACK, SCHED_INFLIGHT_AT_END, SCHED_STREAMS_SHORT)) c.reset();
+    CUTOFF_HIT.set(false); CATCHUP_CPU_SEC = 0; CATCHUP_WALL_S = 0;
     requests.set(0); credit429.set(0);
     producerTransportRetries.set(0); consumerConnectRetries.set(0);
 
@@ -392,11 +421,17 @@ public class StreamLoad {
     r.schedReceived = SCHED_RECEIVED.sum(); r.schedUnreceived = SCHED_UNRECEIVED.sum();
     r.schedPhantomStreams = SCHED_PHANTOM_STREAMS.sum(); r.schedStampFallback = SCHED_STAMP_FALLBACK.sum();
     r.schedInflightAtEnd = SCHED_INFLIGHT_AT_END.sum(); r.cutoffHit = CUTOFF_HIT.get();
+    r.schedStreamsShort = SCHED_STREAMS_SHORT.sum();
+    r.catchupS = CATCHUP_WALL_S;
+    r.catchupCpuPct = CATCHUP_WALL_S > 0 ? CATCHUP_CPU_SEC / CATCHUP_WALL_S * 100.0 : 0;
+    r.harnessCommit = args.harnessCommit;
+    r.validityMarker = VALIDITY_MARKER;
     r.rateMibS = args.rateMibS;
     r.leanConsumer = args.leanConsumerActive();
     long ss = SCHED_SENDS.sum();
     r.schedSends = ss;
-    // Architecture item 2: actual offered = in-window slot sends x chunk bytes / secs.
+    // Architecture item 2 (+ re-review item 1, one basis everywhere): actual offered =
+    // sched_sends (send STARTS of in-window slots, retries not counted) x chunk bytes / secs.
     r.offeredActualMibS = paced ? ss * (double) args.chunkBytes / 1048576.0 / Math.max(1e-6, args.secs) : 0;
     r.schedLatePct = ss == 0 ? 0 : 100.0 * SCHED_LATE.sum() / ss;
     r.schedLagMaxUs = SCHED_LAG_MAX_NS.get() / 1e3;
@@ -460,22 +495,36 @@ public class StreamLoad {
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "producer " + pool, e); }
       }));
     }
-    // The window opens after the admit ramp. Chunks count by slot time in [start, end).
-    long start = System.nanoTime();
+    // The window opens after the admit ramp. Chunks count by slot time in [start, end). startNs is
+    // published 50 ms BEFORE the window opens, so a producer that reads it after reading the clock
+    // sees it whenever its clock reading is inside the window (producer: catch up from start).
+    long start = System.nanoTime() + 50_000_000L;
     w.endNs = start + (long) (duration * 1e9);
     w.startNs = start;
-    Thread.sleep((long) (duration * 1000));
+    Thread.sleep(Math.max(0L, (w.endNs - System.nanoTime()) / 1_000_000L));
     // Producers finish their in-window slots (a late stream catches up) and send LAST; consumers
     // read until LAST. Nothing is cut at the window end: the hard cutoff is end + drain timeout.
     long cutoff = w.endNs + (long) (Math.max(args.drainTimeout, (GRACE_MS + DRAIN_SLACK_MS) / 1000.0) * 1e9);
     if (account) SCHED_INFLIGHT_AT_END.add(Math.max(0L, SCHED_SENT.sum() - SCHED_RECEIVED.sum()));
-    boolean allDone = joinUntil(producers, cutoff) & joinUntil(consumers, cutoff);
+    // Optional (re-review): generator CPU over the catch-up period (window end -> producers done) is
+    // reported separately; cpuMon only samples inside the window.
+    long cj0 = account ? readProcJiffies("self") : -1, ct0 = System.nanoTime();
+    boolean producersDone = joinUntil(producers, cutoff);
+    if (account && cj0 >= 0) {
+      long cj1 = readProcJiffies("self");
+      CATCHUP_WALL_S = (System.nanoTime() - ct0) / 1e9;
+      CATCHUP_CPU_SEC = cj1 >= 0 ? (cj1 - cj0) / scClk() : 0;
+    }
+    boolean allDone = producersDone & joinUntil(consumers, cutoff);
     long cutoffNs = System.nanoTime();
     if (!allDone) {
       if (account) CUTOFF_HIT.set(true);
       inTeardown.set(true);
       w.hardStop.set(true);
       for (LeanHttp h : w.consumerSockets) h.close(); // unblock readers stuck in read()
+      for (InputStream in : w.consumerStreams) { // LEAN_CONSUMER=0: HttpClient body streams too
+        try { in.close(); } catch (IOException ignored) {}
+      }
       joinUntil(producers, System.nanoTime() + 5_000_000_000L);
       joinUntil(consumers, System.nanoTime() + 5_000_000_000L);
     }
@@ -531,11 +580,20 @@ public class StreamLoad {
     // at the gate rate too); random phase so 1k streams do not fire in lockstep. Slots are never
     // skipped: a late stream catches up (one sync POST at a time). The producer stops at the first
     // slot at or after the window end, so every in-window slot is sent (or counted unsent).
+    // Re-review item 1: the phase is anchored at the wave epoch (before the window), so expected
+    // slots cover the whole window whenever the claim returned. A claim returning inside or after the
+    // window starts at the first slot >= start and catches up (those slots are late, never dropped).
     final long intervalNs = w.intervalNs;
-    long nextNs = intervalNs > 0 ? System.nanoTime() + rnd.nextLong(intervalNs) : 0L;
+    final long phaseNs = intervalNs > 0 ? w.epochNs + rnd.nextLong(intervalNs) : 0L;
+    long nextNs = 0L;
+    if (intervalNs > 0) {
+      long now0 = System.nanoTime();
+      long s0 = w.startNs; // read AFTER the clock (see wave(): startNs is published before start)
+      nextNs = firstSlotAtOrAfter(phaseNs, intervalNs, w.account ? Math.min(now0, s0) : now0);
+    }
     final boolean coStamp = args.chunkBytes >= 40; // second 20-digit stamp fits in the payload
     final AtomicBoolean stop = w.hardStop;
-    Track track = new Track(nextNs, intervalNs);
+    Track track = new Track(phaseNs, intervalNs);
     w.tracks.put(new StreamKey(lease.streamHi, lease.streamLo), track);
     try {
       if (args.leanHttp) lean = new LeanHttp(URI.create(args.base), 60_000);
@@ -548,6 +606,14 @@ public class StreamLoad {
         }
         long slotNs;
         if (intervalNs > 0) {
+          // Re-review fix: never catch up UNMEASURED slots (warmup, or measure-wave slots before the
+          // window); a backlog there would end in a burst right before the window opens.
+          if (!w.account || nextNs < w.startNs) {
+            long now0 = System.nanoTime();
+            long s0 = w.startNs; // after the clock
+            if (nextNs < now0)
+              nextNs = firstSlotAtOrAfter(phaseNs, intervalNs, w.account ? Math.min(now0, s0) : now0);
+          }
           if (nextNs >= w.endNs) break; // all in-window slots done
           long now = System.nanoTime();
           while (now < nextNs && !stop.get()) {
@@ -780,11 +846,14 @@ public class StreamLoad {
         HttpResponse<InputStream> get = http.send(gb.build(), HttpResponse.BodyHandlers.ofInputStream());
         if (get.statusCode() != 200) throw new IOException("replies " + get.statusCode());
         try (InputStream in = get.body()) {
+          w.consumerStreams.add(in); // closed at the drain cutoff (re-review optional)
+          if (w.hardStop.get()) return;
           if ("sse".equals(args.accept)) readSse(in, w, bytesRx);
           else readBinary(in, w, bytesRx);
         }
         return;
       } catch (Exception e) {
+        if (w.hardStop.get()) return; // closed by the drain cutoff: unreceived slots are aged
         last = e;
         // Count every failed connect/setup attempt (not only the final throw into error_count).
         if (!inTeardown.get()) consumerConnectRetries.incrementAndGet();
@@ -1456,6 +1525,7 @@ public class StreamLoad {
         case "--rate-mib-s" -> args.rateMibS = Double.parseDouble(a[++i]);
         case "--lean-consumer" -> args.leanConsumer = true;
         case "--no-lean-consumer" -> args.leanConsumer = false;
+        case "--harness-commit" -> args.harnessCommit = a[++i];
         default -> throw new IllegalArgumentException(a[i]);
       }
     }
@@ -1464,6 +1534,10 @@ public class StreamLoad {
     if (args.rateMibS < 0) throw new IllegalArgumentException("--rate-mib-s must be >= 0");
     // Paced windows gate on the scheduled-send stamp at data[20..40) (inceptor Q1): it must fit.
     if (args.rateMibS > 0 && args.chunkBytes < 40) throw new IllegalArgumentException("--rate-mib-s needs --chunk-bytes >= 40");
+    if (args.harnessCommit.isBlank()) {
+      String hc = System.getenv("HARNESS_COMMIT");
+      args.harnessCommit = hc == null ? "" : hc.trim();
+    }
     if (args.groups <= 0) args.groups = args.streams; // 1:1 legacy
     if (args.groups > args.streams) args.groups = args.streams;
     String heapEnv = System.getenv("HEAP");
@@ -1493,8 +1567,10 @@ public class StreamLoad {
     double rateMibS, schedLatePct, schedLagMaxUs, offeredActualMibS;
     Double lagP50, lagP99;
     long schedSends, schedExpected, schedSent, schedReceived, schedUnreceived, schedPhantomStreams,
-        schedStampFallback, schedInflightAtEnd;
+        schedStampFallback, schedInflightAtEnd, schedStreamsShort;
     boolean cutoffHit;
+    double catchupS, catchupCpuPct;
+    String harnessCommit = "", validityMarker = "";
     boolean leanConsumer;
     Map<String, Double> counters, hardZeros;
     List<String> errors, teardownErrors;
@@ -1544,6 +1620,11 @@ public class StreamLoad {
       field(sb, "sched_inflight_at_end", schedInflightAtEnd, true);
       field(sb, "sched_stamp_fallback", schedStampFallback, true);
       field(sb, "cutoff_hit", cutoffHit, true);
+      field(sb, "sched_streams_short", schedStreamsShort, true);
+      field(sb, "catchup_s", catchupS, true);
+      field(sb, "catchup_cpu_pct_of_wall", catchupCpuPct, true);
+      field(sb, "harness_commit", quote(harnessCommit), true);
+      field(sb, "validity_marker", quote(validityMarker), true);
       field(sb, "sched_lag_p50_us", lagP50, true);
       field(sb, "sched_lag_p99_us", lagP99, true);
       field(sb, "sched_late_pct", schedLatePct, true);

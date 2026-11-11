@@ -18,8 +18,17 @@ GATE_RATE_MIB_S = 110.0
 FLOOR_P99_MAX_US = 300.0
 # Architecture item 7 / inceptor Q4: no gate window counts until the Q4 validity change lands
 # (after #465 merges: master merged into #502, stricter self_loaded + --rate-mib-s folded in).
-# Flip to True in that commit. Tests pass --assume-q4 to exercise the PASS path.
+# Flip to True in that commit, together with StreamLoad.VALIDITY_MARKER = "q4".
+# Re-review item 2: once landed, only windows whose result.json carries a harness commit AND the
+# "q4" validity marker count; older windows can never turn into a PASS. --assume-q4 exists for the
+# tests only and never prints PASS (TEST_ONLY_PASS / TEST_ONLY_FAIL).
 Q4_LANDED = False
+REQUIRED_VALIDITY_MARKER = "q4"
+# Re-review item 1: offered_actual_mib_s (sched_sends x chunk_bytes / secs) must be within this
+# rounding allowance of 110. Per-stream edge rounding is <= 1 slot of ~2 250 per stream in a 20 s
+# window (<= 0.05 %); integer-ns interval truncation is negligible; 0.5 % leaves 10x headroom and
+# still catches ~1 % of slots never sent.
+OFFERED_ACTUAL_TOL_PCT = 0.5
 
 
 def binom_sf(k, n, p=0.5):
@@ -57,9 +66,23 @@ def is_gate_rate(off) -> bool:
     return isinstance(off, (int, float)) and abs(float(off) - GATE_RATE_MIB_S) < 1e-6
 
 
-def main():
-    argv = sys.argv[1:]
+def offered_actual_ok(v) -> bool:
+    return (isinstance(v, (int, float))
+            and abs(float(v) - GATE_RATE_MIB_S) <= GATE_RATE_MIB_S * OFFERED_ACTUAL_TOL_PCT / 100.0)
+
+
+def shortfall(r: dict):
+    """In-window slots not received (int), or None when the window has no slot accounting."""
+    exp, rec = r.get("sched_expected"), r.get("sched_received")
+    if not isinstance(exp, int) or not isinstance(rec, int) or exp <= 0:
+        return None
+    return max(0, exp - rec)
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
     assume_q4 = "--assume-q4" in argv
+    enforce_marker = Q4_LANDED and not assume_q4
     out = Path([a for a in argv if not a.startswith("--")][0])
     abs_runs = sorted(out.glob("abs-*/result.json"))
     windows = []
@@ -69,13 +92,22 @@ def main():
             continue
         # Shared absolute-window validity (window_valid.py) — same rule as gate.sh
         ev = evaluate_window(r)
+        short = shortfall(r)
+        # Re-review fix: no p99 is ever reported for a window with a slot shortfall (or no accounting
+        # on a paced window): the missing slots' true ages are only lower-bounded.
+        no_p99 = (short is None and r.get("latency_basis") == "scheduled") or (short or 0) > 0
+        marker_ok = bool(r.get("harness_commit")) and r.get("validity_marker") == REQUIRED_VALIDITY_MARKER
         windows.append({
             "tag": p.parent.name,
             "valid": ev["valid"],
             "mib_s": r.get("mib_s"),
             "p50_us": r.get("p50_us"),
             "p90_us": r.get("p90_us"),
-            "p99_us": ev["p99_us"],
+            "p99_us": None if no_p99 else ev["p99_us"],
+            "shortfall": short,
+            "harness_commit": r.get("harness_commit"),
+            "validity_marker": r.get("validity_marker"),
+            "marker_ok": marker_ok,
             "samples": ev["samples"],
             "self_loaded": ev["self_loaded"],
             "gen_cores": ev["gen_cores"],
@@ -101,8 +133,8 @@ def main():
             # inceptor Q1/Q2/Q5 (2026-11-11)
             "offered_mib_s": r.get("offered_mib_s"),
             "latency_basis": r.get("latency_basis"),
-            "p99_send_us": r.get("p99_send_us"),
-            "p99_sched_us": r.get("p99_sched_us"),
+            "p99_send_us": None if no_p99 else r.get("p99_send_us"),
+            "p99_sched_us": None if no_p99 else r.get("p99_sched_us"),
             "sched_late_pct": r.get("sched_late_pct"),
             "offered_actual_mib_s": r.get("offered_actual_mib_s"),
             "sched_lag_p50_us": r.get("sched_lag_p50_us"),
@@ -114,11 +146,21 @@ def main():
             "sched_phantom_streams": r.get("sched_phantom_streams"),
             "sched_stamp_fallback": r.get("sched_stamp_fallback"),
             "cutoff_hit": r.get("cutoff_hit"),
+            "sched_streams_short": r.get("sched_streams_short"),
+            "catchup_s": r.get("catchup_s"),
+            "catchup_cpu_pct_of_wall": r.get("catchup_cpu_pct_of_wall"),
             "closed_loop": closed_loop_info(out, p.parent.name),
         })
 
+    if enforce_marker:
+        for w in windows:
+            if not w["marker_ok"]:
+                w["valid"] = False  # pre-Q4 or unstamped window: never counts
     valid = [w for w in windows if w["valid"]]
     floor, floor_valid = lowload_floor(out)
+    if enforce_marker and floor and not (floor.get("harness_commit")
+                                         and floor.get("validity_marker") == REQUIRED_VALIDITY_MARKER):
+        floor_valid = False  # a pre-Q4 floor leg never counts either
     floor_txt = (f"lowload-floor@{floor.get('offered_mib_s')}MiB/s p99={floor.get('p99_us')}µs "
                  f"(send {floor.get('p99_send_us')}, valid={floor_valid})") if floor else "lowload-floor=n/a"
     print(f"absolute windows: {len(windows)} total, {len(valid)} valid (need 5–8)")
@@ -127,7 +169,9 @@ def main():
     for w in windows:
         mib_s = w['mib_s']
         mib_txt = f"{mib_s:.3f}" if isinstance(mib_s, (int, float)) else "n/a"
-        print(f"  {w['tag']}: valid={w['valid']} mib_s={mib_txt} p50={w['p50_us']} p99={w['p99_us']} "
+        p99_txt = (f"n/a (shortfall {w['shortfall']})" if (w['shortfall'] or 0) > 0
+                   else ("n/a (no slot accounting)" if w['p99_us'] is None else w['p99_us']))
+        print(f"  {w['tag']}: valid={w['valid']} mib_s={mib_txt} p50={w['p50_us']} p99={p99_txt} "
               f"n={w['samples']} self_loaded={w['self_loaded']} stalls={w['credit_stalls']} "
               f"stall_flag={w['stall_flag']} err={w['errors']} group_open={w.get('group_open_refusals')} "
               f"prod_tx_retry={w['producer_transport_retries']} cons_conn_retry={w['consumer_connect_retries']} "
@@ -140,9 +184,14 @@ def main():
               f"p99_sched={w.get('p99_sched_us')} p99_send={w.get('p99_send_us')} late%={w.get('sched_late_pct')} "
               f"lag_p50={w.get('sched_lag_p50_us')} lag_p99={w.get('sched_lag_p99_us')} "
               f"slots exp/sent/recv={w.get('sched_expected')}/{w.get('sched_sent')}/{w.get('sched_received')} "
-              f"unrecv={w.get('sched_unreceived_at_cutoff')} cutoff_hit={w.get('cutoff_hit')} | "
+              f"unrecv={w.get('sched_unreceived_at_cutoff')} streams_short={w.get('sched_streams_short')} "
+              f"cutoff_hit={w.get('cutoff_hit')} catchup={w.get('catchup_s')}s@{w.get('catchup_cpu_pct_of_wall')}% "
+              f"harness={w.get('harness_commit')}/{w.get('validity_marker')} | "
               f"closed-loop(info) mib_s={cl.get('mib_s')} p99={cl.get('p99_us')} cpu={cl.get('client_cpu_pct_of_wall')} | "
               f"{floor_txt}")
+        if enforce_marker and not w["marker_ok"]:
+            print(f"  INVALID {w['tag']}: harness_commit={w.get('harness_commit')} "
+                  f"validity_marker={w.get('validity_marker')} (need {REQUIRED_VALIDITY_MARKER})")
         if (w['transport_retry_flag'] or w['refused_per_ip'] or w['drain_timed_out']
                 or w['open_sessions_after_drain'] != 0 or w.get('setup_fail') or w.get('noisy')):
             print(f"  INVALID {w['tag']}: tx_retry={w['transport_retry_flag']} "
@@ -154,6 +203,9 @@ def main():
 
     verdict = "FAIL"
     reason = []
+    for w in windows:
+        if not w.get("harness_commit"):
+            reason.append(f"{w['tag']}: no harness_commit stamped in result.json")
     if len(valid) < 5:
         reason.append(f"only {len(valid)} valid windows (need ≥5)")
     else:
@@ -187,13 +239,26 @@ def main():
             if w.get("latency_basis") != "scheduled" or not is_gate_rate(off):
                 reason.append(f"{w['tag']}: not a paced gate window at {GATE_RATE_MIB_S:.0f} MiB/s "
                               f"(offered={off}, basis={w.get('latency_basis')})")
-            exp, rec = w.get("sched_expected"), w.get("sched_received")
-            if not isinstance(exp, int) or not isinstance(rec, int) or exp <= 0:
+            oa = w.get("offered_actual_mib_s")
+            if not offered_actual_ok(oa):
+                reason.append(f"{w['tag']}: offered_actual_mib_s={oa} not within "
+                              f"{OFFERED_ACTUAL_TOL_PCT}% of {GATE_RATE_MIB_S:.0f}")
+            exp, short = w.get("sched_expected"), w.get("shortfall")
+            if short is None:
                 reason.append(f"{w['tag']}: no slot accounting (sched_expected={exp})")
-            elif rec < exp:
-                reason.append(f"{w['tag']}: slot shortfall {exp - rec} of {exp} "
+            elif short > 0:
+                reason.append(f"{w['tag']}: slot shortfall {short} of {exp} "
                               f"(unreceived at cutoff {w.get('sched_unreceived_at_cutoff')}, "
                               f"phantom streams {w.get('sched_phantom_streams')})")
+            ss = w.get("sched_streams_short")
+            if not isinstance(ss, int):
+                reason.append(f"{w['tag']}: no per-stream accounting (sched_streams_short={ss})")
+            elif ss > 0:
+                reason.append(f"{w['tag']}: {ss} streams short of their in-window slots")
+            cs, cp, lim = w.get("catchup_s"), w.get("catchup_cpu_pct_of_wall"), w.get("gen_sat_limit_pct")
+            if (isinstance(cs, (int, float)) and cs >= 1.0 and isinstance(cp, (int, float))
+                    and isinstance(lim, (int, float)) and cp > lim):
+                reason.append(f"{w['tag']}: generator saturated during catch-up ({cp:.0f}% > {lim:.0f}% for {cs:.1f}s)")
             if w.get("cutoff_hit"):
                 reason.append(f"{w['tag']}: drain cutoff hit (hung streams)")
             if (w.get("sched_stamp_fallback") or 0) > 0:
@@ -274,11 +339,22 @@ def main():
     aa = [load(p) for p in sorted(out.glob("aa-*/result.json"))]
     aa = [r for r in aa if r and r.get("mib_s") is not None]
     for i, r in enumerate(aa):
+        bad = []
         if not is_gate_rate(r.get("offered_mib_s")) or r.get("latency_basis") != "scheduled":
-            reason.append(f"A/A leg {i}: not paced at {GATE_RATE_MIB_S:.0f} MiB/s "
-                          f"(offered={r.get('offered_mib_s')}, basis={r.get('latency_basis')})")
-            if verdict == "PASS":
-                verdict = "FAIL"
+            bad.append(f"not paced at {GATE_RATE_MIB_S:.0f} MiB/s "
+                       f"(offered={r.get('offered_mib_s')}, basis={r.get('latency_basis')})")
+        elif not offered_actual_ok(r.get("offered_actual_mib_s")):
+            bad.append(f"offered_actual_mib_s={r.get('offered_actual_mib_s')} off {GATE_RATE_MIB_S:.0f}")
+        if (shortfall(r) or 0) > 0:
+            bad.append(f"slot shortfall {shortfall(r)}")
+            r["p99_us"] = None
+        if enforce_marker and not (r.get("harness_commit")
+                                   and r.get("validity_marker") == REQUIRED_VALIDITY_MARKER):
+            bad.append("pre-Q4 or unstamped A/A leg")
+        for b_ in bad:
+            reason.append(f"A/A leg {i}: {b_}")
+        if bad and verdict == "PASS":
+            verdict = "FAIL"
     if len(aa) >= 2:
         print(f"A/A noise floor: {aa[0]['mib_s']:.3f} vs {aa[1]['mib_s']:.3f} MiB/s; "
               f"p99 {aa[0].get('p99_us')} vs {aa[1].get('p99_us')} µs")
@@ -314,7 +390,10 @@ def main():
             print(f"  {row['tag']}: groups={row['groups']} mib_s={row['mib_s']} p99_us={row['p99_us']} "
                   f"writers={row['writer_count']} zstall={row['zallocation_stalls']} oom={row['oom']}")
 
-    if not (Q4_LANDED or assume_q4):
+    if assume_q4:
+        # Tests only: exercises the rule on pre-Q4 fixtures, never a countable verdict.
+        verdict = f"TEST_ONLY_{verdict}"
+    elif not Q4_LANDED:
         # Sequencing (Architecture item 7): report what it would be, but nothing counts yet.
         reason.insert(0, f"pre-Q4 harness, would be {verdict}")
         verdict = "NOT_COUNTABLE"

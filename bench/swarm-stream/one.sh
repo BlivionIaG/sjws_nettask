@@ -66,6 +66,12 @@ done
 LOADGEN=${LOADGEN:-python}
 HERE_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ "$LOADGEN" = java ]; then
+  # #415 re-review item 2: StreamLoad stamps the harness commit into result.json (gate.sh exports it).
+  if [ -z "${HARNESS_COMMIT:-}" ]; then
+    HARNESS_COMMIT=$(git -C "$HERE_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+    if [ -n "$(git -C "$HERE_DIR" status --porcelain -- . 2>/dev/null)" ]; then HARNESS_COMMIT="$HARNESS_COMMIT-dirty"; fi
+  fi
+  export HARNESS_COMMIT
   if [ "${LEAN_HTTP:-1}" = 0 ]; then LEAN_HTTP_FLAG=--no-lean-http; else LEAN_HTTP_FLAG=--lean-http; fi
   # B1: drain timeout ≥ GRACE_MS + 15s (StreamHttp.GRACE_MS=60000 → ≥75s). Do not use 40.
   DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-75}

@@ -59,94 +59,163 @@ def slots_in_window(phase: int, iv: int, start: int, end: int) -> int:  # Stream
     return max(0, k_hi - k_lo)
 
 
+def first_slot_at_or_after(phase: int, iv: int, t: int) -> int:  # StreamLoad.firstSlotAtOrAfter
+    return phase + max(0, ceil_div(t - phase, iv)) * iv
+
+
 MS = 1_000_000
+EPOCH = 0                                  # Win.epochNs: wave creation, before the admit ramp
 START, END = 10_000 * MS, 30_000 * MS      # 20 s window
 CUTOFF = END + 75_000 * MS                 # drain timeout
 IV = 9 * MS                                # ~110 MiB/s over 1k streams
 BASE_LAT_US = 300
+SEND_NS = 300_000                          # one sync POST round trip
 
 
-def simulate(n_streams: int, deliver, registered=lambda i: True, seed=1):
-    """deliver(slot_ns) -> receive time ns or None (never). Returns (old_p99, new_p99, shortfall)."""
+def first_send_slot(phase: int, reg: int, measured: bool = True) -> int:
+    """StreamLoad.producer: start at the first slot >= min(claim return, window start)."""
+    return first_slot_at_or_after(phase, IV, min(reg, START) if measured else reg)
+
+
+def simulate(n_streams: int, deliver=None, registered=lambda i: True, reg_at=lambda i: 0,
+             legacy_anchor=False, seed=1):
+    """Paced producers with catch-up, consumers through the cutoff.
+
+    deliver(slot_ns, send_ns) -> receive time ns or None. legacy_anchor=True models b47b7b26, where a
+    stream's phase (and so its expected slots) started at its own claim return.
+    Returns dict(old_p99, new_p99, shortfall, offered_frac) where offered_frac = in-window slot
+    sends / (streams x window/IV), i.e. offered_actual / 110.
+    """
+    deliver = deliver or (lambda slot, send: send + BASE_LAT_US * 1000)
     rnd = random.Random(seed)
     old, new = [], []
-    expected = received = 0
+    expected = received = sends = 0
     for i in range(n_streams):
         if not registered(i):  # producer never claimed: phantom slots spread over the window
             per = (END - START) // IV
             expected += per
             new += [(CUTOFF - (START + k * IV)) / 1e3 for k in range(per)]
             continue
-        phase = rnd.randrange(IV)
+        reg = reg_at(i)
+        off = rnd.randrange(IV)
+        phase = (reg + off) if legacy_anchor else (EPOCH + off)
         exp = slots_in_window(phase, IV, START, END)
         expected += exp
+        slot = phase if legacy_anchor else first_send_slot(phase, reg)
+        busy = reg
         recv = 0
-        k = 0
-        while True:
-            slot = phase + k * IV
-            k += 1
-            if slot >= END:
+        while slot < END:
+            send = max(slot, busy)
+            if send > CUTOFF:
                 break
-            if slot < START:
-                continue
-            rt = deliver(slot)
-            if rt is not None and START <= rt < END:      # old rule: received while measureActive
-                old.append((rt - slot) / 1e3)
-            if rt is not None and rt <= CUTOFF:           # new rule: by slot time, through cutoff
-                new.append((rt - slot) / 1e3)
-                recv += 1
+            busy = send + SEND_NS
+            if slot >= START:
+                sends += 1
+                rt = deliver(slot, send)
+                if rt is not None and START <= rt < END:      # receive-time rule (pre-5f4805d6)
+                    old.append((rt - slot) / 1e3)
+                if rt is not None and rt <= CUTOFF:           # slot-time rule, through the cutoff
+                    new.append((rt - slot) / 1e3)
+                    recv += 1
+            slot += IV
         missing = exp - recv
         k_hi = max(0, ceil_div(END - phase, IV))
-        for j in range(1, missing + 1):                   # accountWave: age the youngest slots
+        for j in range(1, missing + 1):                   # accountWave: youngest slots, lower bound
             new.append((CUTOFF - (phase + (k_hi - j) * IV)) / 1e3)
         received += recv
-    return p99(old), p99(new), expected - received
+    full = n_streams * (END - START) / IV
+    return {"old_p99": p99(old), "new_p99": p99(new) if new else 0.0,
+            "shortfall": expected - received, "offered_frac": sends / full, "expected": expected}
 
 
 def main():
-    # slotsInWindow edge cases
+    # slotsInWindow / firstSlotAtOrAfter edge cases
     assert slots_in_window(0, 10, 0, 100) == 10
     assert slots_in_window(5, 10, 0, 100) == 10           # 5,15,...,95
     assert slots_in_window(5, 10, 6, 96) == 9             # 15..95
-    assert slots_in_window(200, 10, 0, 100) == 0          # phase after the window
+    assert slots_in_window(200, 10, 0, 100) == 0          # a phase after the window owns no slots...
     assert slots_in_window(0, 10, 100, 100) == 0
+    assert first_slot_at_or_after(5, 10, 0) == 5 and first_slot_at_or_after(5, 10, 6) == 15
+    assert first_slot_at_or_after(5, 10, 15) == 15
+    # ...which is why phases are anchored at the wave epoch: every phase is <= start, so every
+    # registered stream owns a full window of slots (re-review item 1).
+    for off in (0, IV // 3, IV - 1):
+        n = slots_in_window(EPOCH + off, IV, START, END)
+        assert n in ((END - START) // IV, (END - START) // IV + 1), n
 
-    healthy = lambda s: s + BASE_LAT_US * 1000
-    o, n, short = simulate(200, healthy)
-    assert o < 1000 and n < 1000 and short == 0, (o, n, short)
+    r = simulate(200)
+    assert r["old_p99"] < 1000 and r["new_p99"] < 1000 and r["shortfall"] == 0, r
+    assert abs(r["offered_frac"] - 1) < 0.005, r          # within agg's 0.5 % allowance
 
     # Stall in the last 1.8 s, then nothing until the cutoff (server hangs).
-    stall_hang = lambda s: None if s >= END - 1_800 * MS else healthy(s)
-    o, n, short = simulate(200, stall_hang)
-    assert o < 1000, o                                    # old rule: passes (samples vanished)
-    assert n > 1000 and short > 0, (n, short)             # new rule: fails, slots aged
+    stall_hang = lambda slot, send: None if slot >= END - 1_800 * MS else send + BASE_LAT_US * 1000
+    r = simulate(200, stall_hang)
+    assert r["old_p99"] < 1000, r                         # receive-time rule: passes
+    assert r["new_p99"] > 1000 and r["shortfall"] > 0, r  # slot rule: fails, slots aged
 
     # Stall in the last 1.8 s, delivered after the window end (late, not lost).
-    stall_late = lambda s: END + 200 * MS if s >= END - 1_800 * MS else healthy(s)
-    o, n, short = simulate(200, stall_late)
-    assert o < 1000, o
-    assert n > 1000 and short == 0, (n, short)            # counted at their real latency
+    stall_late = lambda slot, send: END + 200 * MS if slot >= END - 1_800 * MS else send + BASE_LAT_US * 1000
+    r = simulate(200, stall_late)
+    assert r["old_p99"] < 1000, r
+    assert r["new_p99"] > 1000 and r["shortfall"] == 0, r
 
-    # ~9 % hung streams that claimed but never got a chunk through.
+    # ~9 % of streams that claimed but never got a chunk through.
     hung = set(range(0, 200, 11))
-    rnd = random.Random(7)
-    old, new, missing_total = [], [], 0
-    for i in range(200):
-        phase = rnd.randrange(IV)
-        exp = slots_in_window(phase, IV, START, END)
-        if i in hung:
-            k_hi = max(0, ceil_div(END - phase, IV))
-            new += [(CUTOFF - (phase + (k_hi - j) * IV)) / 1e3 for j in range(1, exp + 1)]
-            missing_total += exp
-            continue
-        lat = [BASE_LAT_US] * exp
-        old += lat
-        new += lat
-    assert p99(old) < 1000 and p99(new) > 1000 and missing_total > 0
+    r = simulate(200, lambda slot, send: None)            # nothing delivered at all
+    assert r["shortfall"] == r["expected"]
+
+    def hung_sim():
+        rnd = random.Random(7)
+        new, short = [], 0
+        for i in range(200):
+            phase = EPOCH + rnd.randrange(IV)
+            exp = slots_in_window(phase, IV, START, END)
+            if i in hung:
+                k_hi = max(0, ceil_div(END - phase, IV))
+                new += [(CUTOFF - (phase + (k_hi - j) * IV)) / 1e3 for j in range(1, exp + 1)]
+                short += exp
+            else:
+                new += [BASE_LAT_US] * exp
+        return p99(new), short
+    hp, hs = hung_sim()
+    assert hp > 1000 and hs > 0
 
     # ~9 % hung streams that never claimed (phantom streams).
-    o, n, short = simulate(200, healthy, registered=lambda i: i % 11 != 0)
-    assert o < 1000 and n > 1000 and short > 0, (o, n, short)
+    r = simulate(200, registered=lambda i: i % 11 != 0)
+    assert r["old_p99"] < 1000 and r["new_p99"] > 1000 and r["shortfall"] > 0, r
+
+    # Re-review item 1: ~9 % of claims return AFTER the window (b47b7b26 gave them 0 expected
+    # slots, so the window passed at ~100.1 MiB/s offered). Now they own a full window of slots and
+    # catch them up late: p99 fails.
+    late = lambda i: END + 1_000 * MS if i % 11 == 0 else 0
+    legacy = simulate(200, reg_at=late, legacy_anchor=True)
+    assert legacy["new_p99"] < 1000 and legacy["shortfall"] == 0, legacy   # the hole
+    assert 0.90 < legacy["offered_frac"] < 0.92, legacy                    # ~100.1 MiB/s
+    r = simulate(200, reg_at=late)
+    assert r["new_p99"] > 1000, r
+    assert r["expected"] > legacy["expected"], (r, legacy)
+    assert abs(r["offered_frac"] - 1) < 0.005, r          # sent late, but sent: offered stays 110
+
+    # A claim returning MID-window catches up from the window start.
+    mid = lambda i: START + 10_000 * MS if i % 11 == 0 else 0
+    legacy = simulate(200, reg_at=mid, legacy_anchor=True)
+    assert legacy["new_p99"] < 1000 and legacy["shortfall"] == 0, legacy
+    assert legacy["offered_frac"] < 0.96, legacy          # agg's offered_actual check catches this
+    r = simulate(200, reg_at=mid)
+    assert r["new_p99"] > 1000 and r["shortfall"] == 0, r
+
+    # A claim so late it can't catch up before the cutoff: unsent slots are aged.
+    r = simulate(200, reg_at=lambda i: CUTOFF + MS if i % 11 == 0 else 0)
+    assert r["new_p99"] > 1000 and r["shortfall"] > 0, r
+
+    # Re-review fix: unmeasured slots (warmup / before the window) are never caught up: a producer
+    # 2 s behind before the window skips to the next slot instead of bursting at window start.
+    phase = EPOCH + 123
+    behind_now = START - 50 * MS
+    nxt = first_slot_at_or_after(phase, IV, behind_now)
+    assert nxt >= behind_now and nxt - behind_now < IV
+    # ...but once the window is open, a late producer resumes at the window start (catch-up).
+    assert first_send_slot(phase, START + 5_000 * MS) == first_slot_at_or_after(phase, IV, START)
     print("ok")
 
 
