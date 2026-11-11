@@ -1598,16 +1598,23 @@ public final class SjwsServer implements AutoCloseable {
             control.pinOuter(new ObserveRequestFilter(this.slot));
             return;
         }
-        if (this.armed.get() != null) {
-            return;
+        // Under the reload lock, so a concurrent publish cannot be overtaken by an older HTTP/2 generation.
+        this.reloadLock.lock();
+        try {
+            if (this.armed.get() != null) {
+                return;
+            }
+            Handler leaf = this.override != null ? this.override : request -> this.live.handler().handle(request);
+            var chain = ObserveRequestFilter.chain(this.slot, leaf);
+            this.armed.set(chain);
+            if (this.h3 != null) {
+                this.h3.armHandler(chain);
+            }
+            // HTTP/2 pins this generation's leaf, as startH2 and publish do.
+            armH2(this.h2 == null ? chain : ObserveRequestFilter.chain(this.slot, generationLeaf(this.live.get())), true);
+        } finally {
+            this.reloadLock.unlock();
         }
-        Handler leaf = this.override != null ? this.override : request -> this.live.handler().handle(request);
-        var chain = ObserveRequestFilter.chain(this.slot, leaf);
-        this.armed.set(chain);
-        if (this.h3 != null) {
-            this.h3.armHandler(chain);
-        }
-        armH2(chain, true);
     }
 
     /**
