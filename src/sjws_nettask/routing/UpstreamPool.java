@@ -157,6 +157,15 @@ final class UpstreamPool implements AutoCloseable {
 
     /** @return a pooled channel if one is open, else a new connection; {@code reused} says which */
     Lease acquire() throws IOException, InterruptedException {
+        return acquire(this.connectTimeout);
+    }
+
+    /**
+     * Like {@link #acquire()}, but the new-connect wait is bounded by {@code timeout}
+     * (a shorter active-health probe deadline). Idle sockets are returned unchanged.
+     * A timed-out connect is cancelled so it does not keep a socket in flight.
+     */
+    Lease acquire(Duration timeout) throws IOException, InterruptedException {
         if (this.closed) {
             throw new IOException("upstream pool closed");
         }
@@ -165,17 +174,29 @@ final class UpstreamPool implements AutoCloseable {
                 return new Lease(ch, true);
             }
         }
+        Duration wait = timeout == null || timeout.isZero() || timeout.isNegative() ? this.connectTimeout : timeout;
+        long waitMs = wait.equals(this.connectTimeout)
+                ? this.connectTimeout.toMillis() + 1000
+                : Math.max(1, wait.toMillis());
         var connected = new CompletableFuture<Channel>();
-        this.bootstrap.connect(this.host, this.port).addListener(f -> {
+        var future = this.bootstrap.connect(this.host, this.port);
+        future.addListener(f -> {
             if (f.isSuccess()) {
                 connected.complete(((io.netty.channel.ChannelFuture) f).channel());
-            } else {
+            } else if (f.cause() != null) {
                 connected.completeExceptionally(f.cause());
+            } else {
+                connected.completeExceptionally(new java.nio.channels.ClosedChannelException());
             }
         });
         try {
-            return new Lease(connected.get(this.connectTimeout.toMillis() + 1000, TimeUnit.MILLISECONDS), false);
+            return new Lease(connected.get(waitMs, TimeUnit.MILLISECONDS), false);
         } catch (TimeoutException e) {
+            future.cancel(true);
+            var ch = future.channel();
+            if (ch != null) {
+                ch.close();
+            }
             throw new ConnectTimeout("connect to " + this.host + ":" + this.port + " timed out");
         } catch (ExecutionException e) {
             var cause = e.getCause();

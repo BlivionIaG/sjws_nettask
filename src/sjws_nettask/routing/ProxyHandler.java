@@ -299,16 +299,16 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         var out = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.valueOf(method), path,
                 Unpooled.EMPTY_BUFFER);
         out.headers().set("Host", this.authority);
-        var lease = this.pool.acquire();
+        var lease = this.pool.acquire(timeout);
         var ch = lease.channel();
         var ex = new UpstreamPool.Exchange(ch, timeout, this.pool.budget());
         try {
             ex.send(out, timeout);
             var response = ex.head.get();
             int status = response.status().code();
-            var source = new Source(ex, this.pool, timeout);
-            source.drainToEnd();
-            source.close();
+            // Health is decided by the status line. Do not sit on an unbounded body.
+            ex.abandon();
+            ch.close();
             return status;
         } catch (java.util.concurrent.ExecutionException e) {
             ex.abandon();
@@ -317,7 +317,7 @@ public final class ProxyHandler implements Handler, AutoCloseable {
                 throw new ResponseTimeout();
             }
             throw e.getCause() instanceof IOException io ? io : new IOException(e.getCause());
-        } catch (IOException | RuntimeException | InterruptedException e) {
+        } catch (RuntimeException | InterruptedException e) {
             ex.abandon();
             ch.close();
             throw e;

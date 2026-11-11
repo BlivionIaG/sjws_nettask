@@ -120,6 +120,8 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
     private final ConcurrentHashMap<String, Long> lastProbe = new ConcurrentHashMap<>();
     private final AtomicInteger probeInFlight = new AtomicInteger();
     private final AtomicInteger probesSent = new AtomicInteger();
+    /** Next index in the current view at which {@link #probeTick} starts scanning. */
+    private final AtomicInteger probeScan = new AtomicInteger();
     private final boolean syncProbes; // tests: run probes on the caller of probeTick()
     private volatile View view;
     private volatile boolean closed; // set true before executors are shut down
@@ -473,14 +475,21 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         if (v == null || policy == null || this.closed) {
             return;
         }
+        int n = v.pools.length;
+        if (n == 0) {
+            return;
+        }
         long now = this.clock.getAsLong();
-        for (var pool : v.pools) {
+        int start = Math.floorMod(this.probeScan.get(), n);
+        int i = 0;
+        for (; i < n; i++) {
             if (this.closed) {
                 return;
             }
             if (this.probeInFlight.get() >= MAX_PROBES_IN_FLIGHT) {
-                return;
+                break;
             }
+            var pool = v.pools[Math.floorMod(start + i, n)];
             boolean ejected = pool.health.ejected();
             if (ejected) {
                 long last = this.lastProbe.getOrDefault(pool.key, 0L);
@@ -492,13 +501,15 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                 }
                 // available() has reserved the half-open slot
             } else {
-                if (!this.lastProbe.containsKey(pool.key)) {
+                Long last = this.lastProbe.get(pool.key);
+                if (last == null) {
                     // stagger the first in-rotation probe so a set does not fire as a herd
                     long interval = Math.max(1, policy.interval().toNanos());
                     long delay = Math.floorMod(pool.key.hashCode(), interval);
-                    this.lastProbe.put(pool.key, now - interval + delay);
+                    last = now - interval + delay;
+                    this.lastProbe.put(pool.key, last);
                 }
-                if (now - this.lastProbe.get(pool.key) < policy.interval().toNanos()) {
+                if (now - last < policy.interval().toNanos()) {
                     continue;
                 }
             }
@@ -516,9 +527,10 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                 if (ejected) {
                     pool.health.release();
                 }
-                return;
+                break;
             }
         }
+        this.probeScan.set(Math.floorMod(start + i, n));
     }
 
     private void runProbe(Pool pool, boolean heldHalfOpen) {
