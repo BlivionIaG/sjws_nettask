@@ -78,6 +78,7 @@ public final class DataWatch implements AutoCloseable {
     /** Status when no {@link NodeEnrollment} was given (several watches in one test process). */
     private volatile ControlPlaneBinding own;
     private long skipped;
+    private final BindRetry bindRetry = new BindRetry();
     private String state = "pending";
     private long reportedVersion;
 
@@ -384,7 +385,7 @@ public final class DataWatch implements AutoCloseable {
 
     /** A bind that failed earlier is tried again on each watch tick while a last-good is installed. */
     private void retryContentBind() {
-        if (this.server.dataPlane().hasLastGood()) {
+        if (this.server.dataPlane().hasLastGood() && this.bindRetry.due(System.nanoTime())) {
             bindContentAfterLastGood();
         }
     }
@@ -395,8 +396,12 @@ public final class DataWatch implements AutoCloseable {
         }
         try {
             this.server.bindContentPort();
+            this.bindRetry.succeeded();
         } catch (IOException e) {
-            System.err.println("WARN: content port was not bound after last-good: " + e.getMessage());
+            var message = "WARN: content port was not bound after last-good: " + e.getMessage();
+            if (this.bindRetry.failed(System.nanoTime(), message)) {
+                System.err.println(message);
+            }
         }
     }
 
