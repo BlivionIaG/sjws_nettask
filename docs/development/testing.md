@@ -18,6 +18,7 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `config/ConfigLoaderTest`, `config/RouteTableTest`, `ReloadServerTest`, `ReloadCoverageTest` | YAML file, routing table validation, immutable snapshot reload, challenge-port rebind, HTTP/3 cert swap on reload |
 | `ReloadHookTest` | reload hook registry |
 | `acme/AcmeTest`, `acme/AcmePebbleTest`, `tls/SwappableKeyManagerTest` | HTTP-01 handler, certificate storage, Pebble issuance when `PEBBLE_BIN` / `PEBBLE_CHALLTESTSRV_BIN` are set (required on Linux CI; pinned install in `.github/workflows/ci.yml`), hot cert swap |
+| `admin/ClusterViewTest` | admin Cluster view: UP/DEGRADED/DOWN from named checks, node detail, missing, failing and slow (timed-out) cluster status sources |
 | `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
 | `admin/cp/CpConsoleTest` | control-plane console: label selectors, diff, validation, stage/rollout/rollback on the fake CP, failover client, rendering, zero-cost guard |
 | `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
