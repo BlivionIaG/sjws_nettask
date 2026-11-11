@@ -38,6 +38,12 @@ import sjws_nettask.observe.ClusterStatus;
  */
 public final class EmbeddedServerControl implements ServerControl {
 
+    /** Drains a running server; tests substitute it. */
+    @FunctionalInterface
+    interface Drainer {
+        void drain(SjwsServer server) throws InterruptedException;
+    }
+
     /** Starts a server; tests substitute it. */
     @FunctionalInterface
     public interface Starter {
@@ -54,6 +60,9 @@ public final class EmbeddedServerControl implements ServerControl {
     private volatile Instant startedAt;
     private volatile String lastError;
     private volatile ClusterBoard cluster;
+    private volatile Drainer drainer = SjwsServer::drain;
+    private volatile DrainOperation drain;
+    private final java.util.concurrent.atomic.AtomicLong drainIds = new java.util.concurrent.atomic.AtomicLong();
 
     public EmbeddedServerControl(Supplier<ServerConfig> configSource, LogBuffer log) {
         this(configSource, SjwsServer::start, log, Clock.systemUTC());
@@ -123,10 +132,75 @@ public final class EmbeddedServerControl implements ServerControl {
         return board == null ? null : board.status();
     }
 
+    void drainer(Drainer next) {
+        this.drainer = next;
+    }
+
+    @Override
+    public DrainOperation drain() throws ControlException {
+        this.lock.lock();
+        try {
+            var current = this.drain;
+            if (current != null && current.state() == DrainOperation.State.RUNNING) {
+                return current;
+            }
+            var s = this.server;
+            if (s == null) {
+                throw new ControlException("drain: server is not running");
+            }
+            var op = new DrainOperation("drain-" + this.drainIds.incrementAndGet(), DrainOperation.State.RUNNING,
+                    this.clock.instant(), null, null);
+            this.drain = op;
+            this.log.add(op.id() + ": started");
+            var how = this.drainer;
+            Thread.ofVirtual().name("admin-" + op.id()).start(() -> runDrain(op, s, how));
+            return op;
+        } finally {
+            this.lock.unlock();
+        }
+    }
+
+    private void runDrain(DrainOperation op, SjwsServer s, Drainer how) {
+        DrainOperation end;
+        try {
+            how.drain(s);
+            end = op.finish(DrainOperation.State.DONE, this.clock.instant(), null);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            end = op.finish(DrainOperation.State.FAILED, this.clock.instant(), "interrupted");
+        } catch (RuntimeException e) {
+            end = op.finish(DrainOperation.State.FAILED, this.clock.instant(), String.valueOf(e.getMessage()));
+        }
+        this.lock.lock();
+        try {
+            if (this.server == s) {
+                this.server = null;
+                s.close();
+            }
+            this.drain = end;
+            this.log.add(op.id() + (end.state() == DrainOperation.State.DONE ? ": drained" : ": failed: " + end.error()));
+        } finally {
+            this.lock.unlock();
+        }
+    }
+
+    @Override
+    public DrainOperation drainStatus() {
+        return this.drain;
+    }
+
+    private void refuseWhileDraining(String action) throws ControlException {
+        var current = this.drain;
+        if (current != null && current.state() == DrainOperation.State.RUNNING) {
+            throw new ControlException(action + ": " + current.id() + " is in progress");
+        }
+    }
+
     @Override
     public void start() throws ControlException {
         this.lock.lock();
         try {
+            refuseWhileDraining("start");
             if (this.server != null) {
                 this.log.add("start: already running");
                 return;
@@ -158,6 +232,7 @@ public final class EmbeddedServerControl implements ServerControl {
     public void reload() throws ControlException {
         this.lock.lock();
         try {
+            refuseWhileDraining("reload");
             var next = load(); // a bad config leaves the running server alone
             var previous = this.server == null ? null : this.config;
             stop();
