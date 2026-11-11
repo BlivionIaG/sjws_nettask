@@ -21,9 +21,9 @@ import java.io.IOException;
 /**
  * Pull-style request content attached by the transport. Read on the request thread, at most once
  * from start to end; whatever a handler leaves unread is discarded by the transport (or the
- * connection is closed). HTTP/1.1 attaches one for {@code Content-Length} bodies of methods other
+ * connection is closed). HTTP/1.1 attaches one for {@code Content-Length} and chunked bodies of methods other
  * than GET/HEAD; HTTP/3 for every method other than GET/HEAD (length -1 when no {@code content-length}
- * was sent and content follows); HTTP/2 attaches one the same way (#289).
+ * was sent and content follows); HTTP/2 attaches one the same way when {@code attachBodies} is on.
  */
 public interface RequestBody {
 

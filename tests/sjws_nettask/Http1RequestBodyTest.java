@@ -121,4 +121,58 @@ class Http1RequestBodyTest {
                 "GET / HTTP/1.0\r\nHost: h\r\n\r\n", false);
         assertTrue(known.endsWith("Content-Length: 2\r\n\r\nab") || known.endsWith("\r\n\r\nab"), known);
     }
+
+    @Test
+    void chunkedBodyIsStreamedWithContinueAndTheConnectionStaysUsable() throws Exception {
+        var text = exchange(echo(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        + "7\r\nabcdefg\r\n0\r\n\r\n"
+                        + "POST /b HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                        + "2\r\nxy\r\n0\r\n\r\n",
+                false);
+        assertTrue(text.startsWith("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 "), text);
+        assertTrue(text.contains("got:abcdefg"), text);
+        assertTrue(text.endsWith("got:xy"), text);
+        assertEquals(-1L, exchangeLength("POST /z HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n"));
+    }
+
+    @Test
+    void truncatedChunkedBodyFailsTheReadAndCloses() throws Exception {
+        var text = exchange(echo(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n32\r\nabc", true);
+        assertTrue(text.startsWith("HTTP/1.1 502 "), text);
+        assertTrue(text.contains("mid-chunked body"), text);
+    }
+
+    @Test
+    void anUnreadChunkedBodyClosesTheConnection() throws Exception {
+        var seen = new AtomicReference<Long>();
+        Handler ignoring = request -> {
+            seen.set(request.body().length());
+            return new Response(200, ResponseHeaders.of(), Body.Bytes.of("ok".getBytes()));
+        };
+        var text = exchange(ignoring,
+                "PUT /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n0\r\n\r\n",
+                false);
+        assertEquals(-1L, seen.get());
+        assertTrue(text.contains("Connection: close"), text);
+    }
+
+    private static long exchangeLength(String raw) throws Exception {
+        var seen = new AtomicReference<Long>();
+        Handler taking = request -> {
+            seen.set(request.body().length());
+            var buf = new byte[16];
+            try {
+                while (request.body().read(buf, 0, buf.length) >= 0) {
+                    // drain
+                }
+            } catch (IOException e) {
+                return new Response(502, ResponseHeaders.of(), Body.Bytes.of(e.getMessage().getBytes()));
+            }
+            return new Response(200, ResponseHeaders.of(), Body.Bytes.of("ok".getBytes()));
+        };
+        exchange(taking, raw, false);
+        return seen.get();
+    }
 }

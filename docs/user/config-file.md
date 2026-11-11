@@ -414,11 +414,10 @@ and the request path is unchanged. The records map onto `Route(host, prefix, rew
 handler)` and `ProxyHandler.Settings(url, connectTimeout, responseTimeout,
 idleReadTimeout, maxBody, proto, trustedProxies, preserveHost, maxIdle)`. The proxy is a Netty
 HTTP/1.1 client with up to 256 idle keep-alive connections per upstream, and it streams
-response bodies with backpressure. HTTP/1.1 request bodies with a `Content-Length` are
-streamed upstream (over `max_body` is 413); so are HTTP/3 request bodies with a `content-length`. A chunked request
-body (or an HTTP/3 body of unknown length) is 501 for now, as is a declared body that the transport did not attach
-(HTTP/2 attaches none today); see
-`docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
+response bodies with backpressure. HTTP/1.1, HTTP/2 and HTTP/3 request bodies are streamed upstream, including a
+chunked HTTP/1.1 body and an HTTP/2 or HTTP/3 body of unknown length (over `max_body` is 413,
+enforced as the body is read when the length is unknown). A declared body that the transport did
+not attach is still 501; see `docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
 TCP and h2c, and `https` on HTTP/2 over TLS and HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
 bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read-ahead window)
 and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB), with a per-peer share
