@@ -35,10 +35,19 @@ jobs:
         run: mvn -B -q -DskipTests package
       - name: Cluster harness scenarios
         run: mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test
-      - name: Install wrk
+      - name: wrk cache key
+        id: wrk-cache
         run: |
-          tools/perf-gate/apt-retry.sh update -q
-          tools/perf-gate/apt-retry.sh install -y -q wrk
+          . /etc/os-release
+          echo "key=wrk-${ID}-${VERSION_ID}-${RUNNER_ARCH}-v2" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/wrk-cache
+          key: ${{ steps.wrk-cache.outputs.key }}
+      - name: Install wrk
+        env:
+          WRK_CACHE: ${{ runner.temp }}/wrk-cache
+        run: tools/ci/install-wrk.sh
       - name: Install wrk2
         run: |
           tools/perf-gate/install-wrk2.sh "$HOME/.local/bin/wrk2"

@@ -13,6 +13,7 @@ on:
       - 'src/**'
       - 'pom.xml'
       - 'tools/perf-gate/**'
+      - 'tools/ci/**'
       - 'contrib/sjws_nettask-standalone.yaml'
       - '.github/workflows/perf-gate.yml'
   workflow_dispatch:
@@ -47,10 +48,19 @@ jobs:
           cache-dependency-path: |
             head/pom.xml
             base/pom.xml
-      - name: Install wrk
+      - name: wrk cache key
+        id: wrk-cache
         run: |
-          head/tools/perf-gate/apt-retry.sh update -q
-          head/tools/perf-gate/apt-retry.sh install -y -q wrk
+          . /etc/os-release
+          echo "key=wrk-${ID}-${VERSION_ID}-${RUNNER_ARCH}-v2" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/wrk-cache
+          key: ${{ steps.wrk-cache.outputs.key }}
+      - name: Install wrk
+        env:
+          WRK_CACHE: ${{ runner.temp }}/wrk-cache
+        run: head/tools/ci/install-wrk.sh
       - name: Install wrk2
         run: |
           head/tools/perf-gate/install-wrk2.sh "$HOME/.local/bin/wrk2"

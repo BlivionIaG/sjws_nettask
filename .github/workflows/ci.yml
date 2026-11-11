@@ -34,6 +34,9 @@ jobs:
             echo '::error::continue-on-error masks a red job as a green workflow (#356). Remove it.'
             exit 1
           fi
+      - name: Test wrk installer probes
+        if: runner.os == 'Linux'
+        run: tools/ci/install-wrk-test.sh
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -72,11 +75,22 @@ jobs:
         run: mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test
       - name: Multi-node cluster harness (live scenarios)
         run: mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test
+      - name: wrk cache key
+        if: runner.os == 'Linux'
+        id: wrk-cache
+        run: |
+          . /etc/os-release
+          echo "key=wrk-${ID}-${VERSION_ID}-${RUNNER_ARCH}-v2" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        if: runner.os == 'Linux'
+        with:
+          path: ${{ runner.temp }}/wrk-cache
+          key: ${{ steps.wrk-cache.outputs.key }}
       - name: Install wrk
         if: runner.os == 'Linux'
-        run: |
-          tools/perf-gate/apt-retry.sh update -q
-          tools/perf-gate/apt-retry.sh install -y -q wrk
+        env:
+          WRK_CACHE: ${{ runner.temp }}/wrk-cache
+        run: tools/ci/install-wrk.sh
       - name: wrk standalone vs gateway-off
         if: runner.os == 'Linux'
         run: GATEWAY_BENCH_WARMUP=1s GATEWAY_BENCH_DURATION=3s GATEWAY_BENCH_WRK2=0 tools/gateway-bench.sh
