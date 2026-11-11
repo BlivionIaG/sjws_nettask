@@ -142,7 +142,8 @@ public class StreamLoad {
   static final LongAdder SCHED_EXPECTED = new LongAdder(), SCHED_SENT = new LongAdder(),
       SCHED_RECEIVED = new LongAdder(), SCHED_UNRECEIVED = new LongAdder(),
       SCHED_PHANTOM_STREAMS = new LongAdder(), SCHED_STAMP_FALLBACK = new LongAdder(),
-      SCHED_INFLIGHT_AT_END = new LongAdder(), SCHED_STREAMS_SHORT = new LongAdder();
+      SCHED_INFLIGHT_AT_END = new LongAdder(), SCHED_STREAMS_SHORT = new LongAdder(),
+      SCHED_LATE_REGISTERED = new LongAdder();
   static final AtomicBoolean CUTOFF_HIT = new AtomicBoolean();
   /** #415 catch-up period (window end -> last producer done): generator CPU seconds and wall seconds. */
   static volatile double CATCHUP_CPU_SEC = 0, CATCHUP_WALL_S = 0;
@@ -340,7 +341,8 @@ public class StreamLoad {
     bytesRx.reset(); LAT.clearAll(); LAT_CO.clearAll(); LAG.clearAll(); creditWaits.clear();
     SCHED_SENDS.reset(); SCHED_LATE.reset(); SCHED_LAG_MAX_NS.reset(); measureErr.clear(); teardownErr.clear();
     for (LongAdder c : List.of(SCHED_EXPECTED, SCHED_SENT, SCHED_RECEIVED, SCHED_UNRECEIVED,
-        SCHED_PHANTOM_STREAMS, SCHED_STAMP_FALLBACK, SCHED_INFLIGHT_AT_END, SCHED_STREAMS_SHORT)) c.reset();
+        SCHED_PHANTOM_STREAMS, SCHED_STAMP_FALLBACK, SCHED_INFLIGHT_AT_END, SCHED_STREAMS_SHORT,
+        SCHED_LATE_REGISTERED)) c.reset();
     CUTOFF_HIT.set(false); CATCHUP_CPU_SEC = 0; CATCHUP_WALL_S = 0;
     requests.set(0); credit429.set(0);
     producerTransportRetries.set(0); consumerConnectRetries.set(0);
@@ -349,11 +351,13 @@ public class StreamLoad {
     AtomicReference<double[]> cpuSample = new AtomicReference<>(new double[]{0,0,0,0}); // clientSec, clientPct, serverSec, serverPct
     Thread cpuMon = Thread.startVirtualThread(() -> {
       try {
-        // Skip first 2s (JIT/ramp), then average 1s slices through the measure window
+        // Skip first 2s (JIT/ramp), then 1s slices through the rest of the measure window,
+        // including the last seconds. Previously the deadline was (secs-3) after this skip, which
+        // missed the last ~3.5 s of a 20 s window.
         Thread.sleep(2000);
         double cSecSum = 0, sSecSum = 0, wallSum = 0;
         int n = 0;
-        long deadline = System.nanoTime() + (long)(Math.max(3, args.secs - 3) * 1e9);
+        long deadline = System.nanoTime() + (long)(Math.max(3, args.secs) * 1e9);
         while (System.nanoTime() < deadline) {
           long c0 = readProcJiffies("self");
           long s0 = args.serverPid > 0 ? readProcJiffies(Integer.toString(args.serverPid)) : -1;
@@ -378,7 +382,7 @@ public class StreamLoad {
         inTeardown, bytesRx, creditWaits,
         measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries, groupOpenRefusals);
     double wall = (System.nanoTime() - t0) / 1e9;
-    cpuMon.join(2000);
+    cpuMon.join(4000); // last 1s slice may still be in flight at wave return
     double load1Post = load1();
 
     DrainOutcome drain = waitDrained(http, args.base + "/metrics", args.drainTimeout);
@@ -422,6 +426,7 @@ public class StreamLoad {
     r.schedPhantomStreams = SCHED_PHANTOM_STREAMS.sum(); r.schedStampFallback = SCHED_STAMP_FALLBACK.sum();
     r.schedInflightAtEnd = SCHED_INFLIGHT_AT_END.sum(); r.cutoffHit = CUTOFF_HIT.get();
     r.schedStreamsShort = SCHED_STREAMS_SHORT.sum();
+    r.schedLateRegistered = SCHED_LATE_REGISTERED.sum();
     r.catchupS = CATCHUP_WALL_S;
     r.catchupCpuPct = CATCHUP_WALL_S > 0 ? CATCHUP_CPU_SEC / CATCHUP_WALL_S * 100.0 : 0;
     r.harnessCommit = args.harnessCommit;
@@ -595,6 +600,12 @@ public class StreamLoad {
     final AtomicBoolean stop = w.hardStop;
     Track track = new Track(phaseNs, intervalNs);
     w.tracks.put(new StreamKey(lease.streamHi, lease.streamLo), track);
+    // Optional: count claims that returned at or after the window start (late / mid-window).
+    if (w.account) {
+      long nowReg = System.nanoTime();
+      long startReg = w.startNs; // after the clock; MAX_VALUE until the window is published
+      if (startReg != Long.MAX_VALUE && nowReg >= startReg) SCHED_LATE_REGISTERED.increment();
+    }
     try {
       if (args.leanHttp) lean = new LeanHttp(URI.create(args.base), 60_000);
       while (!stop.get()) {
@@ -1567,7 +1578,7 @@ public class StreamLoad {
     double rateMibS, schedLatePct, schedLagMaxUs, offeredActualMibS;
     Double lagP50, lagP99;
     long schedSends, schedExpected, schedSent, schedReceived, schedUnreceived, schedPhantomStreams,
-        schedStampFallback, schedInflightAtEnd, schedStreamsShort;
+        schedStampFallback, schedInflightAtEnd, schedStreamsShort, schedLateRegistered;
     boolean cutoffHit;
     double catchupS, catchupCpuPct;
     String harnessCommit = "", validityMarker = "";
@@ -1621,6 +1632,7 @@ public class StreamLoad {
       field(sb, "sched_stamp_fallback", schedStampFallback, true);
       field(sb, "cutoff_hit", cutoffHit, true);
       field(sb, "sched_streams_short", schedStreamsShort, true);
+      field(sb, "sched_late_registered", schedLateRegistered, true);
       field(sb, "catchup_s", catchupS, true);
       field(sb, "catchup_cpu_pct_of_wall", catchupCpuPct, true);
       field(sb, "harness_commit", quote(harnessCommit), true);

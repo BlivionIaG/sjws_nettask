@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -29,6 +30,10 @@ REQUIRED_VALIDITY_MARKER = "q4"
 # window (<= 0.05 %); integer-ns interval truncation is negligible; 0.5 % leaves 10x headroom and
 # still catches ~1 % of slots never sent.
 OFFERED_ACTUAL_TOL_PCT = 0.5
+# Architecture approval of fa125a48, required change: a countable harness_commit is a full (40) or
+# short (7–40) lowercase hex sha, never empty, never "unknown", never a "-dirty" suffix. DONE lines
+# may still record "-dirty" for information; those windows never count.
+HARNESS_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 def binom_sf(k, n, p=0.5):
@@ -71,6 +76,22 @@ def offered_actual_ok(v) -> bool:
             and abs(float(v) - GATE_RATE_MIB_S) <= GATE_RATE_MIB_S * OFFERED_ACTUAL_TOL_PCT / 100.0)
 
 
+def harness_commit_ok(c) -> bool:
+    """True iff c is a full or short hex sha with no -dirty suffix (and not 'unknown' or empty)."""
+    return isinstance(c, str) and bool(HARNESS_COMMIT_RE.fullmatch(c))
+
+
+def harness_commit_reason(tag: str, c) -> str | None:
+    if not isinstance(c, str) or not c:
+        return f"{tag}: no harness_commit stamped in result.json"
+    if c.endswith("-dirty"):
+        return (f"{tag}: harness_commit={c} is a dirty tree "
+                "(DONE may record -dirty for information; such windows never count)")
+    if not harness_commit_ok(c):
+        return f"{tag}: harness_commit={c!r} is not a full or short hex sha"
+    return None
+
+
 def shortfall(r: dict):
     """In-window slots not received (int), or None when the window has no slot accounting."""
     exp, rec = r.get("sched_expected"), r.get("sched_received")
@@ -96,7 +117,8 @@ def main(argv=None):
         # Re-review fix: no p99 is ever reported for a window with a slot shortfall (or no accounting
         # on a paced window): the missing slots' true ages are only lower-bounded.
         no_p99 = (short is None and r.get("latency_basis") == "scheduled") or (short or 0) > 0
-        marker_ok = bool(r.get("harness_commit")) and r.get("validity_marker") == REQUIRED_VALIDITY_MARKER
+        marker_ok = (harness_commit_ok(r.get("harness_commit"))
+                     and r.get("validity_marker") == REQUIRED_VALIDITY_MARKER)
         windows.append({
             "tag": p.parent.name,
             "valid": ev["valid"],
@@ -147,20 +169,24 @@ def main(argv=None):
             "sched_stamp_fallback": r.get("sched_stamp_fallback"),
             "cutoff_hit": r.get("cutoff_hit"),
             "sched_streams_short": r.get("sched_streams_short"),
+            "sched_late_registered": r.get("sched_late_registered"),
             "catchup_s": r.get("catchup_s"),
             "catchup_cpu_pct_of_wall": r.get("catchup_cpu_pct_of_wall"),
             "closed_loop": closed_loop_info(out, p.parent.name),
         })
 
-    if enforce_marker:
-        for w in windows:
-            if not w["marker_ok"]:
-                w["valid"] = False  # pre-Q4 or unstamped window: never counts
+    for w in windows:
+        if not harness_commit_ok(w.get("harness_commit")):
+            w["valid"] = False  # unknown / empty / dirty: never counts
+        elif enforce_marker and not w["marker_ok"]:
+            w["valid"] = False  # pre-Q4 or unstamped window: never counts
     valid = [w for w in windows if w["valid"]]
     floor, floor_valid = lowload_floor(out)
-    if enforce_marker and floor and not (floor.get("harness_commit")
-                                         and floor.get("validity_marker") == REQUIRED_VALIDITY_MARKER):
-        floor_valid = False  # a pre-Q4 floor leg never counts either
+    if floor:
+        floor_commit_ok = harness_commit_ok(floor.get("harness_commit"))
+        floor_marker_ok = floor.get("validity_marker") == REQUIRED_VALIDITY_MARKER
+        if not floor_commit_ok or (enforce_marker and not floor_marker_ok):
+            floor_valid = False  # dirty / unknown / empty, or a pre-Q4 floor: never counts
     floor_txt = (f"lowload-floor@{floor.get('offered_mib_s')}MiB/s p99={floor.get('p99_us')}µs "
                  f"(send {floor.get('p99_send_us')}, valid={floor_valid})") if floor else "lowload-floor=n/a"
     print(f"absolute windows: {len(windows)} total, {len(valid)} valid (need 5–8)")
@@ -186,10 +212,13 @@ def main(argv=None):
               f"slots exp/sent/recv={w.get('sched_expected')}/{w.get('sched_sent')}/{w.get('sched_received')} "
               f"unrecv={w.get('sched_unreceived_at_cutoff')} streams_short={w.get('sched_streams_short')} "
               f"cutoff_hit={w.get('cutoff_hit')} catchup={w.get('catchup_s')}s@{w.get('catchup_cpu_pct_of_wall')}% "
+              f"late_registered={w.get('sched_late_registered')} "
               f"harness={w.get('harness_commit')}/{w.get('validity_marker')} | "
               f"closed-loop(info) mib_s={cl.get('mib_s')} p99={cl.get('p99_us')} cpu={cl.get('client_cpu_pct_of_wall')} | "
               f"{floor_txt}")
-        if enforce_marker and not w["marker_ok"]:
+        if not harness_commit_ok(w.get("harness_commit")):
+            print(f"  INVALID {w['tag']}: {harness_commit_reason(w['tag'], w.get('harness_commit'))}")
+        elif enforce_marker and not w["marker_ok"]:
             print(f"  INVALID {w['tag']}: harness_commit={w.get('harness_commit')} "
                   f"validity_marker={w.get('validity_marker')} (need {REQUIRED_VALIDITY_MARKER})")
         if (w['transport_retry_flag'] or w['refused_per_ip'] or w['drain_timed_out']
@@ -204,8 +233,9 @@ def main(argv=None):
     verdict = "FAIL"
     reason = []
     for w in windows:
-        if not w.get("harness_commit"):
-            reason.append(f"{w['tag']}: no harness_commit stamped in result.json")
+        cr = harness_commit_reason(w["tag"], w.get("harness_commit"))
+        if cr:
+            reason.append(cr)
     if len(valid) < 5:
         reason.append(f"only {len(valid)} valid windows (need ≥5)")
     else:
@@ -348,8 +378,10 @@ def main(argv=None):
         if (shortfall(r) or 0) > 0:
             bad.append(f"slot shortfall {shortfall(r)}")
             r["p99_us"] = None
-        if enforce_marker and not (r.get("harness_commit")
-                                   and r.get("validity_marker") == REQUIRED_VALIDITY_MARKER):
+        cr = harness_commit_reason(f"A/A leg {i}", r.get("harness_commit"))
+        if cr:
+            bad.append(cr)
+        elif enforce_marker and r.get("validity_marker") != REQUIRED_VALIDITY_MARKER:
             bad.append("pre-Q4 or unstamped A/A leg")
         for b_ in bad:
             reason.append(f"A/A leg {i}: {b_}")

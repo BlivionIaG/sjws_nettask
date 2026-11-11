@@ -118,18 +118,46 @@ def main():
     out = case({"harness_commit": ""})
     assert "VERDICT: TEST_ONLY_FAIL" in out and "no harness_commit" in out, out
 
+    # Architecture approval of fa125a48: reject unknown, empty (above) and dirty; accept short and full hex.
+    # These windows never count, even on the --assume-q4 path.
+    for bad, needle in (
+        ("unknown", "not a full or short hex sha"),
+        ("fa125a483a11-dirty", "dirty tree"),
+        ("HEAD", "not a full or short hex sha"),
+        ("g123456", "not a full or short hex sha"),
+        ("abc123", "not a full or short hex sha"),  # 6 chars: too short
+    ):
+        out = case({"harness_commit": bad})
+        assert "VERDICT: TEST_ONLY_FAIL" in out and needle in out, (bad, out)
+    assert "VERDICT: TEST_ONLY_PASS" in case({"harness_commit": "fa125a483a11"}), "short 12-char sha"
+    assert "VERDICT: TEST_ONLY_PASS" in case({"harness_commit": "a" * 40}), "full 40-char sha"
+    # A/A and floor legs: same rule.
+    out = case(aa_over={"harness_commit": "abc1234-dirty"})
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "dirty tree" in out, out
+    out = case(aa_over={"harness_commit": "unknown"})
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "not a full or short hex sha" in out, out
+    out = case(floor=False, extra=lambda r: write_floor(r, harness_commit="deadbeef-dirty"))
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "no valid low-load" in out, out
+    out = case(floor=False, extra=lambda r: write_floor(r, harness_commit="unknown"))
+    assert "VERDICT: TEST_ONLY_FAIL" in out and "no valid low-load" in out, out
+    assert "VERDICT: TEST_ONLY_PASS" in case(floor=False, extra=lambda r: write_floor(r, harness_commit="0123456789ab"))
+    # Window line reports late-registered stream count.
+    out = case({"sched_late_registered": 17})
+    assert "late_registered=17" in out, out
+    assert "VERDICT: TEST_ONLY_PASS" in out, out  # reported, not a fail on its own
+
     # Re-review item 2: once Q4 lands, pre-Q4 windows never count; q4-stamped ones do.
     import contextlib
     import io
     sys.path.insert(0, str(HERE))
     import agg as aggmod  # noqa: E402
 
-    def landed(marker):
+    def landed(marker, commit="fa125a483a11"):
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
             for i in range(1, 6):
-                write(root, f"abs-{i:02d}", validity_marker=marker)
-            write_floor(root, validity_marker=marker)
+                write(root, f"abs-{i:02d}", validity_marker=marker, harness_commit=commit)
+            write_floor(root, validity_marker=marker, harness_commit=commit)
             buf = io.StringIO()
             old, aggmod.Q4_LANDED = aggmod.Q4_LANDED, True
             try:
@@ -141,6 +169,12 @@ def main():
     out = landed("pre-q4")
     assert "VERDICT: FAIL" in out and "only 0 valid windows" in out, out
     out = landed("q4")
+    assert "VERDICT: PASS" in out, out
+    out = landed("q4", commit="fa125a483a11-dirty")
+    assert "VERDICT: FAIL" in out and "only 0 valid windows" in out and "dirty tree" in out, out
+    out = landed("q4", commit="unknown")
+    assert "VERDICT: FAIL" in out and "only 0 valid windows" in out, out
+    out = landed("q4", commit="a" * 40)
     assert "VERDICT: PASS" in out, out
     print("ok")
 

@@ -125,6 +125,11 @@ flag-off emits nothing). Validate a scrape with `promtool check metrics`.
     `NOT_COUNTABLE (pre-Q4 harness, would be X)`.
   - Every `result.json` is stamped with `harness_commit` and `validity_marker` (`pre-q4` until the
     post-#465 merge sets `q4`). Once Q4 lands, legs without the `q4` marker never count.
+  - A countable `harness_commit` is a full or short (7–40) hex sha. Empty, `unknown` and `-dirty`
+    commits are rejected on abs, A/A and floor legs. DONE lines may still record `-dirty` for
+    information; those windows never count.
+  - `sched_late_registered` is the count of streams whose claim returned at or after the window start,
+    reported on each window line.
   - `--assume-q4` is for tests only and prints `TEST_ONLY_PASS` / `TEST_ONLY_FAIL`.
 - `result.json` also carries the sparse latency histogram (`chunk_latency.hist`, LatBag buckets,
   `hist_sub_bits`) so windows from several generator processes ((B) split) can be merged exactly.

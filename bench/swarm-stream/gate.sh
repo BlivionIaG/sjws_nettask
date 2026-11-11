@@ -36,6 +36,8 @@ QUIET_WAIT_TOTAL_S=${QUIET_WAIT_TOTAL_S:-5400}
 QUIET_WAITED_S=0
 HERE=$(cd "$(dirname "$0")" && pwd)
 # Architecture item 7: every DONE line records the harness commit (and whether the tree was dirty).
+# Architecture approval of fa125a48: agg.py rejects empty, "unknown" and "-dirty" commits on abs,
+# A/A and floor legs (those windows never count). The DONE line still records -dirty for information.
 HARNESS_COMMIT=$(git -C "$HERE" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
 if [ -n "$(git -C "$HERE" status --porcelain -- . 2>/dev/null)" ]; then HARNESS_COMMIT="$HARNESS_COMMIT-dirty"; fi
 export HARNESS_COMMIT  # stamped into every result.json by StreamLoad (re-review item 2)
