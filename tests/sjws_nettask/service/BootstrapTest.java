@@ -241,8 +241,7 @@ class BootstrapTest {
             assertTrue(suffix.contains("connection=pending"), suffix);
             assertTrue(suffix.contains("config-version=0"), suffix);
             assertFalse(Files.readString(ServiceStatus.beside(pid)).contains(SECRET));
-            assertEquals(PosixFilePermissions.fromString("rw-r--r--"),
-                    Files.getPosixFilePermissions(ServiceStatus.beside(pid)));
+            assertEquals(OWNER_RW, Files.getPosixFilePermissions(ServiceStatus.beside(pid)));
 
             enrollment.attach(new ControlPlaneBinding() {
                 @Override
@@ -685,6 +684,39 @@ class BootstrapTest {
             var kept = ServiceStatus.runningSuffix(pid, me, started);
             assertTrue(kept.contains("connection=leader"), kept);
             assertTrue(kept.contains("admin=127.0.0.1:9443"), kept);
+        } finally {
+            enrollment.close();
+        }
+    }
+
+    @Test
+    void statusSidecarIsOwnerOnlyAndTightensALooserPreExistingFile() throws Exception {
+        long me = ProcessHandle.current().pid();
+        long started = ProcessHandle.current().info().startInstant().orElseThrow().toEpochMilli();
+        var pid = tmp.resolve("nits.pid");
+        Files.writeString(pid, me + "\n" + started + "\n");
+        Path status = ServiceStatus.beside(pid);
+        Files.writeString(status, "stale-world-readable\n");
+        Files.setPosixFilePermissions(status, WORLD);
+
+        ServiceStatus.write(pid, me, started, "control", "", "pending", 0, 30_000, "127.0.0.1:18444", "failed");
+        var perms = Files.getPosixFilePermissions(status);
+        assertEquals(OWNER_RW, perms, perms.toString());
+        assertFalse(perms.contains(PosixFilePermission.GROUP_READ));
+        assertFalse(perms.contains(PosixFilePermission.OTHERS_READ));
+        var body = Files.readString(status);
+        assertTrue(body.contains("admin-state=failed"), body);
+        var suffix = ServiceStatus.runningSuffix(pid, me, started);
+        assertTrue(suffix.contains("admin=127.0.0.1:18444"), suffix);
+        assertTrue(suffix.contains("admin-state=failed"), suffix);
+
+        var fix = controlTree("");
+        var enrollment = NodeEnrollment.open(Bootstrap.load(fix.boot, "control"), pid, 30_000);
+        try {
+            enrollment.adminListener("127.0.0.1:18444", "failed");
+            var viaEnrollment = ServiceStatus.runningSuffix(pid, me, started);
+            assertTrue(viaEnrollment.contains("admin-state=failed"), viaEnrollment);
+            assertEquals(OWNER_RW, Files.getPosixFilePermissions(status));
         } finally {
             enrollment.close();
         }

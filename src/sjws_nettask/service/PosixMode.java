@@ -33,9 +33,8 @@ final class PosixMode {
     static final Set<PosixFilePermission> OWNER_READ = EnumSet.of(PosixFilePermission.OWNER_READ);
     static final Set<PosixFilePermission> OWNER_RWX = EnumSet.of(PosixFilePermission.OWNER_READ,
             PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE);
-    /** Status file: no secrets, readable so an operator can run {@code --status}. */
-    static final Set<PosixFilePermission> STATUS = EnumSet.of(PosixFilePermission.OWNER_READ,
-            PosixFilePermission.OWNER_WRITE, PosixFilePermission.GROUP_READ, PosixFilePermission.OTHERS_READ);
+    /** Status sidecar: owner-only (0600). Not world-readable. */
+    static final Set<PosixFilePermission> STATUS = OWNER_RW;
 
     private PosixMode() {
     }

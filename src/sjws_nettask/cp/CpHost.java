@@ -29,8 +29,9 @@ import sjws_nettask.service.CpReloadable;
 /**
  * A full CONTROL-role voter (control-plane-hosting.md §1). Start order: config and timing check (done by
  * {@link CpLaunch}), {@code KeyRing.load}, {@code CpStore.open} with the peers, {@link WatchServer},
- * {@link AdminServer}, ready. Shutdown runs in reverse. Any failure closes what was opened and throws, so the
- * process exits non-zero.
+ * {@link AdminServer}, ready. Shutdown runs in reverse. A failure to bind or start the admin listener is
+ * recorded as {@code admin-state=failed} and the host stays up so store and watch remain available. Any
+ * other failure closes what was opened and throws, so the process exits non-zero.
  */
 public final class CpHost implements CpReloadable {
 
@@ -126,18 +127,28 @@ public final class CpHost implements CpReloadable {
         var adminAt = resolve(config.adminListen());
         long now = deps.clock().currentTimeMillis();
         var origins = java.util.Set.copyOf(config.adminAllowedOrigins());
-        AdminServer started;
         if (adminTls == null) {
             loopback(adminAt, "cp.admin.listen");
-            started = AdminServer.startPlainForTests(store, now, 60_000L, origins);
-        } else {
-            started = AdminServer.startMtls(store, adminAt, now, 60_000L, adminTls, origins);
-            tlsReloads.add(adminTls::reloadTls);
         }
-        admin = started;
-        adminBound = started.address();
-        adminState = "listening";
-        events.add("admin");
+        try {
+            AdminServer started;
+            if (adminTls == null) {
+                started = AdminServer.startPlainForTests(store, now, 60_000L, origins, adminAt);
+            } else {
+                started = AdminServer.startMtls(store, adminAt, now, 60_000L, adminTls, origins);
+                tlsReloads.add(adminTls::reloadTls);
+            }
+            admin = started;
+            adminBound = started.address();
+            adminState = "listening";
+            events.add("admin");
+        } catch (IOException e) {
+            err.println("ERROR: admin listener failed to bind or start: " + e.getMessage());
+            adminState = "failed";
+            if (adminAt.getPort() > 0) {
+                adminBound = adminAt;
+            }
+        }
         events.add("ready");
     }
 
