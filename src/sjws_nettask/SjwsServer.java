@@ -114,6 +114,11 @@ public final class SjwsServer implements AutoCloseable {
      * Otherwise the chain, or a terminal that is not the static handler. Fixed at start.
      */
     private final Handler override;
+    /**
+     * Non-HA data node with no startup leaf: {@link #override} is a readiness wrapper over the live
+     * snapshot, and each HTTP/2 generation pins its own snapshot behind this readiness check.
+     */
+    private final java.util.function.BooleanSupplier snapshotReadiness;
     /** Null when the server was started without {@link HaSettings}. */
     private final HaRuntime ha;
     private final AltSvc altSvc = new AltSvc();
@@ -236,6 +241,7 @@ public final class SjwsServer implements AutoCloseable {
             this.ha = HaRuntime.create(haSettings, generationLeaf);
             published = this.ha.handler();
         }
+        java.util.function.BooleanSupplier readiness = null;
         if (snapshot.document().node().mode() == NodeSettings.Mode.DATA) {
             var guard = sjws_nettask.cp.DataPlaneGuard.forDocument(snapshot.document());
             this.dataPlane = guard;
@@ -245,9 +251,11 @@ public final class SjwsServer implements AutoCloseable {
                 Handler current = published;
                 published = new DataReadyHandler(
                         () -> current != null ? current : this.live.handler(), guard::ready);
+                readiness = current == null ? guard::ready : null;
             }
         }
         this.override = published;
+        this.snapshotReadiness = readiness;
         if (config.cacheBytes() > Runtime.getRuntime().maxMemory() / 2) {
             System.err.println("WARN: --cache-bytes=" + config.cacheBytes()
                     + " is more than half of the maximum heap (" + Runtime.getRuntime().maxMemory()
@@ -586,7 +594,7 @@ public final class SjwsServer implements AutoCloseable {
             if (transport instanceof sjws_nettask.h2.Http2Server http2) {
                 // Pin a fully armed generation (filters + metrics around the snapshot terminal, or
                 // around a frozen override) so each Task captures one handler (#301 / B3).
-                Handler pinned = this.override != null ? this.override : this.live.handler();
+                Handler pinned = generationLeaf(this.live.get());
                 Handler armed = armedAround(pinned);
                 boolean bodies = liveNeedsBodies() || this.override != null;
                 http2.armHandler(armed, bodies);
@@ -1388,7 +1396,19 @@ public final class SjwsServer implements AutoCloseable {
         if (control != null && control.isLive()) {
             return this.chainLeaf;
         }
-        return this.override != null ? this.override : next.handler();
+        return generationLeaf(next);
+    }
+
+    /**
+     * The leaf an HTTP/2 generation pins for {@code snapshot}: that snapshot's own handler (behind
+     * the data-node readiness check when that is the override), or the startup override.
+     */
+    private Handler generationLeaf(ConfigSnapshot snapshot) {
+        if (this.snapshotReadiness != null) {
+            Handler frozen = snapshot.handler();
+            return new DataReadyHandler(() -> frozen, this.snapshotReadiness);
+        }
+        return this.override != null ? this.override : snapshot.handler();
     }
 
     private Handler compileAroundTerminal(Handler terminal) {
