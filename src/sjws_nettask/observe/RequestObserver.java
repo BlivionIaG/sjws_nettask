@@ -18,6 +18,7 @@ package sjws_nettask.observe;
 
 import java.nio.charset.StandardCharsets;
 import java.util.function.Supplier;
+import sjws_nettask.messaging.stats.MessagingMetrics;
 import sjws_nettask.ServerConfig;
 import sjws_nettask.ServerConfig.MetricsExposure;
 import sjws_nettask.core.Body;
@@ -77,7 +78,10 @@ public final class RequestObserver implements AutoCloseable {
     private volatile Supplier<ClusterStatus> cluster;
     /** Read only while rendering {@code /metrics}. Null or {@link LabelSource#NONE} omits gateway families. */
     private volatile LabelSource labels;
+    /** Extra Prometheus text (e.g. swarm stream counters). Null omits. */
     private volatile java.util.function.Supplier<String> appendix;
+    /** Read only while rendering {@code /metrics}. Null omits messaging families (#400). */
+    private volatile MessagingMetrics messagingMetrics;
     /**
      * Api-key query parameter names to mask in the access-log target. {@link AccessTargetMask#NONE}
      * when unset. Read on the logging path only.
@@ -258,7 +262,15 @@ public final class RequestObserver implements AutoCloseable {
         this.credentialQueryParams = names == null || names.length == 0 ? AccessTargetMask.NONE : names;
     }
 
-    /** Process counters, plus cluster and gateway families when those sources are attached. */
+    /**
+     * Messaging produce/fetch histograms (and optional lag) on {@code /metrics}. Null omits them.
+     * Does not install the observe filter by itself.
+     */
+    void attachMessagingMetrics(MessagingMetrics metrics) {
+        this.messagingMetrics = metrics;
+    }
+
+    /** Process counters, plus cluster, gateway and messaging families when those sources are attached. */
     String exposition() {
         var sb = new StringBuilder(this.metrics.prometheus());
         var cluster = this.cluster;
@@ -275,6 +287,10 @@ public final class RequestObserver implements AutoCloseable {
             if (extra != null && !extra.isEmpty()) {
                 sb.append(extra);
             }
+        }
+        var messaging = this.messagingMetrics;
+        if (messaging != null) {
+            messaging.appendTo(sb);
         }
         return sb.toString();
     }

@@ -157,7 +157,7 @@ public final class ServerMetrics {
         return whole + "." + (frac < 10 ? "00" : frac < 100 ? "0" : "") + frac;
     }
 
-    static int bucket(long nanos) {
+    public static int bucket(long nanos) {
         for (int i = 0; i < LATENCY_BOUNDS_NANOS.length - 1; i++) {
             if (nanos <= LATENCY_BOUNDS_NANOS[i]) {
                 return i;
