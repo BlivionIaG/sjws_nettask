@@ -6,6 +6,11 @@ is not managed by a control plane (CP) loads none of it and runs exactly the cod
 `docs/design/control-plane.md` (the HA workstream) owns the overall CP design. This page covers
 only the security pieces, and the seams they leave for it.
 
+When `LivePolicy` is wired onto data nodes, re-run the combined CP + access-rules overhead bench with the
+#263 method (ABBA, at least 9 valid blocks plus an A/A control) before that change merges. The last run,
+with no content-path caller, is
+[#345 (comment)](https://github.com/BlivionIaG/sjws_nettask/issues/345#issuecomment-6804955879).
+
 ## Distributable access policy
 
 `AccessPolicyDocument` is `version + Scope + AccessSettings`, with a canonical text form:

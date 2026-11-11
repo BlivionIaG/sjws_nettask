@@ -125,6 +125,7 @@ public final class DataWatch implements AutoCloseable {
         var clientTls = cpTls == null ? null : cpTls.client();
         var watch = new DataWatch(endpoint(controlPlane, cpTls != null), nodeId, tokenId, secret, pin, stateDir,
                 server, enrollment, nowMillis, cpTls, clientTls);
+        watch.attachReadiness();
         watch.thread.start();
         return watch;
     }
@@ -190,6 +191,7 @@ public final class DataWatch implements AutoCloseable {
                     offer(WatchWire.decode(body));
                 } else if (status == 204) {
                     report("connected");
+                    retryContentBind();
                 } else {
                     throw new IOException("watch answered " + status);
                 }
@@ -231,6 +233,8 @@ public final class DataWatch implements AutoCloseable {
             return;
         }
         this.applied = new Applied(snapshot.version(), snapshot.canonicalHashHex());
+        this.server.dataPlane().applied(snapshot, true);
+        bindContentAfterLastGood();
         report("connected");
         var ack = request("POST", "/cp/v1/watch/ack?version=" + snapshot.version());
         int status = ack.getResponseCode();
@@ -368,7 +372,36 @@ public final class DataWatch implements AutoCloseable {
     }
 
     /** Rewrites the status file only on a change. {@code down} maps to disconnected or pending. */
+    private void attachReadiness() {
+        if (this.nowMillis != DataPlaneGuard.WALL_CLOCK) {
+            this.server.dataPlane().clock(this.nowMillis);
+        }
+        this.server.installPersistedLastGood(this.stateDir, this.pin);
+        if (this.server.dataPlane().hasLastGood()) {
+            bindContentAfterLastGood();
+        }
+    }
+
+    /** A bind that failed earlier is tried again on each watch tick while a last-good is installed. */
+    private void retryContentBind() {
+        if (this.server.dataPlane().hasLastGood()) {
+            bindContentAfterLastGood();
+        }
+    }
+
+    private void bindContentAfterLastGood() {
+        if (this.server.contentBound()) {
+            return;
+        }
+        try {
+            this.server.bindContentPort();
+        } catch (IOException e) {
+            System.err.println("WARN: content port was not bound after last-good: " + e.getMessage());
+        }
+    }
+
     private void report(String next) {
+        this.server.dataPlane().controlPlane("connected".equals(next));
         long version = this.applied.version();
         var binding = StatusBinding.data("connected".equals(next), version > 0, version);
         var shown = binding.connectionState();

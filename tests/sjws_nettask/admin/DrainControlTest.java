@@ -130,22 +130,43 @@ class DrainControlTest {
     }
 
     @Test
-    void stopDuringDrainWinsAndTheDrainStillFinishes() throws Exception {
+    void stopDuringDrainEndsTheOperationAndALateFinishChangesNothing() throws Exception {
         var release = new CountDownLatch(1);
         var entered = new CountDownLatch(1);
-        try (var control = control(new LogBuffer(50))) {
+        var returned = new CountDownLatch(1);
+        var log = new LogBuffer(50);
+        try (var control = control(log)) {
             control.drainer(server -> {
                 entered.countDown();
-                release.await();
+                try {
+                    release.await();
+                } finally {
+                    returned.countDown();
+                }
             });
             control.start();
-            control.drain();
+            var op = control.drain();
             assertTrue(entered.await(5, TimeUnit.SECONDS));
             control.stop(); // the operator can still stop hard
             assertEquals(ServerStatus.State.STOPPED, control.status().state());
+            var stopped = control.drainStatus();
+            assertEquals(op.id(), stopped.id());
+            assertEquals(DrainOperation.State.FAILED, stopped.state());
+            assertEquals("stopped during drain", stopped.error());
+            assertNotNull(stopped.finishedAt());
+
+            // start and reload are no longer refused while the old drainer is still blocked
+            control.start();
+            assertEquals(ServerStatus.State.RUNNING, control.status().state());
+            control.reload();
+            assertEquals(ServerStatus.State.RUNNING, control.status().state());
+
             release.countDown();
-            await(() -> control.drainStatus().state() == DrainOperation.State.DONE);
-            assertEquals(ServerStatus.State.STOPPED, control.status().state());
+            assertTrue(returned.await(5, TimeUnit.SECONDS));
+            await(() -> String.join("\n", log.tail(10)).contains(op.id() + ": drainer returned after stop"));
+            assertSame(stopped, control.drainStatus(), "a late finish must not overwrite the stopped operation");
+            assertEquals(ServerStatus.State.RUNNING, control.status().state(), "the new server is left alone");
+            control.stop();
         }
     }
 

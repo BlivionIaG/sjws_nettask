@@ -22,6 +22,7 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -87,20 +88,41 @@ public final class LastGoodFiles {
     }
 
     public static void writePin(Path pin, byte[] rootPublic, long versionFloor) throws IOException {
+        writePin(pin, rootPublic, versionFloor, 0L, 0L);
+    }
+
+    public static void writePin(Path pin, byte[] rootPublic, long versionFloor, long appliedVersion,
+            long bundleSerial) throws IOException {
         var parent = pin.toAbsolutePath().getParent();
         if (parent != null) {
             Files.createDirectories(parent);
         }
-        var body = ByteBuffer.allocate(4 + 4 + rootPublic.length + 8);
+        var body = ByteBuffer.allocate(4 + 4 + rootPublic.length + 8 + 8 + 8);
         body.put("SJWS".getBytes(StandardCharsets.US_ASCII));
         body.putInt(rootPublic.length);
         body.put(rootPublic);
         body.putLong(versionFloor);
+        body.putLong(appliedVersion);
+        body.putLong(bundleSerial);
         atomicBytes(pin, body.array());
     }
 
+    /**
+     * Raises the applied-version and bundle-serial floors stored on the pin. Never lowers either
+     * value. The pin file is outside the writable last-good directory.
+     */
+    public static void ratchetPin(Path pin, long appliedVersion, long bundleSerial) throws IOException {
+        var current = readPin(pin);
+        long version = Math.max(current.appliedVersion(), appliedVersion);
+        long serial = Math.max(current.bundleSerial(), bundleSerial);
+        if (version == current.appliedVersion() && serial == current.bundleSerial()) {
+            return;
+        }
+        writePin(pin, current.rootPublic(), current.versionFloor(), version, serial);
+    }
+
     public static Pin readPin(Path pin) throws IOException {
-        var raw = Files.readAllBytes(pin);
+        var raw = readAllBytesNoFollow(pin);
         var body = ByteBuffer.wrap(raw);
         var magic = new byte[4];
         body.get(magic);
@@ -113,11 +135,49 @@ public final class LastGoodFiles {
         }
         var key = new byte[len];
         body.get(key);
+        if (body.remaining() < 8) {
+            throw new IOException("pin floor");
+        }
         long floor = body.getLong();
-        return new Pin(key, floor);
+        long applied = 0L;
+        long serial = 0L;
+        if (body.remaining() == 16) {
+            applied = body.getLong();
+            serial = body.getLong();
+        } else if (body.remaining() != 0) {
+            throw new IOException("pin length");
+        }
+        return new Pin(key, floor, applied, serial);
     }
 
-    public record Pin(byte[] rootPublic, long versionFloor) {
+    public record Pin(byte[] rootPublic, long versionFloor, long appliedVersion, long bundleSerial) {
+        public Pin(byte[] rootPublic, long versionFloor) {
+            this(rootPublic, versionFloor, 0L, 0L);
+        }
+    }
+
+    static boolean isRegularFile(Path path) {
+        return path != null && Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS);
+    }
+
+    static String readStringNoFollow(Path path) throws IOException {
+        return new String(readAllBytesNoFollow(path), StandardCharsets.UTF_8);
+    }
+
+    static byte[] readAllBytesNoFollow(Path path) throws IOException {
+        try (var channel = FileChannel.open(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
+            long size = channel.size();
+            if (size < 0 || size > 8_000_000L) {
+                throw new IOException("file size");
+            }
+            var buffer = ByteBuffer.allocate((int) size);
+            while (buffer.hasRemaining()) {
+                if (channel.read(buffer) < 0) {
+                    break;
+                }
+            }
+            return buffer.array();
+        }
     }
 
     static String jsonString(String raw) {

@@ -100,6 +100,21 @@ public final class EmbeddedServerControl implements ServerControl {
                 Duration.between(this.startedAt, this.clock.instant()), summary, view);
     }
 
+    /** The local node only; a stopped server or a failed snapshot reports 0 of 1 nodes. */
+    @Override
+    public MetricsView.Report metrics() {
+        var s = this.server;
+        if (s == null) {
+            return new MetricsView.Report(java.util.List.of(), 1);
+        }
+        try {
+            return new MetricsView.Report(java.util.List.of(new MetricsView.Node("local", s.metricsSnapshot())), 1);
+        } catch (IOException | RuntimeException e) {
+            this.log.add("metrics snapshot failed: " + e.getMessage());
+            return new MetricsView.Report(java.util.List.of(), 1);
+        }
+    }
+
     /**
      * Attaches the control-plane aggregate the TUI reads, and the same view on {@code /metrics}
      * when that endpoint is enabled. Null detaches both. A board attached before {@link #start}
@@ -219,6 +234,11 @@ public final class EmbeddedServerControl implements ServerControl {
                 this.server = null;
                 s.close();
             }
+            if (this.drain != op) {
+                // a hard stop already ended this operation; a late finish must not overwrite that
+                this.log.add(op.id() + ": drainer returned after stop");
+                return;
+            }
             this.drain = end;
             this.log.add(op.id() + (end.state() == DrainOperation.State.DONE ? ": drained" : ": failed: " + end.error()));
         } finally {
@@ -265,6 +285,12 @@ public final class EmbeddedServerControl implements ServerControl {
             s.close();
             this.lastError = null;
             this.log.add("stopped");
+            var running = this.drain;
+            if (running != null && running.state() == DrainOperation.State.RUNNING) {
+                // the server is closed, so the drain cannot finish anything; do not block start/reload on it
+                this.drain = running.finish(DrainOperation.State.FAILED, this.clock.instant(), "stopped during drain");
+                this.log.add(running.id() + ": failed: stopped during drain");
+            }
         } finally {
             this.lock.unlock();
         }

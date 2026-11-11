@@ -22,6 +22,7 @@ import java.io.PrintStream;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Locale;
+import java.util.concurrent.TimeoutException;
 import sjws_nettask.observe.ClusterStatus;
 
 /**
@@ -40,7 +41,10 @@ public final class AdminTui {
     static final int FILE_TAIL_BYTES = 256 * 1024;
     static final int QUEUE_PAGE = 20;
 
-    enum View { STATUS, CONFIG, LOGS, QUEUES }
+    enum View { STATUS, CONFIG, LOGS, QUEUES, METRICS, CLUSTER }
+
+    /** How long the Cluster view waits for a cluster status before showing it as unavailable. */
+    static final Duration CLUSTER_TIMEOUT = Duration.ofSeconds(2);
 
     private final ServerControl control;
     private final LogBuffer log;
@@ -50,6 +54,8 @@ public final class AdminTui {
     private String message = "";
     private String dlqTitle = "";
     private java.util.List<QueueView.Entry> dlqPage = java.util.List.of();
+    private String selectedNode;
+    private Duration clusterTimeout = CLUSTER_TIMEOUT;
 
     /** @param logFile extra file shown in the logs view (e.g. redirected server output), or null */
     public AdminTui(ServerControl control, LogBuffer log, Path logFile, boolean ansi) {
@@ -73,10 +79,22 @@ public final class AdminTui {
         }
     }
 
+    /** Test hook: a shorter wait for the cluster status. */
+    void clusterTimeout(Duration timeout) {
+        this.clusterTimeout = timeout;
+    }
+
     /** @return false when the admin asked to quit */
     boolean handle(String line) {
         var cmd = line.trim().toLowerCase(Locale.ROOT);
         this.message = "";
+        if (cmd.equals("node") || cmd.startsWith("node ")) {
+            var id = line.trim().substring(4).trim();
+            this.selectedNode = id.isEmpty() ? null : id;
+            this.view = View.CLUSTER;
+            this.message = id.isEmpty() ? "node selection cleared" : "node " + id;
+            return true;
+        }
         try {
             if (cmd.equals("drain confirm")) {
                 var op = this.control.drain();
@@ -93,6 +111,8 @@ public final class AdminTui {
                 case "2", "c" -> this.view = View.CONFIG;
                 case "3", "l" -> this.view = View.LOGS;
                 case "4", "m" -> this.view = View.QUEUES;
+                case "5", "g" -> this.view = View.METRICS;
+                case "6", "k" -> this.view = View.CLUSTER;
                 case "s" -> act("start", this.control::start);
                 case "x" -> act("stop", this.control::stop);
                 case "r" -> act("reload", this.control::reload);
@@ -104,8 +124,8 @@ public final class AdminTui {
                 default -> this.message = "unknown command '" + line.trim() + "' (h for help)";
             }
             if (cmd.equals("h") || cmd.equals("?")) {
-                this.message = "commands: s start, x stop, r reload, n drain, v/c/l/m status/config/logs/queues,"
-                        + " d <topic> <group> [from] dead letters, Enter refresh, q quit";
+                this.message = "commands: s start, x stop, r reload, n drain, v/c/l/m/g/k status/config/logs/queues/metrics/cluster,"
+                        + " d <topic> <group> [from] dead letters, node <id> node detail, Enter refresh, q quit";
             }
         } catch (ServerControl.ControlException e) {
             this.message = color(RED, "error: " + printable(String.valueOf(e.getMessage())));
@@ -136,7 +156,9 @@ public final class AdminTui {
                 .append(tab(View.STATUS, "v status")).append(" | ")
                 .append(tab(View.CONFIG, "c config")).append(" | ")
                 .append(tab(View.LOGS, "l logs")).append(" | ")
-                .append(tab(View.QUEUES, "m queues")).append("]\n");
+                .append(tab(View.QUEUES, "m queues")).append(" | ")
+                .append(tab(View.METRICS, "g metrics")).append(" | ")
+                .append(tab(View.CLUSTER, "k cluster")).append("]\n");
         sb.append("State: ").append(stateText(status.state()));
         if (status.state() == ServerStatus.State.RUNNING) {
             sb.append("  up ").append(formatUptime(status.uptime()));
@@ -147,6 +169,8 @@ public final class AdminTui {
             case CONFIG -> status.config().forEach((k, v) -> sb.append(String.format("  %-22s %s%n", k, v)));
             case LOGS -> renderLogs(sb);
             case QUEUES -> renderQueues(sb);
+            case METRICS -> renderMetrics(sb);
+            case CLUSTER -> renderClusterView(sb);
         }
         sb.append('\n');
         if (!this.message.isEmpty()) {
@@ -287,6 +311,91 @@ public final class AdminTui {
             sb.append("...");
         }
         return sb.toString();
+    }
+
+    private void renderMetrics(StringBuilder sb) {
+        var report = this.control.metrics();
+        if (report == null) {
+            sb.append("  metrics are not available for this server\n");
+            return;
+        }
+        int reporting = report.nodes().size();
+        var nodes = String.format(Locale.ROOT, "Nodes reporting %d/%d", reporting, report.nodesTotal());
+        sb.append(reporting < report.nodesTotal() ? color(YELLOW, nodes + " (missing nodes are not in the totals)")
+                : nodes).append('\n');
+        if (reporting == 0) {
+            return;
+        }
+        if (reporting > 1) {
+            sb.append(color(BOLD, "Aggregate")).append('\n');
+            sb.append(MetricsView.render(MetricsView.aggregate(
+                    report.nodes().stream().map(MetricsView.Node::snapshot).toList())));
+        }
+        for (var node : report.nodes()) {
+            sb.append(color(BOLD, "Node " + node.nodeId())).append('\n');
+            sb.append(MetricsView.render(node.snapshot()));
+        }
+    }
+
+    private void renderClusterView(StringBuilder sb) {
+        ClusterStatus cluster;
+        try {
+            cluster = ClusterView.fetch(this.control::clusterStatus, this.clusterTimeout);
+        } catch (TimeoutException e) {
+            sb.append(color(RED, "  cluster status unavailable: no answer within " + this.clusterTimeout.toMillis()
+                    + " ms")).append('\n');
+            return;
+        } catch (IllegalStateException e) {
+            sb.append(color(RED, "  cluster status unavailable: " + e.getMessage())).append('\n');
+            return;
+        }
+        if (cluster == null) {
+            sb.append("  no cluster status attached to this server\n");
+            return;
+        }
+        var nodes = ClusterView.nodes(cluster);
+        long up = nodes.stream().filter(n -> n.health() == ClusterView.Health.UP).count();
+        long down = nodes.stream().filter(n -> n.health() == ClusterView.Health.DOWN).count();
+        sb.append(String.format(Locale.ROOT, "Cluster desired %d: %d nodes, %d up, %d degraded, %d down%n",
+                cluster.desiredVersion(), nodes.size(), up, nodes.size() - up - down, down));
+        sb.append(String.format(Locale.ROOT, "  %-16s %-9s %8s %9s %10s %7s  %s%n", "NODE", "HEALTH", "APPLIED",
+                "REQ/S", "P99", "ERRORS", "CHECKS"));
+        ClusterView.NodeHealth selected = null;
+        for (var n : nodes) {
+            var node = n.node();
+            if (node.nodeId().equals(this.selectedNode)) {
+                selected = n;
+            }
+            sb.append(String.format(Locale.ROOT, "  %-16s %s %8d %9.1f %10s %7d  %s%n", node.nodeId(),
+                    healthText(n.health()), node.appliedVersion(), node.requestsPerSecond(), latency(node.p99Nanos()),
+                    node.errors(), n.summary()));
+        }
+        if (this.selectedNode == null) {
+            sb.append("  node <id> shows one node's checks\n");
+        } else if (selected == null) {
+            sb.append("  node ").append(this.selectedNode).append(" is not in the cluster status\n");
+        } else {
+            sb.append(color(BOLD, "Node " + this.selectedNode)).append(": ").append(healthText(selected.health()))
+                    .append('\n');
+            for (var check : selected.checks()) {
+                sb.append(check.ok() ? "  [ok]   " : "  [FAIL] ").append(check.name());
+                if (!check.ok()) {
+                    sb.append(": ").append(check.detail());
+                }
+                sb.append('\n');
+            }
+            sb.append(String.format(Locale.ROOT, "  requests %d  errors %d%n", selected.node().requests(),
+                    selected.node().errors()));
+        }
+    }
+
+    private String healthText(ClusterView.Health health) {
+        var text = String.format(Locale.ROOT, "%-9s", health);
+        return switch (health) {
+            case UP -> color(GREEN, text);
+            case DEGRADED -> color(YELLOW, text);
+            case DOWN -> color(RED, text);
+        };
     }
 
     private static String latency(long nanos) {
