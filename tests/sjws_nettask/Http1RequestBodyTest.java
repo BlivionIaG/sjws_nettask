@@ -38,7 +38,12 @@ import sjws_nettask.core.ResponseHeaders;
 class Http1RequestBodyTest {
 
     private static String exchange(Handler handler, String raw, boolean halfClose) throws Exception {
-        var reaper = new ConnectionReaper(Duration.ofSeconds(5), Duration.ofSeconds(5), Duration.ofSeconds(5));
+        return exchange(handler, raw, halfClose, Duration.ofSeconds(5));
+    }
+
+    private static String exchange(Handler handler, String raw, boolean halfClose, Duration headTimeout)
+            throws Exception {
+        var reaper = new ConnectionReaper(headTimeout, headTimeout, headTimeout);
         try (var server = ServerSocketChannel.open().bind(new InetSocketAddress("127.0.0.1", 0));
                 var client = SocketChannel.open(server.getLocalAddress())) {
             var accepted = server.accept();
@@ -49,9 +54,13 @@ class Http1RequestBodyTest {
             }
             var out = new ByteArrayOutputStream();
             var buf = ByteBuffer.allocate(4096);
-            while (client.read(buf) >= 0) {
-                out.write(buf.array(), 0, buf.position());
-                buf.clear();
+            try {
+                while (client.read(buf) >= 0) {
+                    out.write(buf.array(), 0, buf.position());
+                    buf.clear();
+                }
+            } catch (java.net.SocketException e) {
+                // Closing with an unread drained body can RST before the client finishes reading.
             }
             thread.join(5000);
             return out.toString(StandardCharsets.ISO_8859_1);
@@ -195,6 +204,70 @@ class Http1RequestBodyTest {
                 }
             }
         };
+    }
+
+
+    @Test
+    void aDrainedChunkedGetBodyOverTheLimitClosesAfterTheResponse() throws Exception {
+        var data = "x".repeat(65_537);
+        var raw = "GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n10001\r\n" + data
+                + "\r\n0\r\n\r\n";
+        var text = exchange(ok(), raw, false);
+        assertTrue(text.startsWith("HTTP/1.1 200 "), text);
+        assertTrue(text.contains("Connection: close"), text);
+    }
+
+    @Test
+    void aTruncatedChunkedGetBodyClosesWithoutAFinalResponse() throws Exception {
+        var text = exchange(ok(), "GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n32\r\nabc", true);
+        assertFalse(text.startsWith("HTTP/1.1 200 "), text);
+    }
+
+    @Test
+    void aStalledChunkedGetBodyTimesOutWith408() throws Exception {
+        var text = exchange(ok(), "GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n32\r\nabc",
+                false, Duration.ofMillis(200));
+        assertTrue(text.contains("HTTP/1.1 408 "), text);
+    }
+
+    @Test
+    void aSplitChunkedGetBodyIsDrainedAfterASecondFill() throws Exception {
+        var text = exchangeSplit(ok(),
+                "GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "4\r\nabcd\r\n0\r\n\r\n");
+        assertTrue(text.startsWith("HTTP/1.1 200 "), text);
+        assertTrue(text.contains("ok"), text);
+    }
+
+    private static Handler ok() {
+        return request -> new Response(200, ResponseHeaders.of(), Body.Bytes.of("ok".getBytes()));
+    }
+
+    private static String exchangeSplit(Handler handler, String first, String second) throws Exception {
+        var reaper = new ConnectionReaper(Duration.ofSeconds(5), Duration.ofSeconds(5), Duration.ofSeconds(5));
+        try (var server = ServerSocketChannel.open().bind(new InetSocketAddress("127.0.0.1", 0));
+                var client = SocketChannel.open(server.getLocalAddress())) {
+            var accepted = server.accept();
+            var thread = Thread.ofVirtual().start(new Http1Connection(accepted, handler, ResponseHeaders::of, reaper));
+            client.write(ByteBuffer.wrap(first.getBytes(StandardCharsets.ISO_8859_1)));
+            Thread.sleep(200);
+            client.write(ByteBuffer.wrap(second.getBytes(StandardCharsets.ISO_8859_1)));
+            client.shutdownOutput();
+            var out = new ByteArrayOutputStream();
+            var buf = ByteBuffer.allocate(4096);
+            try {
+                while (client.read(buf) >= 0) {
+                    out.write(buf.array(), 0, buf.position());
+                    buf.clear();
+                }
+            } catch (java.net.SocketException e) {
+                // Closing with an unread drained body can RST before the client finishes reading.
+            }
+            thread.join(5000);
+            return out.toString(StandardCharsets.ISO_8859_1);
+        } finally {
+            reaper.close();
+        }
     }
 
     private static long exchangeLength(String raw) throws Exception {
