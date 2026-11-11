@@ -11,6 +11,7 @@ on:
       - 'src/**'
       - 'pom.xml'
       - 'tools/perf-gate/**'
+      - 'tools/ci/**'
       - 'contrib/sjws_nettask-standalone.yaml'
       - '.github/workflows/perf-gate.yml'
 
@@ -42,8 +43,19 @@ jobs:
           cache-dependency-path: |
             head/pom.xml
             base/pom.xml
+      - name: wrk cache key
+        id: wrk-cache
+        run: |
+          . /etc/os-release
+          echo "key=wrk-${ID}-${VERSION_ID}-${RUNNER_ARCH}-v2" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/wrk-cache
+          key: ${{ steps.wrk-cache.outputs.key }}
       - name: Install wrk
-        run: sudo apt-get update -q && sudo apt-get install -y -q wrk
+        env:
+          WRK_CACHE: ${{ runner.temp }}/wrk-cache
+        run: head/tools/ci/install-wrk.sh
       - name: Build base and head jars
         run: |
           for side in base head; do
