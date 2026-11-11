@@ -351,6 +351,11 @@ public final class ProxyHandler implements Handler, AutoCloseable {
             try {
                 response = exchange(request, tries == 0 ? out : rebuild(out), length, true);
                 failed = kind(response);
+            } catch (RequestBodyTooLarge e) {
+                if (this.breaker != null) {
+                    this.breaker.release(); // local 413, not an upstream verdict
+                }
+                return StaticFileHandler.error(413, head);
             } catch (IOException e) {
                 failed = kind(e);
                 errorStatus = status(e);

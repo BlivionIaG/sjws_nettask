@@ -258,6 +258,29 @@ class ProxyStreamingTest {
             try (tight) {
                 assertEquals(413, tight.handle(new Request("POST", "/echo").withBody(oversized)).status());
             }
+            // A circuit or retry must not reclassify the local 413 as an upstream failure.
+            var gated = new ProxyHandler(new ProxyHandler.Settings(this.base, Duration.ofSeconds(2),
+                    Duration.ofSeconds(5), Duration.ofSeconds(5), 1024, null, List.of(), false, 8),
+                    ByteBudget.shared(),
+                    new Resilience(null, new Resilience.Circuit(1, Duration.ofSeconds(30))));
+            try (gated) {
+                assertEquals(413, gated.handle(new Request("POST", "/echo").withBody(oversized)).status());
+                var smallBytes = "ok".getBytes(StandardCharsets.UTF_8);
+                var smallIn = new java.io.ByteArrayInputStream(smallBytes);
+                RequestBody small = new RequestBody() {
+                    @Override
+                    public long length() {
+                        return smallBytes.length;
+                    }
+
+                    @Override
+                    public int read(byte[] into, int off, int len) {
+                        return smallIn.read(into, off, len);
+                    }
+                };
+                assertEquals(200, gated.handle(new Request("POST", "/echo").withBody(small)).status(),
+                        "a local 413 must not trip the circuit");
+            }
         }
     }
 
