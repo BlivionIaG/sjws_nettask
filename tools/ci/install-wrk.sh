@@ -13,8 +13,22 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 
+# wrk 4.1 has no --version; missing flags print usage and exit 1 once
+# the binary has loaded. A missing shared library typically exits 127
+# (see 43066143761) and is also visible in ldd as "not found".
 runnable() {
-  command -v wrk >/dev/null 2>&1 && wrk --version >/dev/null 2>&1
+  local bin rc=0
+  bin="$(command -v wrk 2>/dev/null)" || return 1
+  [ -x "$bin" ] || return 1
+  if command -v ldd >/dev/null 2>&1 && ldd "$bin" 2>/dev/null | grep -q 'not found'; then
+    ldd "$bin" >&2 || true
+    return 1
+  fi
+  wrk >/dev/null 2>&1 || rc=$?
+  if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+    return 1
+  fi
+  return 0
 }
 
 already() {
