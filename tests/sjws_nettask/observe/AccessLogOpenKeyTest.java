@@ -12,6 +12,9 @@ import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
@@ -358,4 +361,73 @@ final class AccessLogOpenKeyTest {
             assertThrows(FileSystemException.class, () -> AccessLog.openFile(a));
         }
     }
+    @Test
+    void openFileWritesThroughProcFdPipe() throws Exception {
+        assumePosix(dir);
+        Assumptions.assumeTrue(Files.isDirectory(Path.of("/proc/self/fd")), "procfs required");
+        Set<String> beforePipes = pipeTargets();
+        Path dest = dir.resolve("from-pipe.log");
+        Process cat = new ProcessBuilder("cat").redirectOutput(dest.toFile()).start();
+        try {
+            Path fdLink = newPipeFd(beforePipes);
+            Assumptions.assumeTrue(fdLink != null, "could not find the cat pipe write fd");
+            try (var out = AccessLog.openFile(fdLink)) {
+                out.write("piped-line\n".getBytes());
+                out.flush();
+            }
+        } finally {
+            cat.getOutputStream().close();
+            if (!cat.waitFor(2, TimeUnit.SECONDS)) {
+                cat.destroyForcibly();
+            }
+        }
+        assertTrue(Files.exists(dest) && Files.readString(dest).contains("piped-line"),
+                Files.exists(dest) ? Files.readString(dest) : "missing " + dest);
+    }
+
+    @Test
+    void resolveAndOpenDevStdout() throws Exception {
+        Path stdout = Path.of("/dev/stdout");
+        Assumptions.assumeTrue(Files.isSymbolicLink(stdout), "/dev/stdout is not a symlink");
+        Path leaf = AccessLog.resolveLogLeaf(stdout);
+        assertNotNull(leaf);
+        try (var out = AccessLog.openFile(stdout)) {
+            assertNotNull(out);
+        }
+    }
+
+    private static Set<String> pipeTargets() throws Exception {
+        Set<String> targets = new HashSet<>();
+        try (var fds = Files.list(Path.of("/proc/self/fd"))) {
+            for (Path fd : fds.toList()) {
+                try {
+                    String t = Files.readSymbolicLink(fd).toString();
+                    if (t.startsWith("pipe:[")) {
+                        targets.add(t);
+                    }
+                } catch (IOException ignored) {
+                    // fd already closed
+                }
+            }
+        }
+        return targets;
+    }
+
+    private static Path newPipeFd(Set<String> beforePipes) throws Exception {
+        try (var fds = Files.list(Path.of("/proc/self/fd"))) {
+            for (Path fd : fds.toList()) {
+                try {
+                    Path target = Files.readSymbolicLink(fd);
+                    if (AccessLog.isKernelMagicTarget(target) && target.toString().startsWith("pipe:[")
+                            && !beforePipes.contains(target.toString())) {
+                        return fd.toAbsolutePath();
+                    }
+                } catch (IOException ignored) {
+                    // fd already closed
+                }
+            }
+        }
+        return null;
+    }
+
 }

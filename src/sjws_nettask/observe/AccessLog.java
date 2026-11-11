@@ -123,6 +123,11 @@ final class AccessLog implements Runnable, AutoCloseable {
                 return leaf;
             }
             Path target = Files.readSymbolicLink(leaf);
+            // /dev/stdout and /proc/self/fd/N often point at pipe:[...] / socket:[...],
+            // which are not filesystem paths — return the descriptor link and follow-open it.
+            if (isKernelMagicTarget(target)) {
+                return leaf;
+            }
             Path linkParent = leaf.toAbsolutePath().getParent();
             if (linkParent == null) {
                 throw new IOException("symlink has no parent: " + leaf);
@@ -161,9 +166,9 @@ final class AccessLog implements Runnable, AutoCloseable {
         IOException lastClose = null;
         for (int attempt = 0; attempt < 3; attempt++) {
             Path leaf = resolveLogLeaf(path);
-            Object before = fileKeyNoFollow(leaf);
+            Object before = leafKey(leaf);
             OutputStream stream = openLeaf(leaf);
-            Object after = fileKeyNoFollow(leaf);
+            Object after = leafKey(leaf);
             boolean raced = before != null && after != null && !before.equals(after);
             if (openKeyRaceProbe.consumeForceRace()) {
                 raced = true;
@@ -183,15 +188,15 @@ final class AccessLog implements Runnable, AutoCloseable {
         }
         Path leaf = resolveLogLeaf(path);
         OutputStream stream = openLeaf(leaf);
-        return new Opened(stream, fileKeyNoFollow(leaf));
+        return new Opened(stream, leafKey(leaf));
     }
 
-    /** CREATE_NEW+0640 or append-open the resolved leaf; never follows the leaf path. */
+    /** CREATE_NEW+0640 or append-open the resolved leaf; follows only kernel magic descriptor links. */
     static OutputStream openLeaf(Path leaf) throws IOException {
         ensureParent(leaf);
         if (!Files.exists(leaf, LinkOption.NOFOLLOW_LINKS)) {
             try {
-                return openChannel(leaf, true);
+                return openChannel(leaf, true, true);
             } catch (FileAlreadyExistsException e) {
                 // Create raced; append only if the winner is a regular file, never a planted link.
                 if (!Files.exists(leaf, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(leaf)) {
@@ -200,18 +205,29 @@ final class AccessLog implements Runnable, AutoCloseable {
             }
         }
         if (Files.isSymbolicLink(leaf)) {
+            if (isMagicDescriptorLeaf(leaf)) {
+                // Follow /proc/self/fd/N or /dev/stdout onto the pipe/socket; never CREATE_NEW.
+                return openChannel(leaf, false, false);
+            }
             // Dangling or unexpected link at leaf after resolve — do not follow.
             throw new IOException("access log leaf is still a symbolic link: " + leaf);
         }
         warnIfWorldReadable(leaf);
-        return openChannel(leaf, false);
+        return openChannel(leaf, false, true);
     }
 
-    private static OutputStream openChannel(Path leaf, boolean createNew) throws IOException {
-        Set<OpenOption> opts = createNew
-                ? Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, StandardOpenOption.APPEND,
-                        LinkOption.NOFOLLOW_LINKS)
-                : Set.of(StandardOpenOption.WRITE, StandardOpenOption.APPEND, LinkOption.NOFOLLOW_LINKS);
+    private static OutputStream openChannel(Path leaf, boolean createNew, boolean noFollow) throws IOException {
+        Set<OpenOption> opts;
+        if (createNew) {
+            opts = noFollow
+                    ? Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, StandardOpenOption.APPEND,
+                            LinkOption.NOFOLLOW_LINKS)
+                    : Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
+        } else {
+            opts = noFollow
+                    ? Set.of(StandardOpenOption.WRITE, StandardOpenOption.APPEND, LinkOption.NOFOLLOW_LINKS)
+                    : Set.of(StandardOpenOption.WRITE, StandardOpenOption.APPEND);
+        }
         FileChannel ch;
         if (createNew && posix(leaf)) {
             FileAttribute<?> perms = PosixFilePermissions.asFileAttribute(FILE_0640);
@@ -220,6 +236,29 @@ final class AccessLog implements Runnable, AutoCloseable {
             ch = FileChannel.open(leaf, opts);
         }
         return Channels.newOutputStream(ch);
+    }
+
+    /**
+     * Procfs/dev magic symlink targets such as {@code pipe:[123]} or {@code socket:[123]}. These
+     * are not filesystem paths; resolving them against the link parent yields a nonexistent file.
+     */
+    static boolean isKernelMagicTarget(Path target) {
+        String s = target.toString();
+        int colon = s.indexOf(':');
+        return colon > 0 && colon + 1 < s.length() && s.charAt(colon + 1) == '[' && !target.isAbsolute();
+    }
+
+    private static boolean isMagicDescriptorLeaf(Path leaf) {
+        try {
+            return Files.isSymbolicLink(leaf) && isKernelMagicTarget(Files.readSymbolicLink(leaf));
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /** File key matching the open: follow for magic descriptor leaves, NOFOLLOW otherwise. */
+    private static Object leafKey(Path leaf) {
+        return isMagicDescriptorLeaf(leaf) ? fileKey(leaf) : fileKeyNoFollow(leaf);
     }
 
     /** Stream plus the path file key observed to be stable across that open. */
