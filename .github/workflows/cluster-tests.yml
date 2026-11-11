@@ -36,11 +36,24 @@ jobs:
         run: mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test
       - name: Install optional external clients
         run: |
-          sudo DEBIAN_FRONTEND=noninteractive apt-get update -q             && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q nghttp2-client             || echo "h2load not installed; ExternalClientEndToEndTest will skip that case"
+          tools/ci/apt-get.sh update -q
+          tools/ci/apt-get.sh install -y -q nghttp2-client \
+            || echo "h2load not installed; ExternalClientEndToEndTest will skip that case"
       - name: External-client e2e (curl; h2load / HTTP/3 skip if missing)
         run: mvn -B -Dgroups=e2e-clients -Dsurefire.failIfNoSpecifiedTests=true test
+      - name: wrk cache key
+        id: wrk-cache
+        run: |
+          . /etc/os-release
+          echo "key=wrk-${ID}-${VERSION_ID}-${RUNNER_ARCH}-v2" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/wrk-cache
+          key: ${{ steps.wrk-cache.outputs.key }}
       - name: Install wrk
-        run: sudo apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q wrk
+        env:
+          WRK_CACHE: ${{ runner.temp }}/wrk-cache
+        run: tools/ci/install-wrk.sh
       - name: wrk standalone vs gateway-off (full length)
         run: tools/gateway-bench.sh
       - uses: actions/upload-artifact@v7
