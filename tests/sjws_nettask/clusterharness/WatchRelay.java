@@ -28,6 +28,9 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 /**
@@ -51,6 +54,8 @@ final class WatchRelay implements AutoCloseable {
     private final Supplier<List<Integer>> upstreams;
     private final ServerSocket listener;
     private final Set<Pipe> pipes = ConcurrentHashMap.newKeySet();
+    private final ReentrantLock registrationLock = new ReentrantLock();
+    private final Condition pipeRegistered = registrationLock.newCondition();
     private final Thread acceptor;
     private volatile boolean paused;
     private volatile long delayNanos;
@@ -98,6 +103,36 @@ final class WatchRelay implements AutoCloseable {
         }
     }
 
+    /**
+     * Block until a pipe to {@code upstreamPort} has been added to the registered set.
+     * Accept can complete (so the test's upstream {@code accept()} returns) before that
+     * add; {@link #dropUpstream(int)} only sees registered pipes.
+     */
+    void awaitPipe(int upstreamPort) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        this.registrationLock.lock();
+        try {
+            while (!hasPipe(upstreamPort)) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0L) {
+                    throw new IllegalStateException("pipe to " + upstreamPort + " was not registered");
+                }
+                this.pipeRegistered.await(remaining, TimeUnit.NANOSECONDS);
+            }
+        } finally {
+            this.registrationLock.unlock();
+        }
+    }
+
+    private boolean hasPipe(int upstreamPort) {
+        for (var pipe : this.pipes) {
+            if (pipe.upstreamPort == upstreamPort) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void accept() {
         while (!this.closed) {
             Socket client;
@@ -113,6 +148,12 @@ final class WatchRelay implements AutoCloseable {
                     var pipe = new Pipe(client, server, port);
                     this.pipes.add(pipe);
                     pipe.start();
+                    this.registrationLock.lock();
+                    try {
+                        this.pipeRegistered.signalAll();
+                    } finally {
+                        this.registrationLock.unlock();
+                    }
                     break;
                 } catch (IOException e) {
                     server = null;

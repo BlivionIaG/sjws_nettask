@@ -184,6 +184,7 @@ class WatchRelayTest {
         client.setSoTimeout(1000);
         await(() -> upstream.accepted.get() != null || !upstream.errors.isEmpty());
         assertTrue(upstream.errors.isEmpty(), () -> String.valueOf(upstream.errors));
+        relay.awaitPipe(upstream.port());
         var server = upstream.accepted.get();
         server.setSoTimeout(1000);
         return new Session(client, server);
