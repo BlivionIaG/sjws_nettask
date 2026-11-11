@@ -157,8 +157,8 @@ class ExternalClientEndToEndTest {
         } else {
             // ngtcp2 examples/client.cc: [OPTIONS] <HOST> <PORT> [<URI>...]
             // --insecure is a wolfSSL wsslclient flag, not the generic client.
+            // No --quiet: it suppresses the headers and body the assertion reads.
             cmd.add("--exit-on-first-stream-close");
-            cmd.add("--quiet");
             cmd.add(host);
             cmd.add(Integer.toString(port));
             cmd.add(uri);
