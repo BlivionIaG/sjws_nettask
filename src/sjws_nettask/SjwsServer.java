@@ -596,6 +596,7 @@ public final class SjwsServer implements AutoCloseable {
             }
             // Custom h2Factory: no start-time arm — chain-control apply, metrics, and publish call
             // Transport.armHandler via armH2 (Codex P2 4421410868).
+            transport.shutdownTimeout(this.shutdownTimeout);
             transport.start();
             this.h2 = transport;
         } catch (Exception | LinkageError e) {
@@ -1639,6 +1640,7 @@ public final class SjwsServer implements AutoCloseable {
                 Supplier<Handler> handlers = this.override != null ? () -> this.override : this.live::handler;
                 this.manager = new ClientManager(this.tcp, snapshot.document().server(), handlers, this.altSvc,
                         null, this.armed);
+                this.manager.shutdownTimeout(this.shutdownTimeout);
                 attachGauges(this.slot.get().metrics());
                 if (this.ha != null) {
                     this.manager.setDrainSignal(this.ha.lifecycle()::closeAfterResponse);
