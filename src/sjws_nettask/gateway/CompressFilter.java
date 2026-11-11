@@ -111,9 +111,11 @@ public final class CompressFilter implements RequestFilter {
         }
         return switch (response.body()) {
             case Body.Empty ignored -> false;
-            case Body.Bytes bytes -> bytes.length() >= this.minSize;
+            case Body.Bytes bytes -> bytes.length() >= this.minSize && bytes.length() <= this.maxBuffer;
             case Body.FileBody file -> file.length() >= this.minSize;
-            case Body.Stream stream -> stream.length() >= this.minSize && stream.length() <= this.maxBuffer;
+            // HEAD streams are often metadata-only (known length, empty source). Do not consume them.
+            case Body.Stream stream -> !response.headOnly() && stream.length() >= this.minSize
+                    && stream.length() <= this.maxBuffer;
         };
     }
 
@@ -177,12 +179,8 @@ public final class CompressFilter implements RequestFilter {
                 headers.set("etag", tagged);
             }
         }
-        var vary = headers.get("vary");
-        if (vary == null || vary.isBlank()) {
-            headers.set("vary", "Accept-Encoding");
-        } else if (!"*".equals(vary.trim()) && !containsToken(vary, "accept-encoding")) {
-            headers.set("vary", vary + ", Accept-Encoding");
-        }
+        var vary = mergeVary(headers);
+        headers.set("vary", vary == null ? "Accept-Encoding" : vary);
         return headers;
     }
 
@@ -321,6 +319,52 @@ public final class CompressFilter implements RequestFilter {
             }
         }
         return true;
+    }
+
+    /**
+     * Combined Vary tokens from every field, or {@code *} if any value is {@code *}, or
+     * {@code null} when none were present. Always includes {@code Accept-Encoding} unless the
+     * result is {@code *}.
+     */
+    static String mergeVary(ResponseHeaders headers) {
+        var tokens = new java.util.ArrayList<String>();
+        boolean star = false;
+        boolean hasAcceptEncoding = false;
+        for (var entry : headers.entries()) {
+            if (!"vary".equals(entry.getKey())) {
+                continue;
+            }
+            var raw = entry.getValue();
+            if (raw == null || raw.isBlank()) {
+                continue;
+            }
+            for (var part : raw.split(",")) {
+                var token = part.trim();
+                if (token.isEmpty()) {
+                    continue;
+                }
+                if ("*".equals(token)) {
+                    star = true;
+                    continue;
+                }
+                if ("accept-encoding".equalsIgnoreCase(token)) {
+                    hasAcceptEncoding = true;
+                }
+                if (!containsToken(String.join(",", tokens), token)) {
+                    tokens.add(token);
+                }
+            }
+        }
+        if (star) {
+            return "*";
+        }
+        if (tokens.isEmpty() && !hasAcceptEncoding) {
+            return null;
+        }
+        if (!hasAcceptEncoding) {
+            tokens.add("Accept-Encoding");
+        }
+        return String.join(", ", tokens);
     }
 
     private static boolean containsToken(String list, String token) {

@@ -94,6 +94,66 @@ class CompressFilterTest {
             return new Response(200, headers, Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8)));
         });
         assertEquals("Accept, Origin, Accept-Encoding", merged.headers().get("vary"));
+        var multi = call(filter, request("gzip"), (r) -> {
+            var headers = ResponseHeaders.of().add("content-type", "text/html")
+                    .add("vary", "Accept-Language").add("vary", "Origin");
+            return new Response(200, headers, Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8)));
+        });
+        assertEquals("Accept-Language, Origin, Accept-Encoding", multi.headers().get("vary"));
+        int varyFields = 0;
+        for (var entry : multi.headers().entries()) {
+            if ("vary".equals(entry.getKey())) {
+                varyFields++;
+            }
+        }
+        assertEquals(1, varyFields);
+        var star = call(filter, request("gzip"), (r) -> {
+            var headers = ResponseHeaders.of().add("content-type", "text/html")
+                    .add("vary", "*").add("vary", "Origin");
+            return new Response(200, headers, Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8)));
+        });
+        assertEquals("*", star.headers().get("vary"));
+    }
+
+    @Test
+    void doesNotBufferBytesLargerThanMaxBuffer() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress",
+                Map.of("min_size", "8", "max_buffer", "64")));
+        var plain = "hello gzip ".repeat(40); // well above 64 bytes, would compress
+        var body = Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8));
+        var response = call(filter, request("gzip"), (r) -> {
+            var headers = ResponseHeaders.of().add("content-type", "text/plain");
+            return new Response(200, headers, body);
+        });
+        assertNull(response.headers().get("content-encoding"));
+        assertTrue(response.body() == body, "bytes above max_buffer must be left alone");
+    }
+
+    @Test
+    void leavesMetadataOnlyHeadStreamsAlone() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of("min_size", "8")));
+        var length = "hello gzip ".repeat(40).getBytes(StandardCharsets.UTF_8).length;
+        var source = new Body.Stream.Source() {
+            @Override
+            public java.nio.ByteBuffer next() {
+                throw new AssertionError("HEAD metadata stream must not be consumed");
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        var stream = new Body.Stream(length, source);
+        var response = call(filter, new Request("HEAD", "/",
+                sjws_nettask.core.RequestHeaders.of(java.util.Map.of("accept-encoding", java.util.List.of("gzip")))),
+                (r) -> {
+                    var headers = ResponseHeaders.of().add("content-type", "text/plain");
+                    return new Response(200, headers, stream, true);
+                });
+        assertNull(response.headers().get("content-encoding"));
+        assertTrue(response.body() == stream);
+        assertEquals(length, response.body().length());
+        assertTrue(response.headOnly());
     }
 
     @Test
