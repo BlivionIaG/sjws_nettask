@@ -292,6 +292,15 @@ class ServiceDaemonTest {
         assertTrue(out().contains("data-role=broker"), out());
         assertTrue(out().contains("connection=follower"), out());
         assertTrue(out().contains("config-version=4"), out());
+        assertFalse(out().contains("admin="), out());
+        assertFalse(out().contains(SECRET));
+
+        outBytes.reset();
+        ServiceStatus.write(pid, me, started, "control", "", "leader", 1, 12_000, "127.0.0.1:9443", "listening");
+        assertEquals(0, Daemon.status(pid, out, err));
+        assertTrue(out().contains("role=control"), out());
+        assertTrue(out().contains("admin=127.0.0.1:9443"), out());
+        assertTrue(out().contains("admin-state=listening"), out());
         assertFalse(out().contains(SECRET));
     }
 
@@ -545,6 +554,8 @@ class ServiceDaemonTest {
         assertTrue(hasDirective(standalone, "ExecReload=/bin/kill -HUP $MAINPID"), standalone);
         assertFalse(control.lines().anyMatch(line -> !line.strip().startsWith("#") && line.contains("--bind-content")),
                 control);
+        assertTrue(control.contains("pid file is still written"), control);
+        assertTrue(control.contains("admin-state"), control);
         var doc = Files.readString(Path.of("docs/operations/control-plane-service.md"));
         assertTrue(doc.contains("Lifecycle.drain()"), doc);
         assertTrue(doc.contains("leaderReady"), doc);

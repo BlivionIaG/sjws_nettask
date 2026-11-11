@@ -152,6 +152,9 @@ public final class ServiceLaunch {
             if (this.bootstrap.role() == NodeRole.CONTROL) {
                 // prepare() already refused a CONTROL role without cp settings.
                 this.control = launchControl(this.yamlCp, this.configBase, this.haKey, this.haKeyPrevious);
+                if (this.enrollment != null && this.control != null) {
+                    this.enrollment.adminListener(this.control.adminListen(), this.control.adminState());
+                }
             }
         }
 
