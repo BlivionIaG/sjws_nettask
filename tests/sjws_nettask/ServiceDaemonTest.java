@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import java.io.StringReader;
 import java.net.InetSocketAddress;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.charset.StandardCharsets;
@@ -15,6 +16,10 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+
+import javax.xml.parsers.DocumentBuilderFactory;
+
+import org.xml.sax.InputSource;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -559,6 +564,61 @@ class ServiceDaemonTest {
         assertTrue(doc.contains("SIGHUP"), doc);
         assertTrue(doc.contains("/readyz"), doc);
         assertTrue(doc.contains("idempotent"), doc);
+    }
+
+    @Test
+    void launchdAndWindowsSamplesStayForegroundAndParse() throws Exception {
+        var plistPath = Path.of("contrib/launchd/sjws_nettask.plist");
+        var winswPath = Path.of("contrib/windows/sjws_nettask.xml");
+        var plist = Files.readString(plistPath);
+        var winsw = Files.readString(winswPath);
+        assertFalse(plist.contains("--daemon"), plist);
+        assertFalse(winsw.contains("--daemon"), winsw);
+        assertTrue(plist.contains("--add-opens=jdk.httpserver/sun.net.httpserver=ALL-UNNAMED"), plist);
+        assertTrue(winsw.contains("--add-opens=jdk.httpserver/sun.net.httpserver=ALL-UNNAMED"), winsw);
+        assertTrue(plist.contains("--pid-file="), plist);
+        assertTrue(winsw.contains("--pid-file="), winsw);
+        assertTrue(plist.contains("<key>ExitTimeOut</key>"), plist);
+        assertTrue(plist.contains("SJWS_RELOAD_SIGHUP"), plist);
+        assertTrue(winsw.contains("<stoptimeout>45sec</stoptimeout>"), winsw);
+        assertTrue(Files.readString(Path.of("docs/operations/launchd.md")).contains("do not pass `--daemon`"));
+        assertTrue(Files.readString(Path.of("docs/operations/windows-service.md")).contains("TerminateProcess"));
+
+        var factory = DocumentBuilderFactory.newInstance();
+        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", false);
+        factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+        factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+        factory.setXIncludeAware(false);
+        factory.setExpandEntityReferences(false);
+        factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+        var builder = factory.newDocumentBuilder();
+        builder.setEntityResolver((publicId, systemId) -> new InputSource(new StringReader("")));
+        var plistDoc = builder.parse(plistPath.toFile());
+        assertEquals("plist", plistDoc.getDocumentElement().getTagName());
+        var keys = new java.util.ArrayList<String>();
+        var keyNodes = plistDoc.getElementsByTagName("key");
+        for (int i = 0; i < keyNodes.getLength(); i++) {
+            keys.add(keyNodes.item(i).getTextContent());
+        }
+        assertTrue(keys.contains("Label"), keys.toString());
+        assertTrue(keys.contains("ProgramArguments"), keys.toString());
+        assertTrue(keys.contains("ExitTimeOut"), keys.toString());
+        assertTrue(keys.contains("EnvironmentVariables"), keys.toString());
+        assertTrue(keys.contains("SJWS_RELOAD_SIGHUP"), keys.toString());
+        var args = new java.util.ArrayList<String>();
+        var stringNodes = plistDoc.getElementsByTagName("string");
+        for (int i = 0; i < stringNodes.getLength(); i++) {
+            args.add(stringNodes.item(i).getTextContent());
+        }
+        assertFalse(args.contains("--daemon"), args.toString());
+        assertTrue(args.contains("--config=/usr/local/etc/sjws_nettask/sjws_nettask-standalone.yaml"), args.toString());
+
+        var winswDoc = builder.parse(winswPath.toFile());
+        assertEquals("service", winswDoc.getDocumentElement().getTagName());
+        assertEquals("sjws_nettask", winswDoc.getElementsByTagName("id").item(0).getTextContent());
+        var arguments = winswDoc.getElementsByTagName("arguments").item(0).getTextContent();
+        assertFalse(arguments.contains("--daemon"), arguments);
+        assertTrue(arguments.contains("-jar"), arguments);
     }
 
     @Test
