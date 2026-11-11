@@ -133,7 +133,11 @@ class StaticFileHandlerTest {
         var r = get("/sub?a=1");
         assertEquals(301, r.status());
         assertEquals("/sub/?a=1", r.headers().get("location"));
-        assertTrue(text(r).contains("/sub/?a=1"));
+        var html = text(r);
+        assertTrue(html.contains("<title>301 Moved Permanently</title>"), html);
+        assertTrue(html.contains("<meta charset=\"UTF-8\"/>"), html);
+        assertTrue(html.contains("<h1>301 Moved Permanently</h1>"), html);
+        assertTrue(html.contains("href=\"/sub/?a=1\""), html);
     }
 
     @Test
@@ -193,7 +197,10 @@ class StaticFileHandlerTest {
         var r = handler.handle(new Request(method, "/hello.txt"));
         assertEquals(405, r.status());
         assertEquals("GET, HEAD, OPTIONS", r.headers().get("allow"));
-        assertTrue(text(r).contains("405 Method Not Allowed"));
+        var html = text(r);
+        assertTrue(html.contains("<title>405 Method Not Allowed</title>"), html);
+        assertTrue(html.contains("<meta charset=\"UTF-8\"/>"), html);
+        assertTrue(html.contains("<h1>405 Method Not Allowed</h1>"), html);
     }
 
     @ParameterizedTest
