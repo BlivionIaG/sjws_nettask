@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -722,4 +723,15 @@ class BootstrapTest {
         }
     }
 
+    @Test
+    void sharedModeConstantsCannotBeWidened() {
+        for (var mode : List.of(PosixMode.OWNER_RW, PosixMode.OWNER_READ, PosixMode.OWNER_RWX, PosixMode.STATUS)) {
+            assertThrows(UnsupportedOperationException.class, () -> mode.add(PosixFilePermission.OTHERS_READ));
+            assertThrows(UnsupportedOperationException.class, () -> mode.remove(PosixFilePermission.OWNER_READ));
+            assertThrows(UnsupportedOperationException.class, mode::clear);
+        }
+        assertEquals(OWNER_RW, PosixMode.STATUS);
+        assertEquals(OWNER_R, PosixMode.OWNER_READ);
+        assertEquals(PosixFilePermissions.fromString("rwx------"), PosixMode.OWNER_RWX);
+    }
 }

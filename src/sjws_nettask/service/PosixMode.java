@@ -22,21 +22,27 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.Set;
 
 /** Mode checks that fail closed when the filesystem cannot report POSIX permissions. */
 final class PosixMode {
 
-    static final Set<PosixFilePermission> OWNER_RW = EnumSet.of(PosixFilePermission.OWNER_READ,
-            PosixFilePermission.OWNER_WRITE);
-    static final Set<PosixFilePermission> OWNER_READ = EnumSet.of(PosixFilePermission.OWNER_READ);
-    static final Set<PosixFilePermission> OWNER_RWX = EnumSet.of(PosixFilePermission.OWNER_READ,
-            PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE);
+    // Unmodifiable: these are shared constants, so no caller can widen a mode for every other caller.
+    static final Set<PosixFilePermission> OWNER_RW = frozen(EnumSet.of(PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE));
+    static final Set<PosixFilePermission> OWNER_READ = frozen(EnumSet.of(PosixFilePermission.OWNER_READ));
+    static final Set<PosixFilePermission> OWNER_RWX = frozen(EnumSet.of(PosixFilePermission.OWNER_READ,
+            PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE));
     /** Status sidecar: owner-only (0600). Not world-readable. */
     static final Set<PosixFilePermission> STATUS = OWNER_RW;
 
     private PosixMode() {
+    }
+
+    private static Set<PosixFilePermission> frozen(EnumSet<PosixFilePermission> mode) {
+        return Collections.unmodifiableSet(mode);
     }
 
     static boolean supported(Path path) {
