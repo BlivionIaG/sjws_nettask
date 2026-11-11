@@ -654,7 +654,7 @@ public class Sjws_nettask {
         }
         loaded = applyProcessMode(loaded, choice, hooks);
         boolean bindContent = resolveBind(opt, loaded, err, hooks);
-        if (child) {
+        if (child || "1".equals(env.get(ReloadHook.SIGHUP_ENV))) {
             ReloadHook.installSighup();
         }
         PrintStream logOut = out;

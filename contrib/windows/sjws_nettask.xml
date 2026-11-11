@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WinSW configuration for sjws_nettask.
+
+  Run the server in the foreground. Do not pass the daemon flag: that option
+  relies on setsid and POSIX signals, which Windows does not provide.
+
+  The built-in stop command uses ProcessHandle.destroy(), which on Windows is
+  TerminateProcess and does not run the JVM shutdown hook, so the drain path
+  is skipped. Let WinSW stop the process (WinSW 2.x sends CTRL_C by default,
+  which runs the hook). Do not use CTRL_BREAK: HotSpot treats that as a thread
+  dump, not a shutdown. Keep stoptimeout at least as long as the
+  drain budget (default 30s) plus the 5s stop margin, matching the Linux
+  units' TimeoutStopSec=45.
+
+  Adjust executable and arguments paths, the document root and the port. Copy
+  the jar and its lib directory together (the manifest Class-Path is lib/).
+
+  Example, once WinSW is installed as sjws_nettask.exe next to this file:
+    sjws_nettask.exe install
+    sjws_nettask.exe start
+    sjws_nettask.exe stop
+    sjws_nettask.exe uninstall
+
+  See docs/operations/windows-service.md.
+-->
+<service>
+  <id>sjws_nettask</id>
+  <name>sjws_nettask</name>
+  <description>sjws_nettask static file server</description>
+  <executable>java</executable>
+  <arguments>--add-opens=jdk.httpserver/sun.net.httpserver=ALL-UNNAMED -jar C:\sjws_nettask\sjws_nettask.jar --config=C:\sjws_nettask\sjws_nettask-standalone.yaml --pid-file=C:\sjws_nettask\sjws_nettask.pid --shutdown-timeout=10 8080 C:\sjws_nettask\www</arguments>
+  <workingdirectory>C:\sjws_nettask\www</workingdirectory>
+  <stoptimeout>45sec</stoptimeout>
+  <onfailure action="restart" delay="10 sec"/>
+  <logpath>C:\sjws_nettask\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+</service>
