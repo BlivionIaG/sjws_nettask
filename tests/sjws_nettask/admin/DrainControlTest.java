@@ -113,7 +113,10 @@ class DrainControlTest {
             var tui = new AdminTui(control, log, null, true);
             var screen = tui.render();
             assertTrue(screen.contains(AdminTui.RED + "FAILED" + AdminTui.RESET + " (fence ?lost?[31m)"), screen);
-            assertFalse(screen.contains("‮") || screen.contains(""), screen);
+            // ANSI mode itself emits ESC in color codes; check the error text on a plain render.
+            var plain = new AdminTui(control, log, null, false).render();
+            assertTrue(plain.contains("FAILED (fence ?lost?[31m)"), plain);
+            assertFalse(plain.contains("‮") || plain.contains(""), plain);
         }
     }
 
