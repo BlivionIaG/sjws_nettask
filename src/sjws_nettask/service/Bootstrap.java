@@ -93,6 +93,20 @@ public final class Bootstrap {
      *        file's role. A mismatch is refused.
      */
     public static Bootstrap load(Path file, String expectedRole) throws IOException {
+        var parsed = read(file);
+        return fromParsed(file.toAbsolutePath(), expectedRole, parsed);
+    }
+
+    /**
+     * The pin path as {@link #load} resolves it, read with the same file checks. It skips the
+     * join-token and state-dir checks, so missing-config recovery can use it before a full load.
+     */
+    public static Path pinFile(Path file) throws IOException {
+        var parsed = read(file);
+        return absolute(file.toAbsolutePath(), parsed.values.get("pin"), "pin");
+    }
+
+    private static Parsed read(Path file) throws IOException {
         if (file == null) {
             throw new BootstrapException("bootstrap path is missing");
         }
@@ -105,8 +119,7 @@ public final class Bootstrap {
         byte[] raw = TokenFiles.readCapped(source, TokenFiles.MAX_OTHER_BYTES);
         try {
             rejectEmbeddedSecret(source, raw);
-            var parsed = parse(source, raw);
-            return fromParsed(source, expectedRole, parsed);
+            return parse(source, raw);
         } finally {
             Arrays.fill(raw, (byte) 0);
         }

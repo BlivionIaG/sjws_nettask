@@ -34,6 +34,7 @@ import java.security.interfaces.RSAPrivateCrtKey;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.RSAPublicKeySpec;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.Set;
 import org.shredzone.acme4j.util.KeyPairUtils;
@@ -49,10 +50,12 @@ import sjws_nettask.tls.TlsMaterial;
  */
 public final class AcmeStore {
 
-    private static final Set<PosixFilePermission> OWNER_RW = EnumSet.of(PosixFilePermission.OWNER_READ,
-            PosixFilePermission.OWNER_WRITE);
-    private static final Set<PosixFilePermission> OWNER_RWX = EnumSet.of(PosixFilePermission.OWNER_READ,
-            PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE);
+    /** 0600; unmodifiable so no caller can widen the shared mode. */
+    static final Set<PosixFilePermission> OWNER_RW = Collections.unmodifiableSet(EnumSet.of(
+            PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));
+    /** 0700; unmodifiable so no caller can widen the shared mode. */
+    static final Set<PosixFilePermission> OWNER_RWX = Collections.unmodifiableSet(EnumSet.of(
+            PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE));
 
     private final Path directory;
 
