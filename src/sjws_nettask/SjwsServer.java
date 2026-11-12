@@ -1488,20 +1488,27 @@ public final class SjwsServer implements AutoCloseable {
             } finally {
                 this.drainLock.unlock();
             }
-            // Take reloadLock after drainLock is released, the same order publication uses
-            // (reloadLock then drainLock), so this refresh cannot run mid-publish and replace
-            // the pre-arm union with a stale live document. Reentrant: an idle generation
-            // quiesces on the publish thread, which already holds reloadLock, after live.set.
-            this.reloadLock.lock();
-            try {
-                var live = this.live.get();
-                if (live != null) {
-                    syncCredentialQueryParamsFromConfig(live.document());
-                }
-            } finally {
-                this.reloadLock.unlock();
-            }
+            // Refresh on another thread: do not acquire reloadLock on this call stack.
+            // forceQuiesce can run under the chain publication lock (trackDrainingGeneration
+            // from a chain-control apply); publication already waits for that lock while
+            // holding reloadLock. The delayed refresh takes reloadLock so it cannot replace
+            // a mid-publish pre-arm union with a stale document. Until it runs, the slot
+            // may still list the just-removed names (they stay masked).
+            Thread.ofVirtual().name("sjws-mask-retire").start(this::refreshHeldMaskNames);
         });
+    }
+
+    /** Attaches published names unioned with every still-held outgoing list. */
+    private void refreshHeldMaskNames() {
+        this.reloadLock.lock();
+        try {
+            var live = this.live.get();
+            if (live != null) {
+                syncCredentialQueryParamsFromConfig(live.document());
+            }
+        } finally {
+            this.reloadLock.unlock();
+        }
     }
 
     /** Incoming names plus every still-held outgoing list, in first-seen order. */
