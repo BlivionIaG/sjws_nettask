@@ -15,6 +15,11 @@ controlling a daemon) can be plugged in. `clusterStatus()` is null until a contr
 a `ClusterBoard`; the status view then shows cluster requests per second, p99, errors, drifted
 nodes, and per-route totals.
 
+Text that comes from outside the console (node ids, drain error text, unknown-command input, and
+lines in the logs and recent-events panes) goes through the same printable policy as the Queues
+view: control characters, bidi formatting characters and the U+2028/U+2029 separators are shown
+as `?`.
+
 ## Queues view
 
 `m` (or `4`) opens the Queues view (#384). For each topic and consumer group it shows pending,
