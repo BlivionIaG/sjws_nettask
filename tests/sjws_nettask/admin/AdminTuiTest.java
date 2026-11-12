@@ -190,6 +190,29 @@ class AdminTuiTest {
         }
     }
 
+    @Test
+    void unknownCommandAndLogPanesRunThroughPrintable() {
+        var log = new LogBuffer(10);
+        log.add("queue snapshot failed: topic \u202eCLOSED\u2028");
+        log.add("dead-letter read failed: \u001b[2Jgone");
+        var tui = new AdminTui(new FakeControl(), log, null, false);
+        tui.handle("zz\u202e\u001b[31m");
+        assertEquals("unknown command 'zz??[31m' (h for help)", tui.message());
+        assertFalse(tui.message().contains("\u202e"));
+        assertFalse(tui.message().contains("\u001b"));
+
+        var status = tui.render();
+        assertTrue(status.contains("queue snapshot failed: topic ?CLOSED?"), status);
+        assertTrue(status.contains("dead-letter read failed: ?[2Jgone"), status);
+        assertFalse(status.contains("\u202e") || status.contains("\u2028") || status.contains("\u001b"), status);
+
+        tui.handle("l");
+        var logs = tui.render();
+        assertTrue(logs.contains("queue snapshot failed: topic ?CLOSED?"), logs);
+        assertTrue(logs.contains("dead-letter read failed: ?[2Jgone"), logs);
+        assertFalse(logs.contains("\u202e") || logs.contains("\u2028") || logs.contains("\u001b"), logs);
+    }
+
     // --- AdminTui ---
 
     /** Scriptable fake: what a daemon-mode control would look like to the TUI. */

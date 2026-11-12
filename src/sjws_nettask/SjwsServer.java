@@ -127,6 +127,9 @@ public final class SjwsServer implements AutoCloseable {
     /** Generations awaiting quiesce before their snapshot close; capped to bound memory. */
     private final java.util.ArrayDeque<sjws_nettask.h2.Http2Server.Generation> drainingGenerations =
             new java.util.ArrayDeque<>();
+    /** Outgoing mask names held until the generation they belong to quiesces. */
+    private final java.util.IdentityHashMap<sjws_nettask.h2.Http2Server.Generation, String[]> heldMaskNames =
+            new java.util.IdentityHashMap<>();
     private final ReentrantLock drainLock = new ReentrantLock();
     private static final int MAX_DRAINING_GENERATIONS = 4;
     /** Bound for deferred snapshot close; shortened in tests to cover the force path. */
@@ -1095,8 +1098,10 @@ public final class SjwsServer implements AutoCloseable {
         } else if (this.acme != null) {
             this.acme.update(result.snapshot().document().acme());
         }
-        // The previous generation has been swapped out and can no longer start requests.
-        // Outgoing-only names can drop; incoming names stay.
+        // Outgoing-only names stay until the previous generation quiesces, so a request
+        // that already entered (tryEnter) and is still queued keeps them. Incoming names
+        // stay. A generation with no pins quiesces at once, so names drop in that case.
+        holdOutgoingMaskNames(previousH2, replaced.document());
         syncCredentialQueryParamsFromConfig(next.document());
         return result;
     }
@@ -1443,7 +1448,8 @@ public final class SjwsServer implements AutoCloseable {
         if (control != null && control.isLive()) {
             return;
         }
-        this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromMiddleware(document.middleware()));
+        this.slot.attachCredentialQueryParams(unionWithHeldMaskNames(
+                AccessTargetMask.namesFromMiddleware(document.middleware())));
     }
 
     private void syncCredentialQueryParamsUnion(sjws_nettask.config.ConfigDocument outgoing,
@@ -1452,9 +1458,55 @@ public final class SjwsServer implements AutoCloseable {
         if (control != null && control.isLive()) {
             return;
         }
-        this.slot.attachCredentialQueryParams(AccessTargetMask.union(
+        this.slot.attachCredentialQueryParams(unionWithHeldMaskNames(AccessTargetMask.union(
                 AccessTargetMask.namesFromMiddleware(outgoing.middleware()),
-                AccessTargetMask.namesFromMiddleware(incoming.middleware())));
+                AccessTargetMask.namesFromMiddleware(incoming.middleware()))));
+    }
+
+    /**
+     * Keeps {@code outgoing}'s mask names until {@code previous} quiesces. A later
+     * {@link #syncCredentialQueryParamsFromConfig} then unions those names with the
+     * published document so queued work on that generation stays masked. Null {@code previous}
+     * (no HTTP/2 generation) holds nothing.
+     */
+    private void holdOutgoingMaskNames(sjws_nettask.h2.Http2Server.Generation previous,
+            sjws_nettask.config.ConfigDocument outgoing) {
+        if (previous == null) {
+            return;
+        }
+        var names = AccessTargetMask.namesFromMiddleware(outgoing.middleware());
+        this.drainLock.lock();
+        try {
+            this.heldMaskNames.put(previous, names);
+        } finally {
+            this.drainLock.unlock();
+        }
+        previous.whenQuiesced(() -> {
+            this.drainLock.lock();
+            try {
+                this.heldMaskNames.remove(previous);
+            } finally {
+                this.drainLock.unlock();
+            }
+            var live = this.live.get();
+            if (live != null) {
+                syncCredentialQueryParamsFromConfig(live.document());
+            }
+        });
+    }
+
+    /** Incoming names plus every still-held outgoing list, in first-seen order. */
+    private String[] unionWithHeldMaskNames(String[] incoming) {
+        this.drainLock.lock();
+        try {
+            var names = incoming;
+            for (var held : this.heldMaskNames.values()) {
+                names = AccessTargetMask.union(held, names);
+            }
+            return names;
+        } finally {
+            this.drainLock.unlock();
+        }
     }
 
     /**

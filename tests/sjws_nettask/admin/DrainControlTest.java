@@ -100,7 +100,7 @@ class DrainControlTest {
         var log = new LogBuffer(50);
         try (var control = control(log)) {
             control.drainer(server -> {
-                throw new IllegalStateException("fence lost");
+                throw new IllegalStateException("fence ‮lost[31m");
             });
             control.start();
             var op = control.drain();
@@ -108,10 +108,12 @@ class DrainControlTest {
             var end = control.drainStatus();
             assertEquals(op.id(), end.id());
             assertEquals(DrainOperation.State.FAILED, end.state());
-            assertEquals("fence lost", end.error());
+            assertEquals("fence ‮lost[31m", end.error());
             assertEquals(ServerStatus.State.STOPPED, control.status().state());
             var tui = new AdminTui(control, log, null, true);
-            assertTrue(tui.render().contains(AdminTui.RED + "FAILED" + AdminTui.RESET + " (fence lost)"));
+            var screen = tui.render();
+            assertTrue(screen.contains(AdminTui.RED + "FAILED" + AdminTui.RESET + " (fence ?lost?[31m)"), screen);
+            assertFalse(screen.contains("‮") || screen.contains(""), screen);
         }
     }
 
