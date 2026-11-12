@@ -38,6 +38,12 @@ import sjws_nettask.observe.ClusterStatus;
  */
 public final class EmbeddedServerControl implements ServerControl {
 
+    /** Drains a running server; tests substitute it. */
+    @FunctionalInterface
+    interface Drainer {
+        void drain(SjwsServer server) throws InterruptedException;
+    }
+
     /** Starts a server; tests substitute it. */
     @FunctionalInterface
     public interface Starter {
@@ -54,6 +60,11 @@ public final class EmbeddedServerControl implements ServerControl {
     private volatile Instant startedAt;
     private volatile String lastError;
     private volatile ClusterBoard cluster;
+    private volatile java.util.function.Supplier<java.util.Map<String, sjws_nettask.messaging.delivery.LedgerInspector>> queues;
+    private volatile java.util.function.LongSupplier queueClock = System::currentTimeMillis;
+    private volatile Drainer drainer = SjwsServer::drain;
+    private volatile DrainOperation drain;
+    private final java.util.concurrent.atomic.AtomicLong drainIds = new java.util.concurrent.atomic.AtomicLong();
 
     public EmbeddedServerControl(Supplier<ServerConfig> configSource, LogBuffer log) {
         this(configSource, SjwsServer::start, log, Clock.systemUTC());
@@ -89,6 +100,21 @@ public final class EmbeddedServerControl implements ServerControl {
                 Duration.between(this.startedAt, this.clock.instant()), summary, view);
     }
 
+    /** The local node only; a stopped server or a failed snapshot reports 0 of 1 nodes. */
+    @Override
+    public MetricsView.Report metrics() {
+        var s = this.server;
+        if (s == null) {
+            return new MetricsView.Report(java.util.List.of(), 1);
+        }
+        try {
+            return new MetricsView.Report(java.util.List.of(new MetricsView.Node("local", s.metricsSnapshot())), 1);
+        } catch (IOException | RuntimeException e) {
+            this.log.add("metrics snapshot failed: " + e.getMessage());
+            return new MetricsView.Report(java.util.List.of(), 1);
+        }
+    }
+
     /**
      * Attaches the control-plane aggregate the TUI reads, and the same view on {@code /metrics}
      * when that endpoint is enabled. Null detaches both. A board attached before {@link #start}
@@ -102,16 +128,141 @@ public final class EmbeddedServerControl implements ServerControl {
         }
     }
 
+    /** Attaches the messaging topics the Queues view reads (#384); {@code null} detaches. */
+    public void attachQueues(
+            java.util.function.Supplier<java.util.Map<String, sjws_nettask.messaging.delivery.LedgerInspector>> topics) {
+        attachQueues(topics, System::currentTimeMillis);
+    }
+
+    /** As {@link #attachQueues(java.util.function.Supplier)}, dating ages with the topics' own clock. */
+    public void attachQueues(
+            java.util.function.Supplier<java.util.Map<String, sjws_nettask.messaging.delivery.LedgerInspector>> topics,
+            java.util.function.LongSupplier clockMs) {
+        this.queueClock = java.util.Objects.requireNonNull(clockMs);
+        this.queues = topics;
+    }
+
+    @Override
+    public java.util.List<QueueView> queues() {
+        var source = this.queues;
+        if (source == null) {
+            return java.util.List.of();
+        }
+        try {
+            return QueueView.read(source.get(), this.queueClock.getAsLong());
+        } catch (RuntimeException e) {
+            this.log.add("queue snapshot failed: " + e.getMessage());
+            return java.util.List.of();
+        }
+    }
+
+    @Override
+    public java.util.List<QueueView.Entry> deadLetters(String topic, String group, long fromOffset, int limit)
+            throws ControlException {
+        var source = this.queues;
+        if (source == null) {
+            throw new ControlException("messaging is not enabled");
+        }
+        sjws_nettask.messaging.delivery.LedgerInspector inspector;
+        try {
+            inspector = source.get().get(topic);
+        } catch (RuntimeException e) {
+            this.log.add("dead-letter read failed: " + e.getMessage());
+            throw new ControlException("dead-letter read failed: " + e.getMessage(), e);
+        }
+        if (inspector == null) {
+            throw new ControlException("unknown topic " + topic);
+        }
+        try {
+            return QueueView.deadLetters(inspector, group, fromOffset, limit);
+        } catch (IllegalArgumentException e) {
+            throw new ControlException(e.getMessage(), e);
+        } catch (RuntimeException e) {
+            this.log.add("dead-letter read failed: " + e.getMessage());
+            throw new ControlException("dead-letter read failed: " + e.getMessage(), e);
+        }
+    }
+
     @Override
     public ClusterStatus clusterStatus() {
         var board = this.cluster;
         return board == null ? null : board.status();
     }
 
+    void drainer(Drainer next) {
+        this.drainer = next;
+    }
+
+    @Override
+    public DrainOperation drain() throws ControlException {
+        this.lock.lock();
+        try {
+            var current = this.drain;
+            if (current != null && current.state() == DrainOperation.State.RUNNING) {
+                return current;
+            }
+            var s = this.server;
+            if (s == null) {
+                throw new ControlException("drain: server is not running");
+            }
+            var op = new DrainOperation("drain-" + this.drainIds.incrementAndGet(), DrainOperation.State.RUNNING,
+                    this.clock.instant(), null, null);
+            this.drain = op;
+            this.log.add(op.id() + ": started");
+            var how = this.drainer;
+            Thread.ofVirtual().name("admin-" + op.id()).start(() -> runDrain(op, s, how));
+            return op;
+        } finally {
+            this.lock.unlock();
+        }
+    }
+
+    private void runDrain(DrainOperation op, SjwsServer s, Drainer how) {
+        DrainOperation end;
+        try {
+            how.drain(s);
+            end = op.finish(DrainOperation.State.DONE, this.clock.instant(), null);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            end = op.finish(DrainOperation.State.FAILED, this.clock.instant(), "interrupted");
+        } catch (RuntimeException e) {
+            end = op.finish(DrainOperation.State.FAILED, this.clock.instant(), String.valueOf(e.getMessage()));
+        }
+        this.lock.lock();
+        try {
+            if (this.server == s) {
+                this.server = null;
+                s.close();
+            }
+            if (this.drain != op) {
+                // a hard stop already ended this operation; a late finish must not overwrite that
+                this.log.add(op.id() + ": drainer returned after stop");
+                return;
+            }
+            this.drain = end;
+            this.log.add(op.id() + (end.state() == DrainOperation.State.DONE ? ": drained" : ": failed: " + end.error()));
+        } finally {
+            this.lock.unlock();
+        }
+    }
+
+    @Override
+    public DrainOperation drainStatus() {
+        return this.drain;
+    }
+
+    private void refuseWhileDraining(String action) throws ControlException {
+        var current = this.drain;
+        if (current != null && current.state() == DrainOperation.State.RUNNING) {
+            throw new ControlException(action + ": " + current.id() + " is in progress");
+        }
+    }
+
     @Override
     public void start() throws ControlException {
         this.lock.lock();
         try {
+            refuseWhileDraining("start");
             if (this.server != null) {
                 this.log.add("start: already running");
                 return;
@@ -134,6 +285,12 @@ public final class EmbeddedServerControl implements ServerControl {
             s.close();
             this.lastError = null;
             this.log.add("stopped");
+            var running = this.drain;
+            if (running != null && running.state() == DrainOperation.State.RUNNING) {
+                // the server is closed, so the drain cannot finish anything; do not block start/reload on it
+                this.drain = running.finish(DrainOperation.State.FAILED, this.clock.instant(), "stopped during drain");
+                this.log.add(running.id() + ": failed: stopped during drain");
+            }
         } finally {
             this.lock.unlock();
         }
@@ -143,6 +300,7 @@ public final class EmbeddedServerControl implements ServerControl {
     public void reload() throws ControlException {
         this.lock.lock();
         try {
+            refuseWhileDraining("reload");
             var next = load(); // a bad config leaves the running server alone
             var previous = this.server == null ? null : this.config;
             stop();

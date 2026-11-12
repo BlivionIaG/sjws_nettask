@@ -72,10 +72,13 @@ public final class ConfigCodec {
         out.append("  labels:\n");
         if (node.labels().isEmpty()) {
             out.append("    {}\n");
-            return;
+        } else {
+            for (var key : sorted(node.labels())) {
+                out.append("    ").append(yamlKey(key)).append(": ").append(quote(node.labels().get(key))).append('\n');
+            }
         }
-        for (var key : sorted(node.labels())) {
-            out.append("    ").append(yamlKey(key)).append(": ").append(quote(node.labels().get(key))).append('\n');
+        if (node.maxStaleness() != null) {
+            out.append("  max_staleness: ").append(duration(node.maxStaleness())).append('\n');
         }
     }
 

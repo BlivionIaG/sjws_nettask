@@ -83,8 +83,10 @@ control-plane planned items.
    remains and a restart may present it again until that lands.
 4. After a signed snapshot applies, the data node persists
    `<stateDir>/config/{floor,trust,last-good}.json` and serves CP-owned sections from
-   last-good. Without last-good on first boot, `/readyz` is 503 and the watch retries; there
-   is no automatic drain if the control plane is down later.
+   last-good. Without last-good on first boot, the content port is not bound and the watch
+   retries; `/readyz` is 503 once the port is bound and the snapshot is missing or past
+   max-staleness (`expiresAtMillis`, or `node.max_staleness` when set). There is no automatic
+   drain if the control plane is down later.
 
 Issue join material from the admin API / console as documented in
 [cp-console.md](cp-console.md) and the design. Capability strings and label selectors are
