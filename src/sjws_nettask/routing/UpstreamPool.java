@@ -192,18 +192,32 @@ final class UpstreamPool implements AutoCloseable {
         try {
             return new Lease(connected.get(waitMs, TimeUnit.MILLISECONDS), false);
         } catch (TimeoutException e) {
-            future.cancel(true);
-            var ch = future.channel();
-            if (ch != null) {
-                ch.close();
-            }
+            abandonConnect(future);
             throw new ConnectTimeout("connect to " + this.host + ":" + this.port + " timed out");
+        } catch (InterruptedException e) {
+            // e.g. EndpointBalancer.close() -> probeWorkers.shutdownNow() mid-connect: nobody will
+            // take this lease, so the socket must not outlive the wait (Codex P2 on #477).
+            abandonConnect(future);
+            throw e; // propagates the interrupt to the caller
         } catch (ExecutionException e) {
             var cause = e.getCause();
             if (cause instanceof io.netty.channel.ConnectTimeoutException) {
                 throw new ConnectTimeout(cause.getMessage());
             }
             throw new ConnectFailed("connect to " + this.host + ":" + this.port + ": " + cause, cause);
+        }
+    }
+
+    /**
+     * Gives up on a connect nobody will wait for: cancels it and closes its channel, also when the
+     * connect still completes after the cancel (the listener closes a late success).
+     */
+    private static void abandonConnect(io.netty.channel.ChannelFuture future) {
+        future.cancel(true);
+        future.addListener(f -> future.channel().close());
+        var ch = future.channel();
+        if (ch != null) {
+            ch.close();
         }
     }
 
