@@ -193,7 +193,7 @@ class AdminTuiTest {
     @Test
     void unknownCommandAndLogPanesRunThroughPrintable() {
         var log = new LogBuffer(10);
-        log.add("queue snapshot failed: topic \u202eCLOSED\u2028");
+        log.add("queue snapshot failed: topic \u202eCLOSED\u2066");
         log.add("dead-letter read failed: \u001b[2Jgone");
         var tui = new AdminTui(new FakeControl(), log, null, false);
         tui.handle("zz\u202e\u001b[31m");
