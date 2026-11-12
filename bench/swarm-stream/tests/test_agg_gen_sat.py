@@ -51,7 +51,7 @@ def write_abs(root: Path, tag: str, cpu: float, gen_cores: int = 2, load1_post: 
 
 def run_agg(root: Path) -> str:
     write_floor(root)
-    return subprocess.check_output([sys.executable, str(AGG), str(root), "--assume-q4"], text=True)
+    return subprocess.check_output([sys.executable, str(AGG), str(root)], text=True)
 
 def flags(out: str, tag: str):
     lines = {ln.split(":")[0].strip(): ln for ln in out.splitlines() if ln.strip().startswith("abs-")}

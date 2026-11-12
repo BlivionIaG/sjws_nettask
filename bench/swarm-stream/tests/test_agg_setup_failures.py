@@ -49,7 +49,7 @@ def write_abs(root: Path, tag: str, **over):
 
 def run_agg(root: Path) -> str:
     write_floor(root)
-    return subprocess.check_output([sys.executable, str(AGG), str(root), "--assume-q4"], text=True)
+    return subprocess.check_output([sys.executable, str(AGG), str(root)], text=True)
 
 def line_for(out: str, tag: str) -> str:
     for ln in out.splitlines():
@@ -69,7 +69,7 @@ def main():
             ln = line_for(out, f"abs-0{i}")
             assert "valid=False" in ln, ln
             assert "setup_fail=True" in out or "group_open=300" in ln
-        assert "VERDICT: TEST_ONLY_FAIL" in out
+        assert "VERDICT: FAIL" in out
         assert "valid windows" in out.lower() or "only 0 valid" in out or "only 0 valid windows" in out
 
         # Clean control: five good windows → can PASS medians
@@ -81,7 +81,7 @@ def main():
         print(out2)
         for i in range(1, 6):
             assert "valid=True" in line_for(out2, f"abs-0{i}")
-        assert "VERDICT: TEST_ONLY_PASS" in out2
+        assert "VERDICT: PASS" in out2
 
         # error_count alone invalidates
         root3 = Path(td) / "err_only"

@@ -3,7 +3,8 @@
 
 A window is valid only when ALL of:
   - chunk_samples >= 10000, p99 present, load1_pre < 3
-  - not self_loaded (recomputed: load1_post>=4 OR cpu > 80*gen_cores)
+  - not self_loaded (recomputed from generator CPU and load1_post only:
+    load1_post>=4 OR cpu > 80*gen_cores). Do not OR StreamLoad's stale pre-drain flag.
   - no transport retries / refused_per_ip / drain timeout / open sessions after drain
   - no setup failures (error_count / group_open_refusals)
   - not NOISY (marker, foreign_cpu_avg>0.5, foreign load proc, OR any/end load1>=6)
@@ -42,7 +43,12 @@ def evaluate(r: dict) -> dict:
     except (TypeError, ValueError):
         cpu_f = float("nan")
     gen_sat = (cpu_f == cpu_f) and cpu_f > sat_lim
-    self_loaded = bool(r.get("self_loaded")) or gen_sat or load1_post >= 4.0
+    # Q4: recompute only. Do not OR a stale result.self_loaded: StreamLoad sets that
+    # flag from end-of-measure load1, then merge_noisy overwrites load1_post with
+    # the (usually lower) end-of-drain sample. Trusting the stale flag would
+    # mark a 136%-CPU / load1_post=1.77 leg self_loaded just because mid-measure
+    # load1 briefly crossed 4. Folded in from #465's harness after it merged.
+    self_loaded = gen_sat or load1_post >= 4.0
 
     ptr = _i(r.get("producer_transport_retries"))
     ccr = _i(r.get("consumer_connect_retries"))

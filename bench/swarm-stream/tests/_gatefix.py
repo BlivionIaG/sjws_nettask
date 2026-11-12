@@ -10,8 +10,8 @@ ACCOUNTING = {
     "sched_unreceived_at_cutoff": 0, "sched_phantom_streams": 0, "sched_stamp_fallback": 0,
     "cutoff_hit": False, "offered_actual_mib_s": 110.0, "sched_sends": 20000,
     "sched_streams_short": 0, "sched_late_registered": 0, "catchup_s": 0.2, "catchup_cpu_pct_of_wall": 40.0,
-    # Stamped by StreamLoad (re-review item 2). Pre-Q4 marker: only --assume-q4 tests see these pass.
-    "harness_commit": "fa125a483a11", "validity_marker": "pre-q4",
+    # Stamped by StreamLoad (Q4 landed). A countable window carries a hex sha and the "q4" marker.
+    "harness_commit": "fa125a483a11", "validity_marker": "q4",
 }
 
 HARD_ZEROS = {k: 0 for k in (

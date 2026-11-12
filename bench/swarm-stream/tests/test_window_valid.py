@@ -68,6 +68,12 @@ def main():
     ev = wv.evaluate(base_ok(client_cpu_pct_of_wall=170.0, self_loaded=False, gen_cores=3))
     assert ev["valid"] and not ev["self_loaded"], ev
 
+    # Q4: stale self_loaded flag (end-of-measure load1>=4, then load1_post rewritten
+    # to 1.77 after drain) must not keep the window invalid when CPU is under sat.
+    ev = wv.evaluate(base_ok(self_loaded=True, client_cpu_pct_of_wall=136.0,
+                             load1_post=1.77, load1_peak=4.23, gen_cores=2))
+    assert ev["valid"] and not ev["self_loaded"], ev
+
     # recovered retries
     ev = wv.evaluate(base_ok(producer_transport_retries=3))
     assert not ev["valid"] and ev["transport_retry_flag"], ev

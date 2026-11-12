@@ -149,11 +149,11 @@ public class StreamLoad {
   static volatile double CATCHUP_CPU_SEC = 0, CATCHUP_WALL_S = 0;
   /**
    * Architecture re-review of b47b7b26, item 2: every result.json carries the harness commit and this
-   * validity marker. "pre-q4" until the post-#465 merge folds in the stricter self_loaded check and
-   * --rate-mib-s; that commit changes it to "q4" (with agg.Q4_LANDED). agg.py rejects any window whose
+   * validity marker. "q4" from the commit that folds in the stricter self_loaded check and
+   * --rate-mib-s after #465 merged (agg.Q4_LANDED is True). agg.py rejects any window whose
    * marker is missing or not "q4", so a window run before that commit can never count later.
    */
-  static final String VALIDITY_MARKER = "pre-q4";
+  static final String VALIDITY_MARKER = "q4";
 
   record StreamKey(long hi, long lo) {}
 
@@ -1534,6 +1534,8 @@ public class StreamLoad {
         case "--lean-http" -> args.leanHttp = true;
         case "--no-lean-http" -> args.leanHttp = false;
         case "--rate-mib-s" -> args.rateMibS = Double.parseDouble(a[++i]);
+        case "--pace-ms" -> throw new IllegalArgumentException(
+            "--pace-ms was #465's per-stream sleep; use --rate-mib-s (aggregate MiB/s) instead");
         case "--lean-consumer" -> args.leanConsumer = true;
         case "--no-lean-consumer" -> args.leanConsumer = false;
         case "--harness-commit" -> args.harnessCommit = a[++i];

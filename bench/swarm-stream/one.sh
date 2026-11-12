@@ -78,6 +78,10 @@ if [ "$LOADGEN" = java ]; then
   # #415: RATE_MIB_S>0 paces producers to an aggregate offered rate (0/unset = closed loop).
   # LEAN_CONSUMER=0 keeps the HttpClient consumer (A/B the generator change itself).
   GEN_EXTRA=()
+  if [ -n "${PACE_MS:-}" ]; then
+    echo "one.sh: PACE_MS is removed; use RATE_MIB_S (aggregate MiB/s, --rate-mib-s) instead" >&2
+    exit 2
+  fi
   if [ -n "${RATE_MIB_S:-}" ]; then GEN_EXTRA+=(--rate-mib-s "$RATE_MIB_S"); fi
   if [ "${LEAN_CONSUMER:-1}" = 0 ]; then GEN_EXTRA+=(--no-lean-consumer); fi
   # #415/#414: optional generator JVM flags (e.g. JFR on the generator to find its own hot spots).

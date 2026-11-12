@@ -41,7 +41,7 @@ Off-mode class-load proof (credit / StreamStats stay unloaded when credit is off
 
 A window is **valid only if** the generator's CPU stays at or below **80% of its cores**
 (`self_loaded` when `client_cpu_pct_of_wall > 80 × gen_cores`, or `load1_post ≥ 4`).
-`agg.py` recomputes this from `result.json` (does not trust a stale `self_loaded` flag alone).
+`window_valid.py` / `agg.py` recompute this from generator CPU and `load1_post` only (Q4: they do not OR StreamLoad's stale pre-drain `self_loaded` flag).
 
 | Mode | Gen CPUs | Server CPUs | `GEN_CORES` | Sat limit |
 |------|----------|-------------|-------------|-----------|
@@ -121,10 +121,10 @@ flag-off emits nothing). Validate a scrape with `promtool check metrics`.
 - **Preconditions:**
   - `PHASE=all|abs` refuses to start without `CALIBRATION_REF`, the posted smoke plus calibration result.
   - Every DONE line records `harness=<commit>` and `calibration=<ref>`.
-  - Until the post-#465 merge flips `Q4_LANDED` in `agg.py`, the verdict is
-    `NOT_COUNTABLE (pre-Q4 harness, would be X)`.
-  - Every `result.json` is stamped with `harness_commit` and `validity_marker` (`pre-q4` until the
-    post-#465 merge sets `q4`). Once Q4 lands, legs without the `q4` marker never count.
+  - Q4 has landed (after #465 merged into master at 23f62b51): `Q4_LANDED` is True and
+    `validity_marker` is `q4`. `agg.py` prints `PASS` or `FAIL`, never `NOT_COUNTABLE`.
+  - Every `result.json` is stamped with `harness_commit` and `validity_marker`. Legs without the
+    `q4` marker, or with a pre-q4 marker, never count.
   - A countable `harness_commit` is a full or short (7–40) hex sha. Empty, `unknown` and `-dirty`
     commits are rejected on abs, A/A and floor legs. DONE lines may still record `-dirty` for
     information; those windows never count.

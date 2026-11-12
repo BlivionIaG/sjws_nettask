@@ -19,11 +19,11 @@ GATE_RATE_MIB_S = 110.0
 FLOOR_P99_MAX_US = 300.0
 # Architecture item 7 / inceptor Q4: no gate window counts until the Q4 validity change lands
 # (after #465 merges: master merged into #502, stricter self_loaded + --rate-mib-s folded in).
-# Flip to True in that commit, together with StreamLoad.VALIDITY_MARKER = "q4".
+# Flipped to True in the Q4 landing commit, together with StreamLoad.VALIDITY_MARKER = "q4".
 # Re-review item 2: once landed, only windows whose result.json carries a harness commit AND the
 # "q4" validity marker count; older windows can never turn into a PASS. --assume-q4 exists for the
 # tests only and never prints PASS (TEST_ONLY_PASS / TEST_ONLY_FAIL).
-Q4_LANDED = False
+Q4_LANDED = True
 REQUIRED_VALIDITY_MARKER = "q4"
 # Re-review item 1: offered_actual_mib_s (sched_sends x chunk_bytes / secs) must be within this
 # rounding allowance of 110. Per-stream edge rounding is <= 1 slot of ~2 250 per stream in a 20 s
