@@ -39,6 +39,8 @@ public final class NodeEnrollment {
     private final long startedMillis;
     private final long drainBudgetMs;
     private final AtomicReference<ControlPlaneBinding> binding = new AtomicReference<>();
+    private volatile String adminListen = "";
+    private volatile String adminState = "";
     private boolean closed;
 
     private NodeEnrollment(Bootstrap bootstrap, Path pidFile, long pid, long startedMillis, long drainBudgetMs) {
@@ -173,6 +175,24 @@ public final class NodeEnrollment {
         }
     }
 
+    /**
+     * Records the control-role admin listener for {@code --status}. Safe to call more than once.
+     * Empty values clear the fields.
+     */
+    public void adminListener(String listen, String state) throws IOException {
+        this.lock.lock();
+        try {
+            if (this.closed) {
+                return;
+            }
+            this.adminListen = listen == null ? "" : listen;
+            this.adminState = state == null ? "" : state;
+            rewrite();
+        } finally {
+            this.lock.unlock();
+        }
+    }
+
     private void rewrite() throws IOException {
         var current = this.binding.get();
         String connection = current == null ? ConnectionState.PENDING.wire()
@@ -186,6 +206,6 @@ public final class NodeEnrollment {
         }
         var dataRole = this.bootstrap.dataRole() == null ? "" : this.bootstrap.dataRole().wire();
         ServiceStatus.write(this.pidFile, this.pid, this.startedMillis, this.bootstrap.role().wire(), dataRole,
-                connection, version, this.drainBudgetMs);
+                connection, version, this.drainBudgetMs, this.adminListen, this.adminState);
     }
 }

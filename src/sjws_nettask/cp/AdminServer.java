@@ -231,7 +231,16 @@ public final class AdminServer implements AutoCloseable {
      */
     public static AdminServer startPlainForTests(CpStore store, long nowMillis, long ttlMillis,
             Set<String> allowedOrigins) throws IOException {
-        var http = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        return startPlainForTests(store, nowMillis, ttlMillis, allowedOrigins,
+                new InetSocketAddress("127.0.0.1", 0));
+    }
+
+    /**
+     * Plain HTTP on {@code address}. Production code uses {@link #startMtls}.
+     */
+    public static AdminServer startPlainForTests(CpStore store, long nowMillis, long ttlMillis,
+            Set<String> allowedOrigins, InetSocketAddress address) throws IOException {
+        var http = HttpServer.create(address, 0);
         var bound = new AdminServer(http, new CpAdmin(store, nowMillis, ttlMillis), null, null, allowedOrigins);
         http.createContext("/", bound::handle);
         http.start();
@@ -240,6 +249,12 @@ public final class AdminServer implements AutoCloseable {
 
     public int port() {
         return server.getAddress().getPort();
+    }
+
+    /** Bound listen address, including the kernel-assigned port when the bind used port 0. */
+    public java.net.InetSocketAddress address() {
+        var bound = server.getAddress();
+        return bound instanceof java.net.InetSocketAddress inet ? inet : new java.net.InetSocketAddress(port());
     }
 
     /** How many live admin sessions were dropped because they failed policy after a reload. */
