@@ -19,6 +19,8 @@ web server. Back to the [README](../README.md) (quick start and shipped/planned 
 - [JVM flags (profiles)](operations/jvm-flags.md): G1 default; opt-in ZGC pinned / Serial; container MaxRAMPercentage
 - [Observability](operations/observability.md): access log, `/healthz`, `/metrics`, metrics API, control heartbeat report
 - [Running in the background (daemon)](operations/daemon.md)
+- [macOS launchd](operations/launchd.md)
+- [Windows service](operations/windows-service.md)
 - [Docker image](deployment/docker.md): multi-stage build, non-root runtime, health check
 - [Control-plane and data-node service](operations/control-plane-service.md): systemd units, join bootstrap, status, drain
 - [Control-plane operations runbook](operations/control-plane.md): bootstrap voters, join data nodes, backup, upgrades, DR

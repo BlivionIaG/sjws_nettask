@@ -167,6 +167,12 @@ class WatchTest {
             LastGoodFiles.writePin(high, keys.rootPublic(), 5);
             assertThrows(IOException.class,
                     () -> DataApply.trusted(high, message, this.dir.resolve("s"), System::currentTimeMillis));
+            var serial = this.dir.resolve("serial.pin");
+            LastGoodFiles.writePin(serial, keys.rootPublic(), keys.versionFloor(), 0L,
+                    keys.bundle().bundleSerial() + 1);
+            var serialErr = assertThrows(IOException.class,
+                    () -> DataApply.trusted(serial, message, this.dir.resolve("s"), System::currentTimeMillis));
+            assertTrue(serialErr.getMessage().contains("serial"), serialErr.getMessage());
             assertThrows(IOException.class, () -> WatchWire.decode(text.replace("\"snapshot\":", "\"snap\":")));
             // A tampered bundle (one byte flipped) does not verify under the pinned root.
             var bytes = message.bundle();

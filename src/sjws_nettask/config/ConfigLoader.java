@@ -61,7 +61,20 @@ public final class ConfigLoader {
                 ServerConfig::readPasswordFile, null);
     }
 
+    /**
+     * Like {@link #load(String[], Map)}. {@code recoveryPin} is the bootstrap pin the caller already
+     * resolved; missing-config recovery needs it to boot from a signed last-good.
+     */
+    public static Loaded load(String[] args, Map<String, String> env, Path recoveryPin) {
+        return load(args, env, ServerConfig::readPasswordFile, recoveryPin);
+    }
+
     public static Loaded load(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords) {
+        return load(args, env, passwords, null);
+    }
+
+    private static Loaded load(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+            Path recoveryPin) {
         var arguments = args.clone();
         var environment = Map.copyOf(env);
         for (var arg : arguments) {
@@ -70,14 +83,14 @@ public final class ConfigLoader {
             }
         }
         try {
-            return loadFile(arguments, environment, passwords);
+            return loadFile(arguments, environment, passwords, recoveryPin);
         } catch (ConfigException e) {
             return new Loaded(null, List.of(), List.of(e.getMessage()), false, arguments, environment, passwords, null);
         }
     }
 
-    private static Loaded loadFile(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords)
-            throws ConfigException {
+    private static Loaded loadFile(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+            Path recoveryPin) throws ConfigException {
         var warnings = new ArrayList<String>();
         String fromArgs = null;
         for (var arg : args) {
@@ -114,6 +127,7 @@ public final class ConfigLoader {
         byte[] haPrevious = null;
         byte[] bootSignature = null;
         String recoveredHash = null;
+        boolean pinnedRecovery = false;
         Path yamlState = null;
         Map<String, Object> yamlCp = null;
         String text;
@@ -124,11 +138,12 @@ public final class ConfigLoader {
             if (!Files.isRegularFile(requested)) {
                 var state = stateDir(args, env, null, requested.toAbsolutePath().getParent());
                 var json = LastGoodStore.file(state);
-                var recovered = LastGoodStore.dataPlaneYaml(json);
+                var recovered = recoverLastGoodYaml(json, state, recoveryPin);
+                pinnedRecovery = recovered != null && LastGoodStore.signature(json) != null;
                 var source = json;
                 if (recovered == null) {
                     var legacy = LastGoodStore.beside(requested);
-                    recovered = LastGoodStore.dataPlaneYaml(legacy);
+                    recovered = unsignedLastGoodYaml(legacy, recoveryPin);
                     source = legacy;
                 }
                 if (recovered == null) {
@@ -157,6 +172,11 @@ public final class ConfigLoader {
             schemaVersion = schemaOf(root);
             bundleVersion = versionOf(root);
             node = nodeSection(root);
+            if (pinnedRecovery && node.mode() != NodeSettings.Mode.DATA) {
+                // A pinned last-good belongs to this data node. Keep the data role, as live apply
+                // does when it clamps node.mode, so a recovered snapshot does not select another role.
+                node = new NodeSettings(NodeSettings.Mode.DATA, node.labels(), node.maxStaleness());
+            }
             var base = configFile.toAbsolutePath().getParent();
             var bindHolder = new Boolean[1];
             yamlState = stateDirKey(root, base);
@@ -261,12 +281,19 @@ public final class ConfigLoader {
             return NodeSettings.STANDALONE;
         }
         var map = YamlValues.mapping(node, "node");
-        YamlValues.knownKeys(map, List.of("mode", "labels", "state_dir"), "node");
+        YamlValues.knownKeys(map, List.of("mode", "labels", "state_dir", "max_staleness"), "node");
         var mode = map.containsKey("mode")
                 ? NodeSettings.Mode.parse(text(map.get("mode"), "node.mode"))
                 : NodeSettings.Mode.STANDALONE;
         var labels = map.containsKey("labels") ? labels(map.get("labels")) : Map.<String, String>of();
-        return new NodeSettings(mode, labels);
+        Duration maxStaleness = null;
+        if (map.containsKey("max_staleness")) {
+            maxStaleness = Durations.parse(text(map.get("max_staleness"), "node.max_staleness"), "node.max_staleness");
+            if (maxStaleness.compareTo(NodeSettings.MAX_STALENESS) > 0) {
+                throw new ConfigException("node.max_staleness: must be at most 7d");
+            }
+        }
+        return new NodeSettings(mode, labels, maxStaleness);
     }
 
     private static Path stateDirKey(Map<String, Object> root, Path base) {
@@ -282,6 +309,16 @@ public final class ConfigLoader {
             path = base.resolve(path);
         }
         return path;
+    }
+
+    /** Missing-config recovery from the state dir. The file checks and refusals are in {@link LastGoodStore}. */
+    private static String recoverLastGoodYaml(Path json, Path state, Path pin) {
+        return LastGoodStore.recoveryYaml(json, state, pin);
+    }
+
+    /** The legacy file beside the config: unsigned, and only when no bootstrap pin is set. */
+    private static String unsignedLastGoodYaml(Path legacy, Path pin) {
+        return LastGoodStore.legacyRecoveryYaml(legacy, pin);
     }
 
     /**

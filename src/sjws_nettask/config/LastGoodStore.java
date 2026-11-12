@@ -22,12 +22,14 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.Set;
 
@@ -43,9 +45,12 @@ import java.util.Set;
  */
 public final class LastGoodStore {
 
-    private static final Set<PosixFilePermission> OWNER_RW = PosixFilePermissions.fromString("rw-------");
-    private static final Set<PosixFilePermission> OWNER_RWX = EnumSet.of(PosixFilePermission.OWNER_READ,
-            PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE);
+    /** 0600; unmodifiable so no caller can widen the shared mode. */
+    static final Set<PosixFilePermission> OWNER_RW = Collections.unmodifiableSet(
+            EnumSet.copyOf(PosixFilePermissions.fromString("rw-------")));
+    /** 0700; unmodifiable so no caller can widen the shared mode. */
+    static final Set<PosixFilePermission> OWNER_RWX = Collections.unmodifiableSet(EnumSet.of(
+            PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE));
 
     private LastGoodStore() {
     }
@@ -122,7 +127,15 @@ public final class LastGoodStore {
      */
     public static String dataPlaneYaml(Path path) {
         try {
-            var raw = Files.readString(path);
+            return dataPlaneYamlOf(Files.readString(path));
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** {@link #dataPlaneYaml(Path)} for file text the caller already read. */
+    static String dataPlaneYamlOf(String raw) {
+        try {
             if (raw.isBlank()) {
                 return null;
             }
@@ -137,7 +150,7 @@ public final class LastGoodStore {
                 return dataMode(envelope.canonical) ? envelope.canonical : null;
             }
             return dataMode(raw) ? raw : null;
-        } catch (RuntimeException | IOException e) {
+        } catch (RuntimeException e) {
             return null;
         }
     }
@@ -153,7 +166,73 @@ public final class LastGoodStore {
     /** Signature stored in a JSON envelope, or null when there is none or the file is legacy YAML. */
     public static byte[] signature(Path path) {
         try {
-            var raw = Files.readString(path);
+            return signatureOf(RecoveryFiles.read(path));
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Canonical YAML to boot from when the config file is missing, read from the state-dir
+     * last-good {@code json}. Null when there is no such file or it is not a boot source here.
+     * Every file is read through {@link RecoveryFiles} (no symlinked leaf; owner and mode on POSIX).
+     *
+     * <p>With a bootstrap {@code pin}, the file must be signed and verify under that pin
+     * ({@link sjws_nettask.cp.DataApply#tryReadVerifiedLastGood}); an unsigned file, or a signed
+     * one that does not verify, is refused with a {@link ConfigException}. The trust, floor and pin
+     * files are checked first and then read by that method with {@code NOFOLLOW}; their parent
+     * directories passed the same checks. Without a pin, an unsigned data-mode file is used and a
+     * signed one is not a boot source.
+     *
+     * @throws ConfigException when a file is present but refused
+     */
+    public static String recoveryYaml(Path json, Path state, Path pin) {
+        var text = RecoveryFiles.read(json);
+        if (text == null) {
+            return null;
+        }
+        boolean signed = signatureOf(text) != null;
+        if (pin == null) {
+            return signed ? null : dataPlaneYamlOf(text);
+        }
+        if (!signed) {
+            throw unsignedWithPin(json);
+        }
+        var dir = json.getParent();
+        RecoveryFiles.read(dir.resolve("trust.json"));
+        RecoveryFiles.read(dir.resolve("floor.json"));
+        RecoveryFiles.read(pin);
+        return sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(state, pin)
+                .map(value -> value.snapshot().canonicalYaml())
+                .orElseThrow(() -> new ConfigException("last-good " + json.toAbsolutePath()
+                        + " does not verify under the bootstrap pin"));
+    }
+
+    /**
+     * Canonical YAML from the legacy file beside the config ({@link #beside}). Only an unsigned
+     * data-mode file, and only without a bootstrap {@code pin}; with a pin, a present file is refused.
+     *
+     * @throws ConfigException when the file is present but refused
+     */
+    public static String legacyRecoveryYaml(Path legacy, Path pin) {
+        if (pin != null) {
+            if (Files.exists(legacy, LinkOption.NOFOLLOW_LINKS)) {
+                throw unsignedWithPin(legacy);
+            }
+            return null;
+        }
+        var text = RecoveryFiles.read(legacy);
+        return text == null || signatureOf(text) != null ? null : dataPlaneYamlOf(text);
+    }
+
+    private static ConfigException unsignedWithPin(Path path) {
+        return new ConfigException("with a bootstrap pin only a signed last-good is a boot source; "
+                + path.toAbsolutePath() + " is not signed");
+    }
+
+    /** {@link #signature(Path)} for file text the caller already read. */
+    static byte[] signatureOf(String raw) {
+        try {
             if (raw.isBlank() || raw.charAt(0) != '{') {
                 return null;
             }
@@ -162,7 +241,7 @@ public final class LastGoodStore {
                 return null;
             }
             return Base64.getDecoder().decode(envelope.signature);
-        } catch (RuntimeException | IOException e) {
+        } catch (RuntimeException e) {
             return null;
         }
     }
@@ -346,7 +425,7 @@ public final class LastGoodStore {
                     case "version" -> envelope.version = parser.number();
                     case "canonicalHash" -> envelope.canonicalHash = parser.string();
                     case "signature" -> envelope.signature = parser.string();
-                    case "canonical" -> envelope.canonical = parser.string();
+                    case "canonical", "canonicalYaml" -> envelope.canonical = parser.string();
                     default -> parser.skipValue();
                 }
             }

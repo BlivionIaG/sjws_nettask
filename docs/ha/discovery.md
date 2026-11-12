@@ -109,3 +109,20 @@ stateDiagram-v2
         long, up to 32 times eject_for
     end note
 ```
+
+## Cluster quota share (not this interface)
+
+Ready-gateway membership (how many gateways are in the ready set, and whether *this* node is
+in it) is an HA concern. A later **cluster rate-limit share** uses that set: the control plane
+computes `share = configured_rate / ready_gateway_count` for each named global limit and
+publishes a snapshot to the data plane. That snapshot is **not** an `UpstreamSet`. Upstream
+discovery and quota share stay separate objects, each a full snapshot, never a delta.
+
+The HTTP data plane applies a share it is given through the existing `Quota` factory. It does
+not watch membership itself and must not invent gossip in `routing`. Until the CP/HA share API
+exists, every rate limit stays local.
+
+Failure mode (recorded in design §13): keep the last share if a later snapshot is missing;
+fail closed if this node has never received a share, or is not in the ready set. Do not fall
+back to the full local rate.
+

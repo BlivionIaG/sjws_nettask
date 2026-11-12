@@ -33,4 +33,20 @@ public interface CpReloadable extends AutoCloseable {
     /** Ordered shutdown; never throws. */
     @Override
     void close();
+
+    /**
+     * Bound admin listener as {@code host:port}, or empty when this host has not bound one.
+     * Safe to print in {@code --status}.
+     */
+    default String adminListen() {
+        return "";
+    }
+
+    /**
+     * {@code listening} when the admin listener is bound, {@code not-bound} otherwise, or empty
+     * when this host does not report one.
+     */
+    default String adminState() {
+        return "";
+    }
 }
