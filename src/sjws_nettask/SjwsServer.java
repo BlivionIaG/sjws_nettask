@@ -1488,9 +1488,18 @@ public final class SjwsServer implements AutoCloseable {
             } finally {
                 this.drainLock.unlock();
             }
-            var live = this.live.get();
-            if (live != null) {
-                syncCredentialQueryParamsFromConfig(live.document());
+            // Take reloadLock after drainLock is released, the same order publication uses
+            // (reloadLock then drainLock), so this refresh cannot run mid-publish and replace
+            // the pre-arm union with a stale live document. Reentrant: an idle generation
+            // quiesces on the publish thread, which already holds reloadLock, after live.set.
+            this.reloadLock.lock();
+            try {
+                var live = this.live.get();
+                if (live != null) {
+                    syncCredentialQueryParamsFromConfig(live.document());
+                }
+            } finally {
+                this.reloadLock.unlock();
             }
         });
     }
