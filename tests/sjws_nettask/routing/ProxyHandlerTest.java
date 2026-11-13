@@ -248,7 +248,7 @@ class ProxyHandlerTest {
     }
 
     @Test
-    void requestsWithABodyAre501() {
+    void unattachedDeclaredBodiesAre501() {
         var p = new ProxyHandler(new ProxyHandler.Settings(this.base));
         assertEquals(501, p.handle(withFields("POST", "/", java.util.Map.of("content-length", java.util.List.of("3")), null, false)).status());
         assertEquals(501, p.handle(withFields("POST", "/", java.util.Map.of("transfer-encoding", java.util.List.of("chunked")), null, false)).status());
