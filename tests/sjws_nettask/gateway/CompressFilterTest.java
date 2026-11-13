@@ -589,4 +589,22 @@ class CompressFilterTest {
         assertEquals(304, notModified.status());
         assertTrue(notModified.generated(), "a gzip 304 must keep the generated marker");
     }
+
+    @Test
+    void problemConversionAfterCompressionDropsTheGzipMetadata() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of("min_size", "1")));
+        var problems = new sjws_nettask.routing.ProblemErrorHandler(
+                (request) -> filter.filter(request, (r) -> StaticFileHandler.error(404, false)), "/", null, null);
+        var response = problems.handle(request("gzip"));
+        assertEquals(404, response.status());
+        assertEquals("application/problem+json", response.headers().get("content-type"));
+        assertNull(response.headers().get("content-encoding"), "the JSON body is not gzip");
+        assertNull(response.headers().get("etag"));
+        var data = ((Body.Bytes) response.body()).data().duplicate();
+        var bytes = new byte[data.remaining()];
+        data.get(bytes);
+        var json = new String(bytes, StandardCharsets.UTF_8);
+        assertTrue(json.startsWith("{\"type\":"), json);
+        assertEquals("Accept-Encoding", response.headers().get("vary"));
+    }
 }

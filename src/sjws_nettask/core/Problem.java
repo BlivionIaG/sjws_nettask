@@ -57,7 +57,9 @@ public final class Problem {
 
     /**
      * Builds the response. Header fields of {@code like} other than the representation ones
-     * (e.g. Allow, Content-Range, Retry-After, WWW-Authenticate) are kept.
+     * (e.g. Allow, Content-Range, Retry-After, WWW-Authenticate) are kept. Fields that describe the
+     * replaced body (Content-Encoding, Content-Length, Content-MD5, Content-Digest, Repr-Digest,
+     * Digest, ETag) are dropped.
      *
      * @param typeBase null for {@code "about:blank"}, otherwise a URI the status code is appended to
      *        (e.g. "https://errors.example.com/" gives "https://errors.example.com/503")
@@ -89,6 +91,9 @@ public final class Problem {
                 switch (e.getKey()) {
                     case "accept-ranges", "content-type", "x-content-type-options", "content-security-policy",
                             "cache-control" -> { }
+                    // They describe the replaced body (e.g. a compress filter's gzip), not the JSON.
+                    case "content-encoding", "content-length", "content-md5", "content-digest", "repr-digest",
+                            "digest", "etag" -> { }
                     default -> headers.add(e.getKey(), e.getValue());
                 }
             }

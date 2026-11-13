@@ -634,7 +634,9 @@ example the upstream's own 503) is never rewritten. `type` is `about:blank`, or
 `problem_type` followed by the status code (`https://errors.example.com/503`).
 `instance` is the request path as the client sent it (before `rewrite`, without
 the query). The body carries `Cache-Control: no-store`, and semantic fields of the
-page such as `Allow`, `Content-Range` or `Retry-After` are kept. Routes without
+page such as `Allow`, `Content-Range` or `Retry-After` are kept. Fields that describe the
+replaced HTML body (`Content-Encoding`, `Content-Length`, `Content-MD5`, `Content-Digest`,
+`Repr-Digest`, `Digest`, `ETag`) are dropped. Routes without
 `errors: problem` get no wrapper and run exactly as before.
 
 `listing: false` answers a directory without `index.html` with 404, as if it did
