@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Instant;
+import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
@@ -133,7 +134,11 @@ class StaticFileHandlerTest {
         var r = get("/sub?a=1");
         assertEquals(301, r.status());
         assertEquals("/sub/?a=1", r.headers().get("location"));
-        assertTrue(text(r).contains("/sub/?a=1"));
+        var html = text(r);
+        assertTrue(html.contains("<title>301 Moved Permanently</title>"), html);
+        assertTrue(html.contains("<meta charset=\"UTF-8\"/>"), html);
+        assertTrue(html.contains("<h1>301 Moved Permanently</h1>"), html);
+        assertTrue(html.contains("href=\"/sub/?a=1\""), html);
     }
 
     @Test
@@ -193,7 +198,10 @@ class StaticFileHandlerTest {
         var r = handler.handle(new Request(method, "/hello.txt"));
         assertEquals(405, r.status());
         assertEquals("GET, HEAD, OPTIONS", r.headers().get("allow"));
-        assertTrue(text(r).contains("405 Method Not Allowed"));
+        var html = text(r);
+        assertTrue(html.contains("<title>405 Method Not Allowed</title>"), html);
+        assertTrue(html.contains("<meta charset=\"UTF-8\"/>"), html);
+        assertTrue(html.contains("<h1>405 Method Not Allowed</h1>"), html);
     }
 
     @ParameterizedTest
@@ -228,5 +236,42 @@ class StaticFileHandlerTest {
     void rootMustBeADirectory() {
         assertThrows(java.io.UncheckedIOException.class, () -> new StaticFileHandler(tmp.resolve("missing")));
         assertThrows(java.io.UncheckedIOException.class, () -> new StaticFileHandler(tmp.resolve("secret.txt")));
+    }
+
+    @Test
+    void generatedPagesStayMarkedWhenTheCspHeaderIsRewritten() {
+        var page = StaticFileHandler.error(404, false);
+        assertTrue(StaticFileHandler.isGenerated(page));
+        page.headers().set("content-security-policy", "default-src 'self'");
+        assertTrue(StaticFileHandler.isGenerated(page));
+        page.headers().remove("content-security-policy");
+        assertTrue(StaticFileHandler.isGenerated(page));
+
+        assertTrue(StaticFileHandler.isGenerated(StaticFileHandler.listing(List.of("a"), "/", false)));
+        assertTrue(StaticFileHandler.isGenerated(StaticFileHandler.redirect("/x", false)));
+        assertTrue(StaticFileHandler.isGenerated(StaticFileHandler.methodNotAllowed()));
+        assertFalse(StaticFileHandler.isGenerated(get("/hello.txt")));
+
+        // An upstream (or any non-generated) response that happens to carry the same CSP is not ours.
+        var spoofed = new Response(404,
+                ResponseHeaders.of().add("content-security-policy", StaticFileHandler.HTML_CSP),
+                Body.Bytes.of(new byte[0]));
+        assertFalse(StaticFileHandler.isGenerated(spoofed));
+    }
+
+    @Test
+    void asGeneratedAndAsLocalAdmissionPreserveEachOther() {
+        var r = new Response(503, ResponseHeaders.of(), Body.Empty.INSTANCE);
+        assertFalse(r.generated());
+        assertFalse(r.localAdmission());
+        var both = r.asGenerated().asLocalAdmission();
+        assertTrue(both.generated());
+        assertTrue(both.localAdmission());
+        assertSame(both, both.asGenerated());
+        assertSame(both, both.asLocalAdmission());
+        var admissionFirst = new Response(503, ResponseHeaders.of(), Body.Empty.INSTANCE, false, true)
+                .asGenerated();
+        assertTrue(admissionFirst.localAdmission());
+        assertTrue(admissionFirst.generated());
     }
 }

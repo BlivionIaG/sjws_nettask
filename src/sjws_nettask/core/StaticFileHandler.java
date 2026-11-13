@@ -356,16 +356,18 @@ public final class StaticFileHandler implements Handler {
                 .add("content-type", Mime.contentType("text/html"))
                 .add("x-content-type-options", NOSNIFF)
                 .add("content-security-policy", HTML_CSP);
-        return new Response(status, headers, Body.Bytes.of(html.getBytes(StandardCharsets.UTF_8)), head);
+        return new Response(status, headers, Body.Bytes.of(html.getBytes(StandardCharsets.UTF_8)), head)
+                .asGenerated();
     }
 
     /**
-     * True for a page built by {@link #error}/{@link #html} here (identity check on the shared
-     * {@link #HTML_CSP} constant, so a proxied upstream response never qualifies). Lets a route
+     * True for a page built by {@link #error}/{@link #html} here (the {@link Response#generated()}
+     * flag, so a proxied upstream response never qualifies even if it copies {@link #HTML_CSP},
+     * and a later filter that rewrites that header does not drop the mark). Lets a route
      * re-render server-generated errors (e.g. as problem+json) without touching upstream bodies.
      */
     public static boolean isGenerated(Response response) {
-        return response.headers().get("content-security-policy") == HTML_CSP;
+        return response.generated();
     }
 
     public static Response error(int status, boolean head) {
@@ -393,13 +395,17 @@ public final class StaticFileHandler implements Handler {
     }
 
     public static Response methodNotAllowed() {
-        var r = html(405, "<!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>", false);
+        var r = error(405, false);
         r.headers().add("allow", ALLOW);
         return r;
     }
 
     public static Response redirect(String location, boolean head) {
-        var r = html(301, "<!DOCTYPE html><html><body><a href=\"" + escape(location) + "\">Moved</a></body></html>",
+        // Same chrome as {@link #error}: doctype, charset, title and h1. The body still carries a
+        // link to the new location so a non-redirecting client can follow it.
+        var href = escape(location);
+        var r = html(301, "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"/><title>301 Moved Permanently</title>"
+                + "</head><body><h1>301 Moved Permanently</h1><p><a href=\"" + href + "\">Moved</a></p></body></html>",
                 head);
         r.headers().add("location", location);
         return r;

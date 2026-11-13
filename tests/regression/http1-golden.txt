@@ -3186,12 +3186,12 @@ Date: <normalised>
 Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
-Content-Length: 66
+Content-Length: 175
 X-Content-Type-Options: nosniff
 Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 Location: /sub/
 
-<!DOCTYPE html><html><body><a href="/sub/">Moved</a></body></html>
+<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>301 Moved Permanently</title></head><body><h1>301 Moved Permanently</h1><p><a href="/sub/">Moved</a></p></body></html>
 === 301-query ===
 HTTP/1.1 301 Moved Permanently
 Server: sjws_nettask web server/0.2
@@ -3199,12 +3199,12 @@ Date: <normalised>
 Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
-Content-Length: 80
+Content-Length: 189
 X-Content-Type-Options: nosniff
 Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 Location: /sub/?x=1&y=%20
 
-<!DOCTYPE html><html><body><a href="/sub/?x=1&amp;y=%20">Moved</a></body></html>
+<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>301 Moved Permanently</title></head><body><h1>301 Moved Permanently</h1><p><a href="/sub/?x=1&amp;y=%20">Moved</a></p></body></html>
 === 304 ===
 HTTP/1.1 304 Not Modified
 Server: sjws_nettask web server/0.2
@@ -3268,12 +3268,12 @@ Date: <normalised>
 Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
-Content-Length: 72
+Content-Length: 145
 X-Content-Type-Options: nosniff
 Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 Allow: GET, HEAD, OPTIONS
 
-<!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>
+<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>405 Method Not Allowed</title></head><body><h1>405 Method Not Allowed</h1></body></html>
 === 405-with-body ===
 HTTP/1.1 405 Method Not Allowed
 Server: sjws_nettask web server/0.2
@@ -3281,12 +3281,12 @@ Date: <normalised>
 Accept-Ranges: none
 Content-Type: text/html; charset=utf-8
 Connection: close
-Content-Length: 72
+Content-Length: 145
 X-Content-Type-Options: nosniff
 Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'
 Allow: GET, HEAD, OPTIONS
 
-<!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>
+<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>405 Method Not Allowed</title></head><body><h1>405 Method Not Allowed</h1></body></html>
 === 400-bad-encoding ===
 HTTP/1.1 400 Bad Request
 Server: sjws_nettask web server/0.2
