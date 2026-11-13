@@ -124,6 +124,24 @@ def main():
     assert m3["sched_unreceived_at_cutoff"] == 5
     assert m3["sched_streams_short"] == 1
 
+    # Mode B: any single process > 80% of its own core is self_loaded, even if the sum is < 240%.
+    a4 = dict(a); a4["client_cpu_pct_of_wall"] = 90
+    b4 = dict(b); b4["client_cpu_pct_of_wall"] = 10
+    c4 = dict(c); c4["client_cpu_pct_of_wall"] = 10
+    m4 = mod.merge([a4, b4, c4], gen_cores=3, secs=20)
+    assert m4["client_cpu_pct_of_wall"] == 110.0
+    assert m4["client_cpu_pct_per_proc"] == [90, 10, 10], m4["client_cpu_pct_per_proc"]
+    assert m4["self_loaded"] is True, m4
+    assert m4["generator_saturated_any_proc"] is True
+    assert m4["generator_saturated"] is True
+    # 503 fields are summed
+    a5 = dict(a); a5["http_503_responses"] = 16; a5["http_503_claim_giveups"] = 1; a5["http_503_budget_exhausted"] = 16
+    b5 = dict(b); b5["http_503_responses"] = 32; b5["http_503_claim_giveups"] = 2; b5["http_503_budget_exhausted"] = 32
+    m5 = mod.merge([a5, b5, c], gen_cores=3, secs=20)
+    assert m5["http_503_responses"] == 48, m5["http_503_responses"]
+    assert m5["http_503_claim_giveups"] == 3
+    assert m5["http_503_budget_exhausted"] == 48
+
     print("OK test_merge_gen")
 
 

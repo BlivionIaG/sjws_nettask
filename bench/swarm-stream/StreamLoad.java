@@ -146,6 +146,10 @@ public class StreamLoad {
       SCHED_PHANTOM_STREAMS = new LongAdder(), SCHED_STAMP_FALLBACK = new LongAdder(),
       SCHED_INFLIGHT_AT_END = new LongAdder(), SCHED_STREAMS_SHORT = new LongAdder(),
       SCHED_LATE_REGISTERED = new LongAdder();
+  /** Every HTTP 503 on claim/:stream (including retries). Give-ups are HTTP503_GIVEUPS after 15 retries. */
+  static final LongAdder HTTP503_RESPONSES = new LongAdder(), HTTP503_CLAIM = new LongAdder(),
+      HTTP503_STREAM = new LongAdder(), HTTP503_BUDGET = new LongAdder(),
+      HTTP503_CLAIM_GIVEUPS = new LongAdder(), HTTP503_STREAM_GIVEUPS = new LongAdder();
   static final AtomicBoolean CUTOFF_HIT = new AtomicBoolean();
   /** #415 catch-up period (window end -> last producer done): generator CPU seconds and wall seconds. */
   static volatile double CATCHUP_CPU_SEC = 0, CATCHUP_WALL_S = 0;
@@ -424,6 +428,9 @@ public class StreamLoad {
     CUTOFF_HIT.set(false); CATCHUP_CPU_SEC = 0; CATCHUP_WALL_S = 0;
     requests.set(0); credit429.set(0);
     producerTransportRetries.set(0); consumerConnectRetries.set(0);
+    groupOpenRefusals.set(0);
+    for (LongAdder c : List.of(HTTP503_RESPONSES, HTTP503_CLAIM, HTTP503_STREAM, HTTP503_BUDGET,
+        HTTP503_CLAIM_GIVEUPS, HTTP503_STREAM_GIVEUPS)) c.reset();
 
     // Measure + sample client (/proc/self) and server (/proc/<serverPid>) CPU over the window
     AtomicReference<double[]> cpuSample = new AtomicReference<>(new double[]{0,0,0,0}); // clientSec, clientPct, serverSec, serverPct
@@ -536,6 +543,12 @@ public class StreamLoad {
     r.producerTransportRetries = producerTransportRetries.get();
     r.consumerConnectRetries = consumerConnectRetries.get();
     r.groupOpenRefusals = groupOpenRefusals.get();
+    r.http503Responses = HTTP503_RESPONSES.sum();
+    r.http503ClaimResponses = HTTP503_CLAIM.sum();
+    r.http503StreamResponses = HTTP503_STREAM.sum();
+    r.http503BudgetExhausted = HTTP503_BUDGET.sum();
+    r.http503ClaimGiveups = HTTP503_CLAIM_GIVEUPS.sum();
+    r.http503StreamGiveups = HTTP503_STREAM_GIVEUPS.sum();
     // 503 group-open refusals are NOT transport retries (Messaging Core #335 / steering 16:34).
     r.transportRetryFlag = r.producerTransportRetries > 0 || r.consumerConnectRetries > 0;
     r.requests = requests.get();
@@ -671,8 +684,10 @@ public class StreamLoad {
           token, new byte[0]);
       claimSc = claim.statusCode();
       if (claimSc != 503) break;
+      record503(true, claim.body());
       if (!sleep503(w.hardStop, header(claim, "retry-after"), attempt, 15)) {
         groupOpenRefusals.incrementAndGet();
+        HTTP503_CLAIM_GIVEUPS.increment();
         note(inTeardown, measureErr, teardownErr, "producer-claim-refused " + pool,
             new IOException("claim 503" + bodyDetail(claim.body())));
         return;
@@ -952,8 +967,10 @@ public class StreamLoad {
     AtomicBoolean stop = w.hardStop;
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
     Exception last = null;
+    boolean sessionOpened = false; // 201 received: never POST :stream again (Architecture: no second session)
     for (int attempt = 0, n503 = 0; attempt < 3 && !stop.get(); ) {
       try {
+        if (sessionOpened) throw last != null ? last : new IOException("stream already opened");
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(args.base + "/swarm/v1/tasks/" + enc(pool) + ":stream?deadlineMs=180000"))
             .timeout(Duration.ofSeconds(200))
             .header("Authorization", "Bearer " + token)
@@ -966,14 +983,17 @@ public class StreamLoad {
         HttpResponse<byte[]> resp = http.send(b.build(), HttpResponse.BodyHandlers.ofByteArray());
         int streamSc = resp.statusCode();
         if (streamSc == 503) {
+          record503(false, resp.body());
           if (sleep503(stop, header(resp, "retry-after"), n503++, 15)) continue;
           groupOpenRefusals.incrementAndGet();
+          HTTP503_STREAM_GIVEUPS.increment();
           note(inTeardown, measureErr, teardownErr, "consumer-stream-refused " + pool,
               new IOException("stream 503" + bodyDetail(resp.body())));
           return;
         }
         if (streamSc != 201 && streamSc != 200)
           throw new IOException("stream " + streamSc);
+        sessionOpened = true; // from here a resend would open a second session
         String loc = resp.headers().firstValue("location").orElse(null);
         if (loc == null) {
           Frame f = decodeFrame(ByteBuffer.wrap(resp.body()));
@@ -1005,6 +1025,7 @@ public class StreamLoad {
         last = e;
         // Count every failed connect/setup attempt (not only the final throw into error_count).
         if (!inTeardown.get()) consumerConnectRetries.incrementAndGet();
+        if (sessionOpened) break; // 201 already: never a second :stream (matches consumerLean)
         attempt++;
         if (attempt < 3 && !stop.get()) {
           try { Thread.sleep(20L << Math.min(attempt - 1, 6)); } catch (InterruptedException ie) {
@@ -1056,15 +1077,18 @@ public class StreamLoad {
       }
       if (sr == null) throw last != null ? last : new IOException("stream not opened");
       if (sr.status == 503) {
+        record503(false, sr.body);
         boolean retried = false;
         for (int n503 = 0; n503 < 15 && !w.hardStop.get(); n503++) {
           if (!sleep503(w.hardStop, sr.retryAfter, n503, 15)) break;
           // A 503 means no session was created; it is safe to POST :stream again.
           sr = lh.postOnce(lh.head("POST", spath, token, CT, CT, task.length), task);
           if (sr.status != 503) { retried = true; break; }
+          record503(false, sr.body);
         }
         if (sr.status == 503) {
           groupOpenRefusals.incrementAndGet();
+          HTTP503_STREAM_GIVEUPS.increment();
           note(inTeardown, measureErr, teardownErr, "consumer-stream-refused " + pool,
               new IOException("stream 503" + bodyDetail(sr.body)));
           return;
@@ -1263,6 +1287,20 @@ public class StreamLoad {
     if (attempt >= max || (stop != null && stop.get())) return false;
     Thread.sleep(retryAfterMs(retryAfter, 1000));
     return stop == null || !stop.get();
+  }
+
+  /** Record one HTTP 503 (retry or final). {@code claim} selects the claim vs :stream counter. */
+  static void record503(boolean claim, byte[] body) {
+    HTTP503_RESPONSES.increment();
+    (claim ? HTTP503_CLAIM : HTTP503_STREAM).increment();
+    if (body != null) {
+      String s = new String(body, java.nio.charset.StandardCharsets.UTF_8);
+      if (s.contains("ledger writer budget exhausted")) HTTP503_BUDGET.increment();
+    }
+  }
+
+  static void record503(boolean claim, String body) {
+    record503(claim, body == null ? null : body.getBytes(java.nio.charset.StandardCharsets.UTF_8));
   }
 
   static String header(HttpResponse<?> r, String name) {
@@ -1763,6 +1801,8 @@ public class StreamLoad {
     int[] streamToGroup; // measure-wave mapping stream index → group id
     String heapFlags;
     long bytes, creditStalls, requests, producerTransportRetries, consumerConnectRetries, refusedPerIp, openSessionsAfterDrain, groupOpenRefusals;
+    long http503Responses, http503ClaimResponses, http503StreamResponses, http503BudgetExhausted;
+    long http503ClaimGiveups, http503StreamGiveups;
     int maxConnectionsPerIp;
     double elapsedS, wallS, load1Pre, load1Post, mibS, stallPct, creditWaitTotal, clientCpuSec, clientCpuPctOfWall, serverCpuSec, serverCpuPctOfWall;
     Double p50, p90, p99, creditWaitP50, creditWaitP99;
@@ -1849,6 +1889,12 @@ public class StreamLoad {
       field(sb, "producer_transport_retries", producerTransportRetries, true);
       field(sb, "consumer_connect_retries", consumerConnectRetries, true);
       field(sb, "group_open_refusals", groupOpenRefusals, true);
+      field(sb, "http_503_responses", http503Responses, true);
+      field(sb, "http_503_claim_responses", http503ClaimResponses, true);
+      field(sb, "http_503_stream_responses", http503StreamResponses, true);
+      field(sb, "http_503_budget_exhausted", http503BudgetExhausted, true);
+      field(sb, "http_503_claim_giveups", http503ClaimGiveups, true);
+      field(sb, "http_503_stream_giveups", http503StreamGiveups, true);
       field(sb, "transport_retry_flag", transportRetryFlag, true);
       field(sb, "max_connections_per_ip", maxConnectionsPerIp, true);
       field(sb, "refused_per_ip", refusedPerIp, true);

@@ -39,9 +39,18 @@ Off-mode class-load proof (credit / StreamStats stay unloaded when credit is off
 
 ## Generator CPU / self_loaded (inceptor 2026-10-30 18:46)
 
-A window is **valid only if** the generator's CPU stays at or below **80% of its cores**
-(`self_loaded` when `client_cpu_pct_of_wall > 80 × gen_cores`, or `load1_post ≥ 4`).
-`window_valid.py` / `agg.py` recompute this from generator CPU and `load1_post` only (Q4: they do not OR StreamLoad's stale pre-drain `self_loaded` flag).
+A window is **valid only if** the generator's CPU stays at or below **80% of its cores**.
+In mode B (`GEN_PROCS>1`), a leg is **self_loaded** if **any** generator process is above
+80% of its own pinned core, **or** the summed generator CPU is above 80% × `GEN_CORES`
+(240% for three cores), or `load1_post ≥ 4`. `result.json` records `client_cpu_pct_per_proc`
+and the sum. `window_valid.py` / `agg.py` recompute this from those fields and `load1_post`
+(Q4: they do not OR StreamLoad's stale pre-drain `self_loaded` flag).
+
+HTTP 503s on claim / `:stream` (almost always `ledger writer budget exhausted`) are a
+first-class metric: `http_503_responses` (every 503, including retries),
+`http_503_claim_giveups` / `http_503_stream_giveups` (exhausted 15 retries),
+`http_503_budget_exhausted`. They are measure-only (reset after warmup) and are not a
+reason to raise the shipped writer budget or to cut the default 1000-stream floor.
 
 | Mode | Gen CPUs | Server CPUs | `GEN_CORES` | Sat limit |
 |------|----------|-------------|-------------|-----------|

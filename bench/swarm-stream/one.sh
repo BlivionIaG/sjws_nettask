@@ -38,6 +38,39 @@ _cpu_overlap() {
   done
   return 1
 }
+# Live Cpus_allowed_list for a pid (taskset -cp output after the colon).
+_live_cpus() {
+  taskset -cp "$1" 2>/dev/null | awk -F: '{gsub(/^ +/, "", $2); print $2}'
+  # empty if the pid is gone
+}
+# If the live server affinity overlaps any live generator, re-pin the server to SRV_CPUS (3-7).
+_repin_if_overlap() {
+  local gcpu scpu p overlapped=0
+  scpu=$(_live_cpus "$SPID")
+  [ -n "$scpu" ] || return 0
+  for p in "${GENPIDS[@]:-}"; do
+    gcpu=$(_live_cpus "$p")
+    [ -n "$gcpu" ] || continue
+    if _cpu_overlap "$gcpu" "$scpu"; then
+      echo "one.sh: LIVE OVERLAP server pid=$SPID ($scpu) gen pid=$p ($gcpu); re-pinning server to $SRV_CPUS" | tee -a "$WD/affinity.txt"
+      overlapped=1
+    fi
+  done
+  if [ "$overlapped" = 1 ]; then
+    taskset -cp "$SRV_CPUS" "$SPID" >/dev/null
+    echo "one.sh: server re-pinned requested=$SRV_CPUS live=$(_live_cpus "$SPID")" | tee -a "$WD/affinity.txt"
+    scpu=$(_live_cpus "$SPID")
+    for p in "${GENPIDS[@]:-}"; do
+      gcpu=$(_live_cpus "$p")
+      [ -n "$gcpu" ] || continue
+      if _cpu_overlap "$gcpu" "$scpu"; then
+        echo "one.sh: WARNING still overlapping after re-pin server=$scpu gen=$gcpu pid=$p" | tee -a "$WD/affinity.txt"
+      fi
+    done
+  else
+    echo "one.sh: affinity ok server=$scpu gens=${GENPIDS[*]:-} (no overlap with 0-2)" | tee -a "$WD/affinity.txt"
+  fi
+}
 if _cpu_overlap "$GEN_CPUS" "$SRV_CPUS"; then
   echo "one.sh: GEN_CPUS=$GEN_CPUS overlaps SRV_CPUS=$SRV_CPUS; moving the server off the generator cores" >&2
   _new=()
@@ -159,6 +192,9 @@ SPID=$!
 export SERVER_PID=$SPID
 # Own PIDs for foreign-CPU sampler (07:05 addendum): server + this one.sh shell.
 { echo "$$"; echo "$SPID"; } > "$WD/bench.pids"
+{
+  echo "one.sh: server pid=$SPID requested_pin=$SRV_CPUS live=$(_live_cpus "$SPID")"
+} | tee -a "$WD/affinity.txt"
 GENPIDS=()
 _SPACE_WATCH_PID=
 cleanup(){
@@ -263,6 +299,10 @@ if [ "$LOADGEN" = java ]; then
     GENPID=$_LAUNCHED_PID
     GENPIDS=("$GENPID")
     echo "$GENPID" >> "$WD/bench.pids"
+    {
+      echo "one.sh: gen-0 pid=$GENPID requested_pin=$GEN_CPUS live=$(_live_cpus "$GENPID")"
+    } | tee -a "$WD/affinity.txt"
+    _repin_if_overlap
     wait "$GENPID"
   else
     mapfile -t _gc < <(_expand_cpus "$GEN_CPUS")
@@ -287,7 +327,11 @@ if [ "$LOADGEN" = java ]; then
       echo "$GENPID" >> "$WD/bench.pids"
       PARTS+=("$outp")
       goff=$((goff + gp))
+      {
+        echo "one.sh: gen-$p pid=$GENPID requested_pin=$pin live=$(_live_cpus "$GENPID")"
+      } | tee -a "$WD/affinity.txt"
     done
+    _repin_if_overlap
     for GENPID in "${GENPIDS[@]}"; do
       wait "$GENPID" || rc=$?
     done

@@ -4,7 +4,7 @@
 Sums counters and bytes, merges LatBag sparse histograms and recomputes p50/p90/p99
 from the high edge (same as StreamLoad.LatBag.upper), sums generator CPU, and takes
 the last process's post-drain server counters. Sets gen_cores to the combined width
-(default 3) and recomputes self_loaded from the summed CPU.
+(default 3) and recomputes self_loaded: any process > 80% of its core, or sum > 80% × gen_cores.
 
 Usage: merge-gen.py PART.json... -o OUT.json [--gen-cores 3] [--secs 20]
 """
@@ -127,6 +127,11 @@ def merge(parts: list[dict], gen_cores: int, secs: float | None) -> dict:
     out["producer_transport_retries"] = int(sum_num(parts, "producer_transport_retries"))
     out["consumer_connect_retries"] = int(sum_num(parts, "consumer_connect_retries"))
     out["group_open_refusals"] = int(sum_num(parts, "group_open_refusals"))
+    for k in (
+        "http_503_responses", "http_503_claim_responses", "http_503_stream_responses",
+        "http_503_budget_exhausted", "http_503_claim_giveups", "http_503_stream_giveups",
+    ):
+        out[k] = int(sum_num(parts, k))
     out["sched_sends"] = int(sum_num(parts, "sched_sends"))
     out["sched_expected"] = int(sum_num(parts, "sched_expected"))
     out["sched_sent"] = int(sum_num(parts, "sched_sent"))
@@ -157,6 +162,14 @@ def merge(parts: list[dict], gen_cores: int, secs: float | None) -> dict:
     out["wall_s"] = max_num(parts, "wall_s", default=last.get("wall_s"))
     # CPU % of wall: sum of per-process percentages (each is cpu_sec/wall*100 of the same window).
     out["client_cpu_pct_of_wall"] = sum_num(parts, "client_cpu_pct_of_wall")
+    # Mode B (inceptor 2026-11-13 20:02): record per-process CPU and the sum. self_loaded
+    # if ANY process is above 80% of its own pinned core, OR the sum is above 80% × gen_cores.
+    per = []
+    for r in parts:
+        v = r.get("client_cpu_pct_of_wall")
+        per.append(None if v is None else float(v))
+    out["client_cpu_pct_per_proc"] = per
+    out["gen_procs"] = len(parts)
     out["gen_cores"] = gen_cores
     sat = 80.0 * gen_cores
     out["gen_sat_limit_pct"] = sat
@@ -165,8 +178,10 @@ def merge(parts: list[dict], gen_cores: int, secs: float | None) -> dict:
     out["load1_post"] = load1_post
     out["load1_pre"] = first_present(parts, "load1_pre")
     out["load1_peak"] = max_num(parts, "load1_peak")
-    gen_sat = cpu is not None and cpu > sat
-    out["generator_saturated"] = bool(gen_sat)
+    any_proc = any(c is not None and c > 80.0 for c in per)
+    gen_sat = bool((cpu is not None and cpu > sat) or any_proc)
+    out["generator_saturated"] = gen_sat
+    out["generator_saturated_any_proc"] = bool(any_proc)
     out["self_loaded"] = bool(gen_sat or (load1_post is not None and load1_post >= 4.0))
 
     out["mib_s"] = (out["bytes"] / (1024.0 * 1024.0)) / max(1e-6, secs)
