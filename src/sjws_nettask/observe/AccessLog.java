@@ -31,6 +31,7 @@ import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.Set;
 import java.util.concurrent.atomic.LongAdder;
@@ -71,11 +72,13 @@ final class AccessLog implements Runnable, AutoCloseable {
     private volatile boolean reopenRequested;
     private static final long REOPEN_CHECK_NANOS = 1_000_000_000L;
 
-    private static final Set<PosixFilePermission> FILE_0640 = EnumSet.of(PosixFilePermission.OWNER_READ,
-            PosixFilePermission.OWNER_WRITE, PosixFilePermission.GROUP_READ);
-    private static final Set<PosixFilePermission> DIR_0750 = EnumSet.of(PosixFilePermission.OWNER_READ,
-            PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE, PosixFilePermission.GROUP_READ,
-            PosixFilePermission.GROUP_EXECUTE);
+    /** 0640; unmodifiable so no caller can widen the shared mode. */
+    static final Set<PosixFilePermission> FILE_0640 = Collections.unmodifiableSet(EnumSet.of(
+            PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.GROUP_READ));
+    /** 0750; unmodifiable so no caller can widen the shared mode. */
+    static final Set<PosixFilePermission> DIR_0750 = Collections.unmodifiableSet(EnumSet.of(
+            PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE,
+            PosixFilePermission.GROUP_READ, PosixFilePermission.GROUP_EXECUTE));
 
     static AccessLog start(String target, AccessLogFormat format) throws IOException {
         if ("-".equals(target)) {
