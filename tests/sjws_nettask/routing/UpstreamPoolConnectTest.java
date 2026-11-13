@@ -24,7 +24,12 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URI;
+import java.nio.file.Files;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -72,5 +77,139 @@ class UpstreamPoolConnectTest {
             }
             assertEquals(0, pool.idleCount());
         }
+    }
+
+    /**
+     * Codex P2 on #475 (Security BLOCKER): interrupting or timing out a connecting acquire
+     * must cancel the connect and keep its max_connections slot until the channel closes.
+     * Releasing the slot on the request thread lets a second acquire start another socket
+     * while the first is still connecting.
+     */
+    @Test
+    @Timeout(30)
+    void interruptedConnectHoldsTheSlotUntilTheChannelCloses() throws Exception {
+        var admission = Admission.of(0, 1);
+        try (var server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+                var pool = new UpstreamPool(URI.create("http://127.0.0.1:" + server.getLocalPort() + "/"),
+                        Duration.ofSeconds(5), 4, new ByteBudget(1 << 20), admission)) {
+            var started = new CountDownLatch(1);
+            var interrupted = new CompletableFuture<Void>();
+            var first = Thread.ofPlatform().start(() -> {
+                try {
+                    started.countDown();
+                    pool.acquire();
+                    interrupted.completeExceptionally(new AssertionError("acquire should have been interrupted"));
+                } catch (InterruptedException e) {
+                    interrupted.complete(null);
+                } catch (Throwable e) {
+                    interrupted.completeExceptionally(e);
+                }
+            });
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            for (int i = 0; i < 50 && admission.connections() == 0; i++) {
+                Thread.sleep(10);
+            }
+            assertEquals(1, admission.connections());
+
+            // Park every event loop so Channel.close() cannot complete (and cannot release the
+            // slot) until we say so. Without the fix the slot is released on this thread anyway.
+            var resume = parkEventLoops();
+            try {
+                first.interrupt();
+                interrupted.get(5, TimeUnit.SECONDS);
+                assertEquals(1, admission.connections());
+                var stolen = admission.tryConnection();
+                if (stolen != null) {
+                    stolen.release();
+                    fail("the slot was released before the abandoned channel closed");
+                }
+            } finally {
+                resume.run();
+            }
+            for (int i = 0; i < 50 && admission.connections() > 0; i++) {
+                Thread.sleep(20);
+            }
+            assertEquals(0, admission.connections());
+        }
+    }
+
+    @Test
+    @Timeout(30)
+    void timedOutConnectHoldsTheSlotUntilTheChannelCloses() throws Exception {
+        var admission = Admission.of(0, 1);
+        try (var server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+                var pool = new UpstreamPool(URI.create("http://127.0.0.1:" + server.getLocalPort() + "/"),
+                        Duration.ofSeconds(5), 4, new ByteBudget(1 << 20), admission)) {
+            var started = new CountDownLatch(1);
+            var finished = new CompletableFuture<Throwable>();
+            Thread.ofPlatform().start(() -> {
+                try {
+                    started.countDown();
+                    pool.acquire(Duration.ofMillis(200));
+                    finished.complete(null);
+                } catch (Throwable e) {
+                    finished.complete(e);
+                }
+            });
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            for (int i = 0; i < 50 && admission.connections() == 0; i++) {
+                Thread.sleep(10);
+            }
+            assertEquals(1, admission.connections());
+
+            var resume = parkEventLoops();
+            try {
+                // The connect wait has timed out (or will within 200 ms) and close is queued
+                // behind the parked event loops. The slot must still be held.
+                for (int i = 0; i < 30 && !finished.isDone(); i++) {
+                    Thread.sleep(20);
+                }
+                assertEquals(1, admission.connections());
+                var stolen = admission.tryConnection();
+                if (stolen != null) {
+                    stolen.release();
+                    fail("the slot was released before the timed-out channel closed");
+                }
+                assertFalse(finished.isDone(), "acquire returned before the abandoned channel closed");
+            } finally {
+                resume.run();
+            }
+            var outcome = finished.get(5, TimeUnit.SECONDS);
+            assertInstanceOf(UpstreamPool.ConnectTimeout.class, outcome);
+            for (int i = 0; i < 50 && admission.connections() > 0; i++) {
+                Thread.sleep(20);
+            }
+            assertEquals(0, admission.connections());
+        }
+    }
+
+    /**
+     * Queues a parking task on every upstream event loop so close futures cannot complete
+     * until the returned runnable runs.
+     */
+    private static Runnable parkEventLoops() throws Exception {
+        var field = UpstreamPool.class.getDeclaredField("loops");
+        field.setAccessible(true);
+        var loops = (io.netty.channel.EventLoopGroup) field.get(null);
+        assertNotNull(loops);
+        var evs = new ArrayList<io.netty.util.concurrent.EventExecutor>();
+        loops.forEach(evs::add);
+        var parked = new CountDownLatch(evs.size());
+        var resume = new CountDownLatch(1);
+        for (var ev : evs) {
+            ev.execute(() -> {
+                parked.countDown();
+                try {
+                    resume.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+        if (!parked.await(5, TimeUnit.SECONDS)) {
+            resume.countDown();
+            fail("event loops did not park");
+        }
+        return resume::countDown;
     }
 }
