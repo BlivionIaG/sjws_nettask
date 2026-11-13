@@ -152,4 +152,22 @@ class ClusterViewTest {
         var screen = new AdminTui(control(ClusterViewTest::status), new LogBuffer(5), null, false).render();
         assertTrue(screen.contains("node gw-2 applied 6 DRIFT"), screen);
     }
+
+    @Test
+    void nodeIdsAreShownThroughPrintable() {
+        var id = "gw-\u202e2\u001b[31m";
+        var status = new ClusterStatus(7, 9.0, 2_000_000, 240, 6, 0, new ClusterStatus.Node[] {
+                node(id, true, true, false, 7, false) }, null, null);
+        var tui = new AdminTui(control(() -> status), new LogBuffer(5), null, false);
+        var statusScreen = tui.render();
+        assertTrue(statusScreen.contains("node " + AdminTui.printable(id) + " applied"), statusScreen);
+        assertFalse(statusScreen.contains("\u202e") || statusScreen.contains("\u001b"), statusScreen);
+
+        tui.handle("k");
+        tui.handle("node " + id);
+        var screen = tui.render();
+        assertTrue(screen.contains(AdminTui.printable(id)), screen);
+        assertTrue(screen.contains("Node " + AdminTui.printable(id) + ":"), screen);
+        assertFalse(screen.contains("\u202e") || screen.contains("\u001b"), screen);
+    }
 }

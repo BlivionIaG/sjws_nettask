@@ -149,4 +149,15 @@ class MetricsViewTest {
                 new Snapshot.Latency(0, 0, 0, BOUNDS, new long[BOUNDS.length]));
         assertTrue(MetricsView.render(s).contains("access log lines dropped 7"));
     }
+
+    @Test
+    void nodeIdsAreShownThroughPrintable() {
+        var id = "gw-\u202e1\u001b[31m";
+        var report = new MetricsView.Report(List.of(new MetricsView.Node(id, node(1, 0, 0, 0, "HTTP/1.1"))), 1);
+        var tui = new AdminTui(reporting(report), new LogBuffer(5), null, false);
+        tui.handle("g");
+        var screen = tui.render();
+        assertTrue(screen.contains("Node " + AdminTui.printable(id)), screen);
+        assertFalse(screen.contains("\u202e") || screen.contains("\u001b"), screen);
+    }
 }

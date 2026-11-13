@@ -92,7 +92,7 @@ public final class AdminTui {
             var id = line.trim().substring(4).trim();
             this.selectedNode = id.isEmpty() ? null : id;
             this.view = View.CLUSTER;
-            this.message = id.isEmpty() ? "node selection cleared" : "node " + id;
+            this.message = id.isEmpty() ? "node selection cleared" : "node " + printable(id);
             return true;
         }
         try {
@@ -121,7 +121,7 @@ public final class AdminTui {
                 case "q" -> {
                     return false;
                 }
-                default -> this.message = "unknown command '" + line.trim() + "' (h for help)";
+                default -> this.message = "unknown command '" + printable(line.trim()) + "' (h for help)";
             }
             if (cmd.equals("h") || cmd.equals("?")) {
                 this.message = "commands: s start, x stop, r reload, n drain, v/c/l/m/g/k status/config/logs/queues/metrics/cluster,"
@@ -195,7 +195,7 @@ public final class AdminTui {
             if (drain.state() == DrainOperation.State.RUNNING) {
                 sb.append(" since ").append(drain.startedAt());
             } else if (drain.error() != null) {
-                sb.append(" (").append(drain.error()).append(')');
+                sb.append(" (").append(printable(drain.error())).append(')');
             }
             sb.append('\n');
         }
@@ -204,7 +204,7 @@ public final class AdminTui {
             renderCluster(sb, cluster);
         }
         sb.append("Recent events:\n");
-        this.log.tail(5).forEach(l -> sb.append("  ").append(l).append('\n'));
+        this.log.tail(5).forEach(l -> sb.append("  ").append(printable(l)).append('\n'));
     }
 
     private void renderCluster(StringBuilder sb, ClusterStatus cluster) {
@@ -212,7 +212,7 @@ public final class AdminTui {
                 cluster.desiredVersion(), cluster.requestsPerSecond(), latency(cluster.p99Nanos()), cluster.errors(),
                 cluster.driftedNodes()));
         for (var node : cluster.nodes()) {
-            sb.append("  node ").append(node.nodeId()).append(" applied ").append(node.appliedVersion());
+            sb.append("  node ").append(printable(node.nodeId())).append(" applied ").append(node.appliedVersion());
             if (node.drifted()) {
                 sb.append(" DRIFT");
             }
@@ -332,7 +332,7 @@ public final class AdminTui {
                     report.nodes().stream().map(MetricsView.Node::snapshot).toList())));
         }
         for (var node : report.nodes()) {
-            sb.append(color(BOLD, "Node " + node.nodeId())).append('\n');
+            sb.append(color(BOLD, "Node " + printable(node.nodeId()))).append('\n');
             sb.append(MetricsView.render(node.snapshot()));
         }
     }
@@ -366,16 +366,16 @@ public final class AdminTui {
             if (node.nodeId().equals(this.selectedNode)) {
                 selected = n;
             }
-            sb.append(String.format(Locale.ROOT, "  %-16s %s %8d %9.1f %10s %7d  %s%n", node.nodeId(),
+            sb.append(String.format(Locale.ROOT, "  %-16s %s %8d %9.1f %10s %7d  %s%n", printable(node.nodeId()),
                     healthText(n.health()), node.appliedVersion(), node.requestsPerSecond(), latency(node.p99Nanos()),
                     node.errors(), n.summary()));
         }
         if (this.selectedNode == null) {
             sb.append("  node <id> shows one node's checks\n");
         } else if (selected == null) {
-            sb.append("  node ").append(this.selectedNode).append(" is not in the cluster status\n");
+            sb.append("  node ").append(printable(this.selectedNode)).append(" is not in the cluster status\n");
         } else {
-            sb.append(color(BOLD, "Node " + this.selectedNode)).append(": ").append(healthText(selected.health()))
+            sb.append(color(BOLD, "Node " + printable(this.selectedNode))).append(": ").append(healthText(selected.health()))
                     .append('\n');
             for (var check : selected.checks()) {
                 sb.append(check.ok() ? "  [ok]   " : "  [FAIL] ").append(check.name());
@@ -410,14 +410,14 @@ public final class AdminTui {
 
     private void renderLogs(StringBuilder sb) {
         sb.append("Admin events:\n");
-        this.log.tail(LOG_LINES).forEach(l -> sb.append("  ").append(l).append('\n'));
+        this.log.tail(LOG_LINES).forEach(l -> sb.append("  ").append(printable(l)).append('\n'));
         if (this.logFile != null) {
             sb.append("Tail of ").append(this.logFile).append(":\n");
             try {
                 LogBuffer.tailFile(this.logFile, LOG_LINES, FILE_TAIL_BYTES)
-                        .forEach(l -> sb.append("  ").append(l).append('\n'));
+                        .forEach(l -> sb.append("  ").append(printable(l)).append('\n'));
             } catch (IOException e) {
-                sb.append("  ").append(color(YELLOW, "cannot read: " + e.getMessage())).append('\n');
+                sb.append("  ").append(color(YELLOW, "cannot read: " + printable(String.valueOf(e.getMessage())))).append('\n');
             }
         }
     }
