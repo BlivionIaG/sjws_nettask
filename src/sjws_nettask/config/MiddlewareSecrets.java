@@ -26,9 +26,10 @@ import sjws_nettask.core.MiddlewareSpec;
 
 /**
  * Gateway filter options that carry shared credentials ({@code api-key} {@code keys}, {@code jwt}
- * {@code hmac-keys}). In a control-plane proposal those values must be node-local file references
- * ({@code keys-file}, {@code hmac-keys-file}); the canonical document, Raft log and signed snapshots
- * must not hold the secret bytes. Local (non-CP) config may still use the inline form.
+ * {@code hmac-keys}, {@code basic-auth} {@code users}). In a control-plane proposal those values
+ * must be node-local file references ({@code keys-file}, {@code hmac-keys-file}, {@code users-file});
+ * the canonical document, Raft log and signed snapshots must not hold the secret bytes. Local
+ * (non-CP) config may still use the inline form.
  * <p>
  * Error text never echoes a secret value. {@link #MASK} is the stand-in written by
  * {@link ConfigCodec#viewerText} and by {@link #maskYaml(String)} for viewer reads.
@@ -40,13 +41,13 @@ public final class MiddlewareSecrets {
     public static final String MASK = "***";
 
     /** Inline secret option names (kebab-case, matching the filter params). */
-    public static final Set<String> INLINE = Set.of("keys", "hmac-keys");
+    public static final Set<String> INLINE = Set.of("keys", "hmac-keys", "users");
 
     /** File-reference option names that replace the matching inline form. */
-    public static final Set<String> FILES = Set.of("keys-file", "hmac-keys-file");
+    public static final Set<String> FILES = Set.of("keys-file", "hmac-keys-file", "users-file");
 
     /** Filter names whose options may carry {@link #INLINE} secrets. */
-    public static final Set<String> SECRET_FILTERS = Set.of("api-key", "jwt");
+    public static final Set<String> SECRET_FILTERS = Set.of("api-key", "jwt", "basic-auth");
 
     /** Largest accepted secret file (same order as other SecureKeyFile caps). */
     public static final int MAX_FILE_BYTES = 1 << 16;
@@ -141,9 +142,10 @@ public final class MiddlewareSecrets {
 
     /**
      * Defence in depth for viewer reads of a stored canonical YAML: replace inline secret
-     * values only on {@link #SECRET_FILTERS} middleware entries ({@code api-key} / {@code jwt})
-     * under their {@code options} map. A messaging topic (or any other node) named
-     * {@code keys} / {@code hmac-keys} is left unchanged so the YAML stays valid. The secret
+     * values only on {@link #SECRET_FILTERS} middleware entries ({@code api-key} / {@code jwt} /
+     * {@code basic-auth}) under their {@code options} map. A messaging topic (or any other node)
+     * named {@code keys} / {@code hmac-keys} / {@code users} is left unchanged so the YAML stays
+     * valid. The secret
      * value is never copied into the result beyond the scan needed to find the colon.
      */
     public static String maskYaml(String yaml) {
@@ -310,7 +312,7 @@ public final class MiddlewareSecrets {
 
     /**
      * One WARN body covering applied, activated and last-good middleware that still hold inline
-     * {@code keys}/{@code hmac-keys}, or {@code null} when all three are clean. Never echoes a
+     * {@code keys}/{@code hmac-keys}/{@code users}, or {@code null} when all three are clean. Never echoes a
      * secret value, its length, or a hash. Points at {@link #ROTATION_DOC}.
      */
     public static String startupWarnMessage(List<MiddlewareSpec> applied, List<MiddlewareSpec> activated,
@@ -324,8 +326,9 @@ public final class MiddlewareSecrets {
         }
         return "control-plane config still holds inline gateway filter secrets in "
                 + String.join("; ", parts)
-                + "; move them to keys-file / hmac-keys-file, rotate the affected keys, then let a"
-                + " snapshot and compaction drop the old log entries — see " + ROTATION_DOC;
+                + "; move them to keys-file / hmac-keys-file / users-file, rotate the affected"
+                + " credentials, then let a snapshot and compaction drop the old log entries — see "
+                + ROTATION_DOC;
     }
 
     private static void appendSource(java.util.List<String> parts, String source, List<MiddlewareSpec> middleware) {

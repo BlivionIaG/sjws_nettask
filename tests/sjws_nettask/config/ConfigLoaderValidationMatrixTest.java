@@ -412,10 +412,17 @@ class ConfigLoaderValidationMatrixTest {
         assertNull(MiddlewareSecrets.maskYaml(null));
         assertEquals("", MiddlewareSecrets.maskYaml(""));
         assertTrue(MiddlewareSecrets.hasInline(Map.of("keys", "x")));
+        assertTrue(MiddlewareSecrets.hasInline(Map.of("users", "alice:secret")));
         assertFalse(MiddlewareSecrets.hasInline(Map.of("realm", "x")));
         assertFalse(MiddlewareSecrets.hasInline(null));
         assertNotNull(MiddlewareSecrets.refuseInline(List.of(
                 new sjws_nettask.core.MiddlewareSpec("api-key", 0, "*", Map.of("keys", "secret")))));
+        var basicRefused = MiddlewareSecrets.refuseInline(List.of(
+                new sjws_nettask.core.MiddlewareSpec("basic-auth", 0, "*", Map.of("users", "alice:secret"))));
+        assertNotNull(basicRefused);
+        assertTrue(basicRefused.contains("users-file"), basicRefused);
+        assertNull(MiddlewareSecrets.refuseInline(List.of(
+                new sjws_nettask.core.MiddlewareSpec("basic-auth", 0, "*", Map.of("users-file", "/etc/sjws/users")))));
         assertNull(MiddlewareSecrets.refuseInline(List.of(
                 new sjws_nettask.core.MiddlewareSpec("access-log", 0, "*", Map.of("format", "combined")))));
         assertNull(MiddlewareSecrets.refuseInline(null));
