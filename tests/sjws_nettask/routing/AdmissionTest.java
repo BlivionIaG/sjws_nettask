@@ -22,6 +22,7 @@ import com.sun.net.httpserver.HttpServer;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.time.Duration;
+import java.util.EnumSet;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -438,6 +439,31 @@ class AdmissionTest {
         this.release.countDown();
         assertEquals(200, held.get(8, TimeUnit.SECONDS).status());
         Body.discard(held.get().body());
+    }
+
+    @Test
+    void retryAfterADiscarded5xxWaitsForTheConnectionSlot() throws Exception {
+        var hits = new AtomicInteger();
+        var failBody = "f".repeat(8192).getBytes();
+        start(ex -> {
+            int n = hits.incrementAndGet();
+            if (n == 1) {
+                ex.sendResponseHeaders(503, failBody.length);
+                ex.getResponseBody().write(failBody);
+            } else {
+                var body = "ok".getBytes();
+                ex.sendResponseHeaders(200, body.length);
+                ex.getResponseBody().write(body);
+            }
+            ex.close();
+        });
+        var retry = new Resilience.Retry(1, EnumSet.of(Resilience.On.STATUS_503), 100);
+        this.proxy = new ProxyHandler(new ProxyHandler.Settings(base(), Duration.ofSeconds(2), Duration.ofSeconds(2),
+                1024, "http", null), ByteBudget.shared(), new Resilience(retry, null), Admission.of(0, 1));
+        var response = this.proxy.handle(new Request("GET", "/"));
+        assertEquals(200, response.status(), "the retry must not see a local 503 at the connection cap");
+        assertEquals("ok", ProxyHandlerTest.text(response));
+        assertEquals(2, hits.get());
     }
 
     @FunctionalInterface

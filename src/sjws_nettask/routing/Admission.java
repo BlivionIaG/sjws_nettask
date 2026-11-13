@@ -18,6 +18,8 @@ package sjws_nettask.routing;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.time.Duration;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Per-upstream {@code max_pending} / {@code max_connections} caps (design §13). Lock-free.
@@ -46,6 +48,19 @@ public final class Admission {
     private final int maxConnections;
     private final AtomicInteger pending = new AtomicInteger();
     private final AtomicInteger connections = new AtomicInteger();
+    /** Pools that share this cap; used to reclaim a sibling's idle socket (#508). */
+    private final CopyOnWriteArrayList<IdleReclaim> reclaimers = new CopyOnWriteArrayList<>();
+
+    /**
+     * An upstream pool that may close one idle keep-alive so a sibling can take the slot.
+     */
+    interface IdleReclaim {
+        /**
+         * Close one idle socket and wait until its connection slot is released, or until
+         * {@code timeout}. @return true if a slot was freed
+         */
+        boolean closeOneIdleAndAwait(Duration timeout) throws InterruptedException;
+    }
 
     private Admission(int maxPending, int maxConnections) {
         this.maxPending = maxPending;
@@ -106,5 +121,44 @@ public final class Admission {
 
     int connections() {
         return this.connections.get();
+    }
+
+    int maxConnections() {
+        return this.maxConnections;
+    }
+
+    boolean atConnectionCap() {
+        return this.maxConnections > 0 && this.connections.get() >= this.maxConnections;
+    }
+
+    void attach(IdleReclaim pool) {
+        if (pool != null && this.maxConnections > 0) {
+            this.reclaimers.addIfAbsent(pool);
+        }
+    }
+
+    void detach(IdleReclaim pool) {
+        this.reclaimers.remove(pool);
+    }
+
+    /**
+     * Close one idle keep-alive on a sibling pool and wait until a connection slot is
+     * free. No-op when the cap is unset or a slot is already free.
+     */
+    boolean reclaimIdle(IdleReclaim except, Duration timeout) throws InterruptedException {
+        if (!limitsConnections() || this.connections.get() < this.maxConnections) {
+            return this.maxConnections <= 0 || this.connections.get() < this.maxConnections;
+        }
+        Duration wait = timeout == null || timeout.isZero() || timeout.isNegative()
+                ? Duration.ofSeconds(2) : timeout;
+        for (var pool : this.reclaimers) {
+            if (pool == except) {
+                continue;
+            }
+            if (pool.closeOneIdleAndAwait(wait) && this.connections.get() < this.maxConnections) {
+                return true;
+            }
+        }
+        return this.connections.get() < this.maxConnections;
     }
 }

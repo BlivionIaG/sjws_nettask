@@ -57,7 +57,7 @@ import javax.net.ssl.SSLException;
  * One {@link Exchange} runs on a channel at a time; a channel goes back to the idle stack only
  * after its response ended cleanly with keep-alive.
  */
-final class UpstreamPool implements AutoCloseable {
+final class UpstreamPool implements AutoCloseable, Admission.IdleReclaim {
 
     /** No response head within the response timeout (a 504, never retried). */
     static final class HeadTimeout extends IOException {
@@ -110,6 +110,9 @@ final class UpstreamPool implements AutoCloseable {
     UpstreamPool(URI upstream, Duration connectTimeout, int maxIdle, ByteBudget budget, Admission admission) {
         this.budget = java.util.Objects.requireNonNull(budget);
         this.admission = admission;
+        if (admission != null) {
+            admission.attach(this);
+        }
         boolean tls = "https".equals(upstream.getScheme());
         this.host = upstream.getHost();
         this.port = upstream.getPort() > 0 ? upstream.getPort() : tls ? 443 : 80;
@@ -191,7 +194,13 @@ final class UpstreamPool implements AutoCloseable {
         if (this.admission != null && this.admission.limitsConnections()) {
             slot = this.admission.tryConnection();
             if (slot == null) {
-                throw new ConnectionLimit();
+                // An idle keep-alive on a sibling endpoint can hold the shared cap (#508).
+                if (this.admission.reclaimIdle(this, timeout == null ? this.connectTimeout : timeout)) {
+                    slot = this.admission.tryConnection();
+                }
+                if (slot == null) {
+                    throw new ConnectionLimit();
+                }
             }
         }
         Duration wait = timeout == null || timeout.isZero() || timeout.isNegative() ? this.connectTimeout : timeout;
@@ -313,6 +322,28 @@ final class UpstreamPool implements AutoCloseable {
         return this.idle.size();
     }
 
+    @Override
+    public boolean closeOneIdleAndAwait(Duration timeout) throws InterruptedException {
+        var ch = this.idle.pollFirst();
+        if (ch == null) {
+            return false;
+        }
+        int before = this.admission == null ? 0 : this.admission.connections();
+        ch.close();
+        long waitMs = timeout == null || timeout.isZero() || timeout.isNegative()
+                ? 2000 : Math.max(1, timeout.toMillis());
+        long start = System.nanoTime();
+        ch.closeFuture().await(waitMs, TimeUnit.MILLISECONDS);
+        if (this.admission == null) {
+            return true;
+        }
+        while (this.admission.connections() >= before
+                && TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start) < waitMs) {
+            Thread.sleep(1);
+        }
+        return this.admission.connections() < before;
+    }
+
     /**
      * Stops keeping connections: idle ones close now and each exchange in flight closes its own when
      * it ends. New exchanges still connect. For an endpoint that left the set, so its idle sockets do
@@ -332,6 +363,9 @@ final class UpstreamPool implements AutoCloseable {
             return;
         }
         this.closed = true;
+        if (this.admission != null) {
+            this.admission.detach(this);
+        }
         for (var ch = this.idle.pollFirst(); ch != null; ch = this.idle.pollFirst()) {
             ch.close();
         }

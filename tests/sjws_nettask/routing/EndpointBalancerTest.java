@@ -761,6 +761,40 @@ class EndpointBalancerTest {
     }
 
     @Test
+    void atTheConnectionCapACompletedRequestPrefersAWarmIdleEndpoint() throws Exception {
+        var admission = Admission.of(0, 1);
+        var src = new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1), ep(1, 1)));
+        var b = balancer(src, null, null, Duration.ofSeconds(10), admission);
+        assertEquals("a", body(b.handle(new Request("GET", "/"))));
+        assertEquals(1, this.hits[0].get());
+        assertEquals(0, this.hits[1].get());
+        assertEquals(1, admission.connections());
+        // RR would otherwise select B, whose pool has no socket and cannot take the cap.
+        var again = b.handle(new Request("GET", "/"));
+        assertEquals(200, again.status());
+        assertEquals("a", body(again));
+        assertEquals(2, this.hits[0].get(), "the idle keep-alive on A must be reused");
+        assertEquals(0, this.hits[1].get());
+    }
+
+    @Test
+    void atTheConnectionCapASuspectEndpointsIdleIsReclaimedForAHealthyOne() throws Exception {
+        var admission = Admission.of(0, 1);
+        var src = new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1), ep(1, 1)));
+        var b = balancer(src, null, null, Duration.ofSeconds(10), admission);
+        assertEquals("a", body(b.handle(new Request("GET", "/"))));
+        assertEquals(1, admission.connections());
+        var suspectA = new Endpoint(null, "127.0.0.1", this.servers.get(0).getAddress().getPort(), 1, null,
+                Health.SUSPECT, null);
+        assertTrue(src.update(set(2, LbPolicy.ROUND_ROBIN, suspectA, ep(1, 1))));
+        var again = b.handle(new Request("GET", "/"));
+        assertEquals(200, again.status(), "B must get a slot after A's idle is reclaimed, not a local 503");
+        assertEquals("b", body(again));
+        assertEquals(1, this.hits[0].get());
+        assertEquals(1, this.hits[1].get());
+    }
+
+    @Test
     void publicConstructorHasNoAdmission() {
         EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
                 URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http",

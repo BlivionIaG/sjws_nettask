@@ -442,7 +442,7 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                     return ProxyHandler.withPending(out, hold);
                 }
                 if (response != null) {
-                    Body.discard(response.body());
+                    ProxyHandler.discardForRetry(response, pool.proxy.settings().connectTimeout());
                 }
                 tried[tries++] = i;
             }
@@ -460,6 +460,14 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
     int pick(View v, int[] tried, int nTried, long now) {
         int n = v.pools.length;
         boolean panic = (long) this.ejected.get() * 100 > (long) this.outlier.maxEjectionPercent() * n;
+        // At the shared connection cap, prefer a usable endpoint that already has an idle
+        // socket so we reuse it instead of refusing a request that selected a cold one (#508).
+        if (this.admission != null && this.admission.atConnectionCap()) {
+            int warm = pickWarmIdle(v, tried, nTried, now, panic);
+            if (warm >= 0) {
+                return warm;
+            }
+        }
         int draws = Math.min(n, 4);
         for (int d = 0; d < draws; d++) {
             int i = policyPick(v);
@@ -488,6 +496,24 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
             return -1; // probes own recovery; do not send client traffic as a half-open probe
         }
         return policyPick(v); // everything ejected and below the panic line: still answer
+    }
+
+    /**
+     * A weighted, usable endpoint that already holds an idle keep-alive. Weight-0 / SUSPECT
+     * endpoints are skipped so their idle sockets can be reclaimed for a healthy one.
+     */
+    private int pickWarmIdle(View v, int[] tried, int nTried, long now, boolean panic) {
+        int n = v.pools.length;
+        int start = ThreadLocalRandom.current().nextInt(n);
+        for (int k = 0; k < n; k++) {
+            int i = (start + k) % n;
+            boolean weighted = v.set.endpointAt(i).effectiveWeight() > 0 || v.positive.length == n;
+            if (weighted && !contains(tried, nTried, i) && clientMayUse(v.pools[i], now, panic)
+                    && v.pools[i].proxy.idleConnections() > 0) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     /**
