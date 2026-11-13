@@ -45,10 +45,15 @@ A window is **valid only if** the generator's CPU stays at or below **80% of its
 
 | Mode | Gen CPUs | Server CPUs | `GEN_CORES` | Sat limit |
 |------|----------|-------------|-------------|-----------|
-| (A) default | `0-1` | `2-7` | 2 | 160% of wall |
-| (B) fallback (pre-approved if (A) cannot unsat 1k) | `0-2` (multi-process OK) | `3-7` | 3 | 240% of wall |
+| (A) default | `0-1` (`GEN_PROCS=1`) | `3-7` | 2 | 160% of wall |
+| (B) fallback (pre-approved if (A) cannot unsat 1k) | `0-2` (`GEN_PROCS=3`) | `3-7` | 3 | 240% of wall |
 
 (B) is a **disclosed rule change** for #299 / this gate when used. Thresholds (§13) unchanged.
+`one.sh` starts `GEN_PROCS` StreamLoad processes, each pinned to one of `GEN_CPUS`, with
+`streams/n`, `rate/n` and disjoint `--group-offset` ranges; `merge-gen.py` merges their
+`result.json` (histograms combined at LatBag high edges, generator CPU summed, server CPU
+taken from the last process only). The server pin is `3-7` so it never shares a core with
+(B)'s 0-2 (the previous `2-7` default overlapped core 2). A leftover overlap is auto-shifted.
 `StreamLoad` lean keep-alive HTTP/1.1 POST (`--lean-http`, default on) is harness-only.
 
 

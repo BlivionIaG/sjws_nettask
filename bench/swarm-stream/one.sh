@@ -5,7 +5,10 @@ JAR=$1; WD=$2; ACCEPT=$3; OUT=$4; SECS=${5:-20}; STREAMS=${6:-1000}
 GATE_GROUPS=${GATE_GROUPS:-$STREAMS}  # Architecture 2026-10-30 15:13; gate default 64
 GEN_CPUS=${GEN_CPUS:-0-1}             # inceptor 2026-10-30 18:46 (A)=0-1; (B)=0-2
 GEN_CORES=${GEN_CORES:-2}             # width of GEN_CPUS; sat limit = 80% × GEN_CORES
-SRV_CPUS=${SRV_CPUS:-2-7}             # (B) fallback 3-7
+# Default 3-7: mode B (gen 0-2) must not share a core with the server. Mode A (0-1) is
+# also disjoint. The previous default 2-7 overlapped core 2 with (B).
+SRV_CPUS=${SRV_CPUS:-3-7}
+GEN_PROCS=${GEN_PROCS:-1}             # (B): n StreamLoad processes on GEN_CPUS, then merge-gen.py
 HEAP_FLAGS=${HEAP:--Xms2g -Xmx2g}
 HEAP=$HEAP_FLAGS
 export HEAP
@@ -13,6 +16,56 @@ WARMUP=${WARMUP:-5}
 NAGENTS=${NAGENTS:-20}
 export JAVA_HOME=${JAVA_HOME:-$HOME/jdk25/jdk-25.0.4.1+1}
 export PATH=$JAVA_HOME/bin:${PATH:-}
+# Expand a taskset list (0-2,4) to one cpu per line.
+_expand_cpus() {
+  local part a b i
+  local IFS=','
+  for part in $1; do
+    if [[ "$part" == *-* ]]; then
+      a=${part%-*}; b=${part#*-}
+      for ((i=a; i<=b; i++)); do printf '%s\n' "$i"; done
+    else
+      printf '%s\n' "$part"
+    fi
+  done
+}
+_cpu_overlap() {
+  local x y
+  for x in $(_expand_cpus "$1"); do
+    for y in $(_expand_cpus "$2"); do
+      [ "$x" = "$y" ] && return 0
+    done
+  done
+  return 1
+}
+if _cpu_overlap "$GEN_CPUS" "$SRV_CPUS"; then
+  echo "one.sh: GEN_CPUS=$GEN_CPUS overlaps SRV_CPUS=$SRV_CPUS; moving the server off the generator cores" >&2
+  _new=()
+  for i in 0 1 2 3 4 5 6 7; do
+    _skip=0
+    for x in $(_expand_cpus "$GEN_CPUS"); do
+      [ "$i" = "$x" ] && _skip=1 && break
+    done
+    [ "$_skip" = 0 ] && _new+=("$i")
+  done
+  if [ ${#_new[@]} -eq 0 ]; then
+    echo "one.sh: no remaining cores for the server after GEN_CPUS=$GEN_CPUS" >&2
+    exit 2
+  fi
+  IFS=,
+  SRV_CPUS="${_new[*]}"
+  unset IFS
+  echo "one.sh: SRV_CPUS now $SRV_CPUS" >&2
+fi
+if [ "${GEN_PROCS:-1}" -gt 1 ]; then
+  mapfile -t _gc < <(_expand_cpus "$GEN_CPUS")
+  if [ ${#_gc[@]} -lt 1 ]; then
+    echo "one.sh: GEN_CPUS=$GEN_CPUS is empty" >&2
+    exit 2
+  fi
+  GEN_CORES=${#_gc[@]}
+fi
+
 # Thin jar: maven-jar-plugin writes Class-Path: lib/... relative to the jar,
 # and maven-dependency-plugin copies runtime deps to target/lib at package.
 # Launching a copied jar without that sibling lib/ fails in ConfigLoader
@@ -108,19 +161,72 @@ if [ "$LOADGEN" = java ]; then
   if [ -n "${HANG_EVERY:-}" ]; then GEN_EXTRA+=(--hang-every "$HANG_EVERY"); fi
   # #415/#414: optional generator JVM flags (e.g. JFR on the generator to find its own hot spots).
   read -r -a GEN_JAVA_ARGS <<< "${GEN_JAVA_OPTS:-}"
-  taskset -c "$GEN_CPUS" nice -n 10 java "${GEN_JAVA_ARGS[@]}" "$HERE_DIR/StreamLoad.java" \
-    --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
-    --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$STREAMS" \
-    --groups "$GATE_GROUPS" \
-    --gen-cores "$GEN_CORES" \
-    ${LEAN_HTTP_FLAG:-} \
-    --out "$OUT" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}" \
-    --server-pid "$SPID" \
-    --max-connections-per-ip "${GATE_MAX_CONN_PER_IP:-4096}" \
-    "${GEN_EXTRA[@]}" &
-  GENPID=$!
-  echo "$GENPID" >> "$WD/bench.pids"
-  wait "$GENPID"
+  # Launch one StreamLoad: _launch_streamload <pin> <streams> <groups> <group_offset> <rate_or_empty> <out>
+  _launch_streamload() {
+    local pin=$1 sp=$2 gp=$3 goff=$4 rate=$5 outp=$6
+    local extra=("${GEN_EXTRA[@]}")
+    # Replace a pre-set --rate-mib-s with this process's share, if any.
+    local i
+    for i in "${!extra[@]}"; do
+      if [ "${extra[$i]}" = "--rate-mib-s" ]; then
+        if [ -n "$rate" ]; then extra[$((i+1))]="$rate"; else unset "extra[$i]" "extra[$((i+1))]"; fi
+      fi
+    done
+    if [ -n "$rate" ] && [[ ! " ${extra[*]} " =~ " --rate-mib-s " ]]; then
+      extra+=(--rate-mib-s "$rate")
+    fi
+    # Per-process --gen-cores 1 (its pin is one core); merge-gen.py sets the combined width.
+    local gcores=1
+    [ "${GEN_PROCS:-1}" -le 1 ] && gcores="$GEN_CORES"
+    taskset -c "$pin" nice -n 10 java "${GEN_JAVA_ARGS[@]}" "$HERE_DIR/StreamLoad.java" \
+      --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
+      --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$sp" \
+      --groups "$gp" --group-offset "$goff" \
+      --gen-cores "$gcores" \
+      ${LEAN_HTTP_FLAG:-} \
+      --out "$outp" --drain-timeout "$DRAIN_TIMEOUT" --window "${WINDOW:-8}" \
+      --server-pid "$SPID" \
+      --max-connections-per-ip "${GATE_MAX_CONN_PER_IP:-4096}" \
+      "${extra[@]}" &
+    _LAUNCHED_PID=$!
+  }
+  GENPIDS=()
+  if [ "${GEN_PROCS:-1}" -le 1 ]; then
+    _launch_streamload "$GEN_CPUS" "$STREAMS" "$GATE_GROUPS" 0 "${RATE_MIB_S:-}" "$OUT"
+    GENPID=$_LAUNCHED_PID
+    GENPIDS=("$GENPID")
+    echo "$GENPID" >> "$WD/bench.pids"
+    wait "$GENPID"
+  else
+    mapfile -t _gc < <(_expand_cpus "$GEN_CPUS")
+    leftover_s=$STREAMS leftover_g=$GATE_GROUPS goff=0
+    rc=0
+    PARTS=()
+    for ((p=0; p<GEN_PROCS; p++)); do
+      np=$((GEN_PROCS - p))
+      sp=$(( (leftover_s + np - 1) / np ))
+      leftover_s=$((leftover_s - sp))
+      gp=$(( (leftover_g + np - 1) / np ))
+      leftover_g=$((leftover_g - gp))
+      pin=${_gc[$((p % ${#_gc[@]}))]}
+      outp="$WD/gen-$p.json"
+      rate=""
+      if [ -n "${RATE_MIB_S:-}" ]; then
+        rate=$(python3 -c "print($RATE_MIB_S * $sp / $STREAMS)")
+      fi
+      _launch_streamload "$pin" "$sp" "$gp" "$goff" "$rate" "$outp"
+      GENPID=$_LAUNCHED_PID
+      GENPIDS+=("$GENPID")
+      echo "$GENPID" >> "$WD/bench.pids"
+      PARTS+=("$outp")
+      goff=$((goff + gp))
+    done
+    for GENPID in "${GENPIDS[@]}"; do
+      wait "$GENPID" || rc=$?
+    done
+    python3 "$HERE_DIR/merge-gen.py" "${PARTS[@]}" -o "$OUT" --gen-cores "$GEN_CORES" --secs "$SECS"
+    [ "$rc" -eq 0 ] || echo "one.sh: a generator process exited $rc (merged $OUT anyway)" >&2
+  fi
 else
   export PYTHONPATH="$(cd "$(dirname "$0")/../.." && pwd)/sdk/python${PYTHONPATH:+:$PYTHONPATH}"
   DRAIN_TIMEOUT=${DRAIN_TIMEOUT:-75}
