@@ -170,6 +170,15 @@ final class UpstreamPool implements AutoCloseable {
 
     /** @return a pooled channel if one is open, else a new connection; {@code reused} says which */
     Lease acquire() throws IOException, InterruptedException {
+        return acquire(this.connectTimeout);
+    }
+
+    /**
+     * Like {@link #acquire()}, but the new-connect wait is bounded by {@code timeout}
+     * (a shorter active-health probe deadline). Idle sockets are returned unchanged.
+     * A timed-out connect is cancelled so it does not keep a socket in flight.
+     */
+    Lease acquire(Duration timeout) throws IOException, InterruptedException {
         if (this.closed) {
             throw new IOException("upstream pool closed");
         }
@@ -185,16 +194,33 @@ final class UpstreamPool implements AutoCloseable {
                 throw new ConnectionLimit();
             }
         }
+        Duration wait = timeout == null || timeout.isZero() || timeout.isNegative() ? this.connectTimeout : timeout;
+        long waitMs = wait.equals(this.connectTimeout)
+                ? this.connectTimeout.toMillis() + 1000
+                : Math.max(1, wait.toMillis());
         var connected = new CompletableFuture<Channel>();
-        this.bootstrap.connect(this.host, this.port).addListener(f -> {
+        var future = this.bootstrap.connect(this.host, this.port);
+        future.addListener(f -> {
             if (f.isSuccess()) {
                 connected.complete(((io.netty.channel.ChannelFuture) f).channel());
-            } else {
+            } else if (f.cause() != null) {
                 connected.completeExceptionally(f.cause());
+            } else {
+                connected.completeExceptionally(new java.nio.channels.ClosedChannelException());
             }
         });
+        // Hold the slot until the channel actually closes, including when the wait is
+        // interrupted or times out while the socket is still connecting (Codex P2 on #475).
+        if (slot != null) {
+            var ch = future.channel();
+            if (ch != null) {
+                var held = slot;
+                ch.closeFuture().addListener(f -> held.release());
+                slot = null;
+            }
+        }
         try {
-            var ch = connected.get(this.connectTimeout.toMillis() + 1000, TimeUnit.MILLISECONDS);
+            var ch = connected.get(waitMs, TimeUnit.MILLISECONDS);
             if (slot != null) {
                 var held = slot;
                 ch.closeFuture().addListener(f -> held.release());
@@ -202,36 +228,53 @@ final class UpstreamPool implements AutoCloseable {
             }
             return new Lease(ch, false);
         } catch (TimeoutException e) {
-            connected.whenComplete((ch, err) -> {
-                if (ch != null) {
-                    ch.close();
-                }
-            });
-            if (slot != null) {
-                slot.release();
-                slot = null;
-            }
+            abandonConnect(future);
+            awaitAbandonedSlot(future, slot);
             throw new ConnectTimeout("connect to " + this.host + ":" + this.port + " timed out");
-        } catch (ExecutionException e) {
+        } catch (InterruptedException e) {
+            // Cancel and close; keep the slot on closeFuture until the socket is gone so
+            // repeated resets cannot start more connects than max_connections.
+            abandonConnect(future);
             if (slot != null) {
                 slot.release();
-                slot = null;
             }
+            throw e;
+        } catch (ExecutionException e) {
+            abandonConnect(future);
+            awaitAbandonedSlot(future, slot);
             var cause = e.getCause();
             if (cause instanceof io.netty.channel.ConnectTimeoutException) {
                 throw new ConnectTimeout(cause.getMessage());
             }
             throw new ConnectFailed("connect to " + this.host + ":" + this.port + ": " + cause, cause);
-        } catch (InterruptedException e) {
-            connected.whenComplete((ch, err) -> {
-                if (ch != null) {
-                    ch.close();
-                }
-            });
-            if (slot != null) {
-                slot.release();
+        }
+    }
+
+    /** Waits for an abandoned connect's slot to free so a retry sees an accurate cap. */
+    private void awaitAbandonedSlot(io.netty.channel.ChannelFuture future, Admission.Hold slot) {
+        var ch = future.channel();
+        if (ch != null) {
+            try {
+                ch.closeFuture().await(Math.max(1, this.connectTimeout.toMillis()), TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
-            throw e;
+        }
+        if (slot != null) {
+            slot.release();
+        }
+    }
+
+    /**
+     * Gives up on a connect nobody will wait for: cancels it and closes its channel, also when the
+     * connect still completes after the cancel (the listener closes a late success).
+     */
+    private static void abandonConnect(io.netty.channel.ChannelFuture future) {
+        future.cancel(true);
+        future.addListener(f -> future.channel().close());
+        var ch = future.channel();
+        if (ch != null) {
+            ch.close();
         }
     }
 

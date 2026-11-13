@@ -35,7 +35,9 @@ import sjws_nettask.SjwsServer;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.StaticFileHandler;
+import sjws_nettask.routing.ActiveHealth;
 import sjws_nettask.routing.Cidr;
+import sjws_nettask.routing.EndpointBalancer;
 import sjws_nettask.routing.Router;
 
 class RoutingCompilerTest {
@@ -249,5 +251,44 @@ class RoutingCompilerTest {
 
     private static HttpResponse<String> get(HttpClient client, String url) throws IOException, InterruptedException {
         return client.send(HttpRequest.newBuilder(URI.create(url)).build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    @Test
+    void wiresActiveHealthOntoTheBalancer() throws IOException {
+        var on = load("""
+                routing:
+                  enabled: true
+                  upstreams:
+                    api:
+                      endpoints: ["http://127.0.0.1:9"]
+                      active_health: {}
+                  routes:
+                    - { prefix: /, proxy: api }
+                """);
+        var router = RoutingCompiler.compile(on.document().routing(), null);
+        try {
+            var b = assertInstanceOf(EndpointBalancer.class, router.routes().get(0).handler());
+            assertTrue(b.hasActiveProbes());
+            assertEquals(ActiveHealth.DEFAULT, b.activeHealth());
+        } finally {
+            router.close();
+        }
+        var off = load("""
+                routing:
+                  enabled: true
+                  upstreams:
+                    api:
+                      endpoints: ["http://127.0.0.1:9"]
+                  routes:
+                    - { prefix: /, proxy: api }
+                """);
+        var plain = RoutingCompiler.compile(off.document().routing(), null);
+        try {
+            var b = assertInstanceOf(EndpointBalancer.class, plain.routes().get(0).handler());
+            assertFalse(b.hasActiveProbes());
+            assertNull(b.activeHealth());
+        } finally {
+            plain.close();
+        }
     }
 }

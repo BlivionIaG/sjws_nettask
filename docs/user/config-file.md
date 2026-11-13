@@ -555,6 +555,7 @@ upstreams:
     lb: weighted_random            # default; round_robin | least_request
     retry: { attempts: 2 }         # a retry goes to a different endpoint
     circuit: { failures: 5, eject_for: 10s, error_rate: 50%, min_requests: 20, window: 10s, max_ejection: 50% }  # defaults
+    # active_health: { path: /, method: HEAD, interval: 10s, eject_interval: 2s, timeout: 1s }  # off unless present
 ```
 
 All endpoints share one scheme and path (no query, fragment or userinfo); up to 1024, default
@@ -566,9 +567,21 @@ always on with the defaults above, per endpoint, per attempt: an endpoint is eje
 `error_rate` or more. It comes back after `eject_for` through one probe, doubling on each repeat
 (up to 32×). If more than `max_ejection` of the endpoints are ejected, the balancer ignores ejection
 ("panic") and spreads over all of them. When every endpoint is ejected or tried, the request still
-goes somewhere rather than failing fast. The endpoint list can be replaced at run time by the
-control plane (see `docs/ha/discovery.md`); a reload keeps a list the control plane has set.
-A plain `url` upstream is unchanged and pays nothing for this.
+goes somewhere rather than failing fast, unless `active_health` is on (see below). The endpoint list
+can be replaced at run time by the control plane (see `docs/ha/discovery.md`); a reload keeps a list
+the control plane has set. A plain `url` upstream is unchanged and pays nothing for this.
+
+`active_health` is optional and only valid with `endpoints`. Off unless the block is present
+(`active_health: {}` uses the defaults). The balancer then sends a synthetic `GET` or `HEAD`
+(`method`, default `HEAD`) to `path` (an origin-form target, default `/`, not prefixed with the
+upstream path). 2xx is success; any other status, a timeout or a connect failure is a failure.
+Probes use the same per-endpoint circuit as client traffic and share its one half-open slot:
+`interval` (default 10s) while the endpoint is in rotation, `eject_interval` (default 2s) after
+`eject_for` while it is ejected, `timeout` (default 1s) for connect and the response head. With
+`active_health` on, a client request is not used as a probe; ejected endpoints stay out of rotation
+until a probe succeeds, and if every endpoint is ejected and the balancer is not in panic the
+request is 503 with `Retry-After`. Unset means no probe threads, timers or allocations. Probe
+results stay on the node and are never pushed to the control plane.
 
 `trusted_proxies` is a list of IP or CIDR literals (no DNS).
 

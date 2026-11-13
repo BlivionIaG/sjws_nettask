@@ -54,12 +54,21 @@ class EndpointBalancerTest {
     private final List<EndpointBalancer> balancers = new ArrayList<>();
     /** Answers its name; a name in {@code failing} answers 503. */
     private final java.util.Set<String> failing = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicInteger[] hits = {
+        new java.util.concurrent.atomic.AtomicInteger(), new java.util.concurrent.atomic.AtomicInteger(),
+        new java.util.concurrent.atomic.AtomicInteger()
+    };
 
     @BeforeEach
     void start() throws Exception {
+        for (var h : this.hits) {
+            h.set(0);
+        }
         for (var name : List.of("a", "b", "c")) {
+            int idx = this.servers.size();
             var s = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
             s.createContext("/", ex -> {
+                this.hits[idx].incrementAndGet();
                 boolean fail = this.failing.contains(name);
                 var body = name.getBytes(StandardCharsets.UTF_8);
                 ex.sendResponseHeaders(fail ? 503 : 200, body.length);
@@ -93,17 +102,31 @@ class EndpointBalancerTest {
 
     private EndpointBalancer balancer(StaticUpstreamSource src, Resilience.Retry retry, EndpointBalancer.Outlier o,
             Duration grace) {
-        return balancer(src, retry, o, grace, null);
+        return balancerWith(src, retry, o, grace, null, null);
     }
 
     private EndpointBalancer balancer(StaticUpstreamSource src, Resilience.Retry retry, EndpointBalancer.Outlier o,
             Duration grace, Admission admission) {
+        return balancerWith(src, retry, o, grace, admission, null);
+    }
+
+    private EndpointBalancer balancer(StaticUpstreamSource src, Resilience.Retry retry, EndpointBalancer.Outlier o,
+            Duration grace, ActiveHealth health) {
+        return balancerWith(src, retry, o, grace, null, health);
+    }
+
+    private EndpointBalancer balancerWith(StaticUpstreamSource src, Resilience.Retry retry, EndpointBalancer.Outlier o,
+            Duration grace, Admission admission, ActiveHealth health) {
         EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
                 URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http",
                 null), ByteBudget.shared(), null, admission);
-        var b = new EndpointBalancer(src, pools, retry, o, grace, this.now::get, admission);
+        var b = new EndpointBalancer(src, pools, retry, o, grace, this.now::get, admission, health, false);
         this.balancers.add(b);
         return b;
+    }
+
+    private static ActiveHealth testHealth() {
+        return new ActiveHealth("/", "GET", Duration.ofSeconds(10), Duration.ofMillis(1), Duration.ofSeconds(1));
     }
 
     private EndpointBalancer balancer(UpstreamSet initial) {
@@ -433,8 +456,128 @@ class EndpointBalancerTest {
         assertTrue(cleared && live == 0, "retained " + live + " / 10000 local-refusal responses");
     }
 
+    @Test
+    void hasActiveProbesOnlyWhenConfigured() {
+        var b = balancer(set(1, null, ep(0, 1)));
+        assertFalse(b.hasActiveProbes());
+        assertNull(b.activeHealth());
+    }
 
+    @Test
+    void ejectedEndpointRecoversViaActiveProbeWithoutClientTraffic() {
+        var o = new EndpointBalancer.Outlier(3, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(1), 100);
+        var b = balancer(new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1), ep(1, 1))), null, o,
+                Duration.ZERO, testHealth());
+        assertTrue(b.hasActiveProbes());
+        this.failing.add("a");
+        var counts = spread(b, 60);
+        assertTrue(counts.getOrDefault("status503", 0) <= 3, counts.toString());
+        assertEquals(1, b.ejectedCount());
+        int hitsA = this.hits[0].get();
+        this.now.addAndGet(2_000_000_000L); // eject_for elapsed: clients still must not probe
+        var after = spread(b, 40);
+        assertNull(after.get("a"), after.toString());
+        assertEquals(0, after.getOrDefault("status503", 0));
+        assertEquals(hitsA, this.hits[0].get(), "client traffic must not be used as a probe");
+        assertEquals(1, b.ejectedCount());
+        this.failing.clear();
+        b.probeTick();
+        assertEquals(hitsA + 1, this.hits[0].get());
+        assertFalse(b.poolOf(ep(0, 1).authority()).health.ejected());
+        assertEquals(0, b.ejectedCount());
+        assertTrue(spread(b, 60).getOrDefault("a", 0) > 5);
+    }
 
+    @Test
+    void failedActiveProbeReEjectsWithBackoff() {
+        var o = new EndpointBalancer.Outlier(3, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(1), 100);
+        var b = balancer(new StaticUpstreamSource(set(1, null, ep(0, 1), ep(1, 1))), null, o, Duration.ZERO,
+                testHealth());
+        this.failing.add("a");
+        spread(b, 60);
+        var pool = b.poolOf(ep(0, 1).authority());
+        assertTrue(pool.health.ejected());
+        this.now.addAndGet(1_100_000_000L);
+        b.probeTick();
+        assertTrue(pool.health.ejected());
+        int sent = b.probesSent();
+        this.now.addAndGet(1_100_000_000L); // only one eject_for: still in the doubled window
+        b.probeTick();
+        assertEquals(sent, b.probesSent());
+        this.failing.clear();
+        this.now.addAndGet(1_100_000_000L);
+        b.probeTick();
+        assertFalse(pool.health.ejected());
+        assertEquals(0, b.ejectedCount());
+    }
+
+    @Test
+    void allEjectedWithoutPanicIs503WhenActiveHealthIsOn() {
+        var o = new EndpointBalancer.Outlier(1, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(60), 100);
+        var b = balancer(new StaticUpstreamSource(set(1, null, ep(0, 1))), null, o, Duration.ZERO, testHealth());
+        this.failing.add("a");
+        assertEquals(503, b.handle(new Request("GET", "/")).status()); // first attempt ejects
+        int hitsA = this.hits[0].get();
+        var refused = b.handle(new Request("GET", "/"));
+        assertEquals(503, refused.status());
+        assertNotNull(refused.headers().get("retry-after"));
+        assertEquals(hitsA, this.hits[0].get(), "503 must not contact the ejected endpoint");
+        this.failing.clear();
+        this.now.addAndGet(61_000_000_000L);
+        b.probeTick();
+        assertEquals(200, b.handle(new Request("GET", "/")).status());
+    }
+
+    @Test
+    void panicStillUsesEjectedEndpointsWhenActiveHealthIsOn() {
+        var o = new EndpointBalancer.Outlier(1, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(60), 0);
+        var b = balancer(new StaticUpstreamSource(set(1, null, ep(0, 1), ep(1, 1))), null, o, Duration.ZERO,
+                testHealth());
+        this.failing.add("a");
+        this.failing.add("b");
+        spread(b, 20);
+        assertEquals(2, b.ejectedCount());
+        this.failing.clear();
+        var counts = spread(b, 40);
+        assertEquals(40, counts.getOrDefault("a", 0) + counts.getOrDefault("b", 0), counts.toString());
+    }
+
+    @Test
+    void publicCtorsAndClosedTicksAndDeadProbes() throws Exception {
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofMillis(200), Duration.ofSeconds(1), 1024, "http",
+                null));
+        var src = new StaticUpstreamSource(set(1, null, ep(0, 1)));
+        var plain = new EndpointBalancer(src, pools, null, null);
+        this.balancers.add(plain);
+        assertFalse(plain.hasActiveProbes());
+        assertNull(plain.poolOf("missing:1"));
+
+        var live = new EndpointBalancer(new StaticUpstreamSource(set(1, null, ep(0, 1))), pools, null, null,
+                testHealth());
+        this.balancers.add(live);
+        assertTrue(live.hasActiveProbes());
+        live.close();
+        live.probeTick(); // closed: no-op
+
+        var o = new EndpointBalancer.Outlier(1, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(1), 100);
+        var deadEp = dead();
+        var deadB = balancer(new StaticUpstreamSource(set(1, null, deadEp)), null, o, Duration.ZERO, testHealth());
+        this.now.addAndGet(20_000_000_000L);
+        deadB.probeTick(); // first tick only staggers the first in-rotation probe
+        this.now.addAndGet(20_000_000_000L);
+        deadB.probeTick();
+        assertTrue(deadB.probesSent() >= 1);
+        assertEquals(1, deadB.ejectedCount());
+        assertTrue(deadB.poolOf(deadEp.authority()).health.ejected());
+
+        var healthy = balancer(new StaticUpstreamSource(set(1, null, ep(0, 1))), null, o, Duration.ZERO, testHealth());
+        assertThrows(IllegalArgumentException.class,
+                () -> healthy.poolOf(ep(0, 1).authority()).proxy.probe("GET", "health", Duration.ofSeconds(1)));
+        assertThrows(IllegalArgumentException.class,
+                () -> healthy.poolOf(ep(0, 1).authority()).proxy.probe("GET", null, Duration.ofSeconds(1)));
+        assertEquals(200, healthy.poolOf(ep(0, 1).authority()).proxy.probe("HEAD", "/", Duration.ofSeconds(1)));
+    }
 
     @Test
     void maxPendingIsSharedAcrossTheEndpointSet() throws Exception {
