@@ -3,9 +3,9 @@
 
 A window is valid only when ALL of:
   - chunk_samples >= 10000, p99 present, load1_pre < 3
-  - not self_loaded (recomputed from generator CPU and load1_post only:
-    load1_post>=4 OR sum cpu > 80*gen_cores OR any process > 80% of its own core).
-    Do not OR StreamLoad's stale pre-drain flag.
+  - not self_loaded (recomputed from generator CPU only: sum cpu > 80*gen_cores
+    OR any process > 80% of its own pinned core). load1_post is not part of this
+    rule (load1>=6 is NOISY). Do not OR StreamLoad's stale pre-drain flag.
   - no transport retries / refused_per_ip / drain timeout / open sessions after drain
   - no setup failures (error_count / group_open_refusals)
   - not NOISY (marker, foreign_cpu_avg>0.5, foreign load proc, OR any/end load1>=6)
@@ -61,7 +61,11 @@ def evaluate(r: dict) -> dict:
     # the (usually lower) end-of-drain sample. Trusting the stale flag would
     # mark a 136%-CPU / load1_post=1.77 leg self_loaded just because mid-measure
     # load1 briefly crossed 4. Folded in from #465's harness after it merged.
-    self_loaded = gen_sat or load1_post >= 4.0
+    # Mode B (inceptor 2026-11-13 21:32): self_loaded is ONLY any-proc > 80%
+    # or sum > 80*gen_cores. load1_post>=4 is not this flag (it wrongly marked
+    # the 25 and 50 MiB/s rungs self_loaded at 140.5%/208.9% with every proc
+    # under 80% and the sum under 240%). load1>=6 is still NOISY.
+    self_loaded = gen_sat
 
     ptr = _i(r.get("producer_transport_retries"))
     ccr = _i(r.get("consumer_connect_retries"))

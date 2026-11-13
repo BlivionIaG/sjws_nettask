@@ -142,6 +142,32 @@ def main():
     assert m5["http_503_claim_giveups"] == 3
     assert m5["http_503_budget_exhausted"] == 48
 
+    # smoke5 recorded rungs (inceptor 21:32): 25 and 50 must not be self_loaded;
+    # 80 (sum 270.5 > 240) and 110 (one proc 99.8%) must be. load1_post>=4 does not set the flag.
+    templates = [a, b, c]
+    def rung(*cpus):
+        parts = []
+        for i, cpu in enumerate(cpus):
+            d = dict(templates[i])
+            d["client_cpu_pct_of_wall"] = cpu
+            d["load1_post"] = 4.5
+            parts.append(d)
+        return mod.merge(parts, gen_cores=3, secs=20)
+
+    m25 = rung(42.419247456034334, 48.67595620658049, 49.45217851201966)
+    assert abs(m25["client_cpu_pct_of_wall"] - 140.5473821746345) < 1e-9, m25["client_cpu_pct_of_wall"]
+    assert m25["self_loaded"] is False, m25
+    m50 = rung(57.59790813221684, 73.39507959222537, 77.951515731217)
+    assert abs(m50["client_cpu_pct_of_wall"] - 208.9445034556592) < 1e-9, m50["client_cpu_pct_of_wall"]
+    assert m50["self_loaded"] is False, m50
+    m80 = rung(84.79420079320167, 88.79617145807866, 96.90249720881268)
+    assert abs(m80["client_cpu_pct_of_wall"] - 270.492869460093) < 1e-9, m80["client_cpu_pct_of_wall"]
+    assert m80["self_loaded"] is True, m80
+    m110 = rung(43.20033132842212, 99.81830645762592, 38.207023019281536)
+    assert abs(m110["client_cpu_pct_of_wall"] - 181.22566080532957) < 1e-9, m110["client_cpu_pct_of_wall"]
+    assert m110["self_loaded"] is True, m110
+    assert m110["generator_saturated_any_proc"] is True
+
     print("OK test_merge_gen")
 
 

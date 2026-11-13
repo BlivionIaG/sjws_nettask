@@ -67,7 +67,7 @@ def main():
         # 3 cores → limit 240. 230 OK, 241 self_loaded
         write_abs(root, "abs-03", cpu=230.0, gen_cores=3)
         write_abs(root, "abs-04", cpu=241.0, gen_cores=3)
-        # load1_post >= 4 forces self_loaded even if CPU low
+        # load1_post >= 4 is NOT self_loaded (inceptor 21:32); CPU 10% << 160
         write_abs(root, "abs-05", cpu=10.0, gen_cores=2, load1_post=4.0)
         # Stale recorded override must NOT raise the limit (Codex P2): cpu=170, cores=2,
         # gen_sat_limit_pct=180 would wrongly pass if trusted; disclosed limit is 160.
@@ -79,7 +79,7 @@ def main():
             ("abs-02", False, True),
             ("abs-03", True, False),
             ("abs-04", False, True),
-            ("abs-05", False, True),
+            ("abs-05", True, False),
             ("abs-06", False, True),
         ):
             (v, s), ln = flags(out, tag)

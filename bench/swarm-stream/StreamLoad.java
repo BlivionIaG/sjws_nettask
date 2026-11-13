@@ -150,6 +150,52 @@ public class StreamLoad {
   static final LongAdder HTTP503_RESPONSES = new LongAdder(), HTTP503_CLAIM = new LongAdder(),
       HTTP503_STREAM = new LongAdder(), HTTP503_BUDGET = new LongAdder(),
       HTTP503_CLAIM_GIVEUPS = new LongAdder(), HTTP503_STREAM_GIVEUPS = new LongAdder();
+
+  /** First claim and first :stream response per pool (warmup + measure, separately). */
+  static final ConcurrentLinkedQueue<String> FIRST_ADMIT_LOG = new ConcurrentLinkedQueue<>();
+  static final ConcurrentLinkedQueue<String> FIRST_ADMIT_WARMUP = new ConcurrentLinkedQueue<>();
+  static final ConcurrentHashMap<String, Boolean> FIRST_ADMIT_SEEN = new ConcurrentHashMap<>();
+
+  static void resetFirstAdmit(boolean snapshotWarmup) {
+    if (snapshotWarmup) {
+      FIRST_ADMIT_WARMUP.clear();
+      FIRST_ADMIT_WARMUP.addAll(FIRST_ADMIT_LOG);
+    }
+    FIRST_ADMIT_LOG.clear();
+    FIRST_ADMIT_SEEN.clear();
+  }
+
+  static String bodySnippet(byte[] body, int n) {
+    if (body == null || body.length == 0) return "";
+    int m = Math.min(body.length, n);
+    StringBuilder sb = new StringBuilder(m);
+    for (int i = 0; i < m; i++) {
+      int c = body[i] & 0xff;
+      sb.append(c >= 32 && c < 127 ? (char) c : '.');
+    }
+    if (body.length > n) sb.append("...");
+    return sb.toString();
+  }
+
+  static String headerMap(java.net.http.HttpHeaders h) {
+    if (h == null) return "";
+    StringBuilder sb = new StringBuilder();
+    h.map().forEach((k, v) -> sb.append(k).append('=').append(String.join(",", v)).append(';'));
+    return sb.toString();
+  }
+
+  /** Log the first claim or :stream response for this pool (request URL, status, headers, body snippet). */
+  static void logFirstAdmit(String kind, String method, String url, String pool, int status,
+      String headers, byte[] body, long elapsedMs) {
+    String key = kind + ":" + pool;
+    if (FIRST_ADMIT_SEEN.putIfAbsent(key, Boolean.TRUE) != null) return;
+    String line = kind + " pool=" + pool + " " + method + " " + url
+        + " status=" + status + " elapsed_ms=" + elapsedMs
+        + " headers={" + headers + "} body=" + bodySnippet(body, 180);
+    FIRST_ADMIT_LOG.add(line);
+    System.err.println("StreamLoad: first-" + line);
+  }
+
   static final AtomicBoolean CUTOFF_HIT = new AtomicBoolean();
   /** #415 catch-up period (window end -> last producer done): generator CPU seconds and wall seconds. */
   static volatile double CATCHUP_CPU_SEC = 0, CATCHUP_WALL_S = 0;
@@ -416,6 +462,7 @@ public class StreamLoad {
     AtomicLong consumerConnectRetries = new AtomicLong();
     AtomicLong groupOpenRefusals = new AtomicLong(); // claim/stream HTTP 503 (ledger budget) — not transport
 
+    resetFirstAdmit(false);
     // Warmup (same group count; fewer streams)
     wave(http, args, tokens, Math.min(32, args.streams), args.warmup, "w", false,
         inTeardown, bytesRx, creditWaits,
@@ -431,6 +478,7 @@ public class StreamLoad {
     groupOpenRefusals.set(0);
     for (LongAdder c : List.of(HTTP503_RESPONSES, HTTP503_CLAIM, HTTP503_STREAM, HTTP503_BUDGET,
         HTTP503_CLAIM_GIVEUPS, HTTP503_STREAM_GIVEUPS)) c.reset();
+    resetFirstAdmit(true);
 
     // Measure + sample client (/proc/self) and server (/proc/<serverPid>) CPU over the window
     AtomicReference<double[]> cpuSample = new AtomicReference<>(new double[]{0,0,0,0}); // clientSec, clientPct, serverSec, serverPct
@@ -485,10 +533,11 @@ public class StreamLoad {
     double[] cpu = cpuSample.get();
     r.clientCpuSec = cpu[0]; r.clientCpuPctOfWall = cpu[1];
     r.serverCpuSec = cpu[2]; r.serverCpuPctOfWall = cpu[3];
-    // inceptor 2026-10-30 18:46: self_loaded iff gen CPU > 80% of its cores (also load1_post>=4)
+    // Mode B (inceptor 2026-11-13 21:32): self_loaded iff gen CPU > 80% of its cores
+    // (or, after merge-gen, any process > 80%). load1_post is not this flag.
     double satLim = args.genSatPct > 0 ? args.genSatPct : 80.0 * args.genCores;
     boolean genSat = !Double.isNaN(r.clientCpuPctOfWall) && r.clientCpuPctOfWall > satLim;
-    r.selfLoaded = load1Post >= 4.0 || genSat;
+    r.selfLoaded = genSat;
     r.generatorSaturated = genSat;
     r.genCores = args.genCores;
     r.genSatLimitPct = satLim;
@@ -549,6 +598,8 @@ public class StreamLoad {
     r.http503BudgetExhausted = HTTP503_BUDGET.sum();
     r.http503ClaimGiveups = HTTP503_CLAIM_GIVEUPS.sum();
     r.http503StreamGiveups = HTTP503_STREAM_GIVEUPS.sum();
+    r.firstAdmit = List.copyOf(FIRST_ADMIT_LOG);
+    r.firstAdmitWarmup = List.copyOf(FIRST_ADMIT_WARMUP);
     // 503 group-open refusals are NOT transport retries (Messaging Core #335 / steering 16:34).
     r.transportRetryFlag = r.producerTransportRetries > 0 || r.consumerConnectRetries > 0;
     r.requests = requests.get();
@@ -680,9 +731,12 @@ public class StreamLoad {
     // a transient. Treating it as fatal left phantom streams; their cutoff-slot ages then became
     // the 28.6 s scheduled p99 at 10 MiB/s, where delivered p50 was 142 µs and lag p99 1.5 ms.
     for (int attempt = 0; ; attempt++) {
-      claim = post(http, args.base + "/swarm/v1/tasks/" + enc(pool) + ":claim?visibilityMs=60000&waitMs=30000&max=1",
-          token, new byte[0]);
+      String claimUrl = args.base + "/swarm/v1/tasks/" + enc(pool) + ":claim?visibilityMs=60000&waitMs=30000&max=1";
+      long claimT0 = System.nanoTime();
+      claim = post(http, claimUrl, token, new byte[0]);
       claimSc = claim.statusCode();
+      logFirstAdmit("claim", "POST", claimUrl, pool, claimSc, headerMap(claim.headers()), claim.body(),
+          (System.nanoTime() - claimT0) / 1_000_000L);
       if (claimSc != 503) break;
       record503(true, claim.body());
       if (!sleep503(w.hardStop, header(claim, "retry-after"), attempt, 15)) {
@@ -963,6 +1017,7 @@ public class StreamLoad {
       return;
     }
     boolean released = false;
+    String cancelId = null;
     try {
     AtomicBoolean stop = w.hardStop;
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
@@ -980,8 +1035,12 @@ public class StreamLoad {
           b.header("Accept", CT);
         else
           b.header("Accept", "text/event-stream");
+        String streamUrl = args.base + "/swarm/v1/tasks/" + enc(pool) + ":stream?deadlineMs=180000";
+        long streamT0 = System.nanoTime();
         HttpResponse<byte[]> resp = http.send(b.build(), HttpResponse.BodyHandlers.ofByteArray());
         int streamSc = resp.statusCode();
+        logFirstAdmit("stream", "POST", streamUrl, pool, streamSc, headerMap(resp.headers()), resp.body(),
+            (System.nanoTime() - streamT0) / 1_000_000L);
         if (streamSc == 503) {
           record503(false, resp.body());
           if (sleep503(stop, header(resp, "retry-after"), n503++, 15)) continue;
@@ -999,6 +1058,8 @@ public class StreamLoad {
           Frame f = decodeFrame(ByteBuffer.wrap(resp.body()));
           loc = "/swarm/v1/replies/" + hex(f.payload);
         }
+        int slash = loc.lastIndexOf('/');
+        if (slash >= 0 && slash + 1 < loc.length()) cancelId = loc.substring(slash + 1);
         if (!loc.startsWith("http")) loc = args.base + loc;
         HttpRequest.Builder gb = HttpRequest.newBuilder(URI.create(loc))
             .timeout(Duration.ofSeconds(200))
@@ -1038,6 +1099,7 @@ public class StreamLoad {
     }
     if (last != null) throw last;
     } finally {
+      cancelSession(http, args, token, cancelId);
       if (!released) admit.countDown();
     }
   }
@@ -1076,6 +1138,9 @@ public class StreamLoad {
         }
       }
       if (sr == null) throw last != null ? last : new IOException("stream not opened");
+      logFirstAdmit("stream", "POST", args.base + spath, pool, sr.status,
+          "retry-after=" + sr.retryAfter + ";location=" + sr.location,
+          sr.body, 0);
       if (sr.status == 503) {
         record503(false, sr.body);
         boolean retried = false;
@@ -1311,6 +1376,14 @@ public class StreamLoad {
     if (body == null || body.length == 0) return "";
     String s = new String(body, 0, Math.min(body.length, 200), StandardCharsets.UTF_8).replaceAll("\\s+", " ").trim();
     return s.isEmpty() ? "" : ": " + s;
+  }
+
+  /** Best-effort session cancel so a finished/aborted HttpClient consumer releases server writers. */
+  static void cancelSession(HttpClient http, Args args, String token, String sessionId) {
+    if (sessionId == null || sessionId.isEmpty()) return;
+    try {
+      post(http, args.base + "/swarm/v1/tasks/" + sessionId + ":cancel", token, new byte[0]);
+    } catch (Exception ignored) {}
   }
 
   static HttpResponse<byte[]> post(HttpClient http, String url, String token, byte[] body) throws Exception {
@@ -1803,6 +1876,8 @@ public class StreamLoad {
     long bytes, creditStalls, requests, producerTransportRetries, consumerConnectRetries, refusedPerIp, openSessionsAfterDrain, groupOpenRefusals;
     long http503Responses, http503ClaimResponses, http503StreamResponses, http503BudgetExhausted;
     long http503ClaimGiveups, http503StreamGiveups;
+    List<String> firstAdmit = List.of();
+    List<String> firstAdmitWarmup = List.of();
     int maxConnectionsPerIp;
     double elapsedS, wallS, load1Pre, load1Post, mibS, stallPct, creditWaitTotal, clientCpuSec, clientCpuPctOfWall, serverCpuSec, serverCpuPctOfWall;
     Double p50, p90, p99, creditWaitP50, creditWaitP99;
@@ -1895,6 +1970,9 @@ public class StreamLoad {
       field(sb, "http_503_budget_exhausted", http503BudgetExhausted, true);
       field(sb, "http_503_claim_giveups", http503ClaimGiveups, true);
       field(sb, "http_503_stream_giveups", http503StreamGiveups, true);
+      sb.append("  \"first_admit\":").append(listJson(firstAdmit)).append(",\n");
+      sb.append("  \"first_admit_warmup\":").append(listJson(firstAdmitWarmup)).append(",\n");
+
       field(sb, "transport_retry_flag", transportRetryFlag, true);
       field(sb, "max_connections_per_ip", maxConnectionsPerIp, true);
       field(sb, "refused_per_ip", refusedPerIp, true);

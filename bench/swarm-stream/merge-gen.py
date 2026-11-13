@@ -182,7 +182,7 @@ def merge(parts: list[dict], gen_cores: int, secs: float | None) -> dict:
     gen_sat = bool((cpu is not None and cpu > sat) or any_proc)
     out["generator_saturated"] = gen_sat
     out["generator_saturated_any_proc"] = bool(any_proc)
-    out["self_loaded"] = bool(gen_sat or (load1_post is not None and load1_post >= 4.0))
+    out["self_loaded"] = bool(gen_sat)  # CPU rule only; load1_post>=4 is not self_loaded
 
     out["mib_s"] = (out["bytes"] / (1024.0 * 1024.0)) / max(1e-6, secs)
     out["offered_mib_s"] = sum_num(parts, "offered_mib_s")

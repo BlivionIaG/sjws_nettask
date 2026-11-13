@@ -72,6 +72,26 @@ def main():
                             client_cpu_pct_per_proc=[90.0, 10.0, 10.0]))
     assert not ev["valid"] and ev["self_loaded"], ev
 
+    # smoke5 recorded rungs (inceptor 21:32): 25 and 50 were flagged wrongly.
+    ev = wv.evaluate(base_ok(client_cpu_pct_of_wall=140.5473821746345, self_loaded=True, gen_cores=3,
+                            load1_post=3.5,
+                            client_cpu_pct_per_proc=[42.419247456034334, 48.67595620658049, 49.45217851201966]))
+    assert ev["valid"] and not ev["self_loaded"], ev
+    ev = wv.evaluate(base_ok(client_cpu_pct_of_wall=208.9445034556592, self_loaded=True, gen_cores=3,
+                            load1_post=3.9,
+                            client_cpu_pct_per_proc=[57.59790813221684, 73.39507959222537, 77.951515731217]))
+    assert ev["valid"] and not ev["self_loaded"], ev
+    ev = wv.evaluate(base_ok(client_cpu_pct_of_wall=270.492869460093, self_loaded=False, gen_cores=3,
+                            client_cpu_pct_per_proc=[84.79420079320167, 88.79617145807866, 96.90249720881268]))
+    assert not ev["valid"] and ev["self_loaded"], ev
+    ev = wv.evaluate(base_ok(client_cpu_pct_of_wall=181.22566080532957, self_loaded=False, gen_cores=3,
+                            client_cpu_pct_per_proc=[43.20033132842212, 99.81830645762592, 38.207023019281536]))
+    assert not ev["valid"] and ev["self_loaded"], ev
+    # load1_post>=4 alone is not self_loaded (was the 25/50 false positive)
+    ev = wv.evaluate(base_ok(client_cpu_pct_of_wall=140.5, gen_cores=3, load1_post=4.5,
+                            client_cpu_pct_per_proc=[42.4, 48.7, 49.5]))
+    assert ev["valid"] and not ev["self_loaded"], ev
+
     # Q4: stale self_loaded flag (end-of-measure load1>=4, then load1_post rewritten
     # to 1.77 after drain) must not keep the window invalid when CPU is under sat.
     ev = wv.evaluate(base_ok(self_loaded=True, client_cpu_pct_of_wall=136.0,

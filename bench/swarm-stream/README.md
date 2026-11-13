@@ -170,3 +170,23 @@ leg dirs before the logs were deleted). `one.sh` therefore:
 `profile-414.sh <jar> <out>` records JFR on the server (and the generator with `GEN_JFR=1`) for one
 1k/64 window and writes `server-attribution.md` via `jfr_top.py`. It exits 5 when the window is not
 valid: a profile from a self-loaded or NOISY window is not evidence. Never a gate window.
+
+
+## LEAN_CONSUMER=0 admit (`Lean0AdmitTest`)
+
+The HttpClient consumer (`--no-lean-consumer`) logs the first claim and first `:stream`
+response per pool (`first_admit`, `first_admit_warmup` in `result.json`: status, headers,
+body snippet, elapsed_ms). On exit it `POST`s `:cancel` for the session so leftover
+warmup sessions do not sit on the server until the 75 s drain floor.
+
+`Lean0AdmitTest` is a 2-stream in-JVM dry check (test server subprocess, `StreamLoad.run()`
+in the test JVM; not a load generator). It expects both lean0 and lean1 to send chunks,
+with first claim 200 and first `:stream` 201. Build and run (outside the bench lock):
+
+```
+javac -d /tmp/lean0-admit StreamLoad.java Lean0AdmitTest.java
+java -Dlean0.jar=path/to/sjws_nettask-*.jar -cp /tmp/lean0-admit Lean0AdmitTest
+```
+
+The 1000-stream closed-loop 503s are the shipped ledger writer budget (see issue #414);
+this test does not raise that budget.
