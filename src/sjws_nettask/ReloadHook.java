@@ -27,9 +27,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Process-wide reload hooks. {@link #run()} rebuilds each registered server's immutable
  * configuration snapshot and swaps it in. The daemon child calls {@link #installSighup()} so
- * {@code SIGHUP} is reload. A foreground process does not: it must still die on {@code SIGHUP}.
- * The child is also started with {@code setsid} when that binary exists, so closing the terminal
- * does not deliver {@code SIGHUP} at all.
+ * {@code SIGHUP} is reload. A foreground process does not, unless {@link #SIGHUP_ENV} is
+ * {@code 1} (the launchd sample sets it): a normal foreground process must still die on
+ * {@code SIGHUP}. The child is also started with {@code setsid} when that binary exists, so
+ * closing the terminal does not deliver {@code SIGHUP} at all.
  * <p>
  * When this process inherited an ignored {@code SIGHUP} (no controlling terminal, GitHub Actions),
  * HotSpot's {@code Signal.handle} returns {@code SIG_IGN} and leaves the disposition unchanged.
@@ -40,6 +41,12 @@ import java.util.concurrent.atomic.AtomicInteger;
  * reloads bootstrap settings only and leaves that config in place.
  */
 public final class ReloadHook {
+
+    /**
+     * When set to {@code 1}, {@code main} installs the {@code SIGHUP} reload hook even for a
+     * foreground process (launchd). A normal foreground process still dies on hangup.
+     */
+    public static final String SIGHUP_ENV = "SJWS_RELOAD_SIGHUP";
 
     private static final CopyOnWriteArrayList<Runnable> HOOKS = new CopyOnWriteArrayList<>();
 
@@ -81,8 +88,9 @@ public final class ReloadHook {
      * Points {@code SIGHUP} at {@link #run()}. Returns false when the JDK does not expose
      * {@code sun.misc.Signal}, or when this process already ignores {@code SIGHUP} and the
      * disposition cannot be restored (no FFM native access, or a non-POSIX host). {@code main}
-     * calls this only for the daemon child. The daemon child must not leave {@code SIGHUP} ignored:
-     * systemd {@code ExecReload} and operators send hangup to reload.
+     * calls this for the daemon child, and for a foreground process when {@link #SIGHUP_ENV} is
+     * {@code 1}. The process must not leave {@code SIGHUP} ignored in those cases: systemd
+     * {@code ExecReload}, {@code launchctl kill HUP}, and operators send hangup to reload.
      */
     public static boolean installSighup() {
         try {

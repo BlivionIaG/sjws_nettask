@@ -142,7 +142,8 @@ public class Sjws_nettask {
         var messagingMetrics = prepareMessagingMetrics(modules, installMessagingHooks); // before contribute/mount (#400)
         SjwsServer server;
         try {
-            server = SjwsServer.start(loaded, h3Factory, bindContent, OptionalModules.contributors(modules));
+            server = SjwsServer.start(loaded, h3Factory, bindContent, OptionalModules.contributors(modules),
+                    hooks != null ? hooks.pinFile() : null);
         } catch (BindException e) {
             modules.close();
             err.println("Cannot listen on port " + config.port() + ": " + e.getMessage()
@@ -615,7 +616,7 @@ public class Sjws_nettask {
         if (opt.action() == Daemon.Action.STOP || opt.action() == Daemon.Action.STATUS) {
             return control(opt, out, err);
         }
-        var loaded = sjws_nettask.config.ConfigLoader.load(opt.remaining(), env);
+        var loaded = sjws_nettask.config.ConfigLoader.load(opt.remaining(), env, recoveryPin(opt.bootstrap()));
         opt.warnings().forEach(w -> err.println("WARN: " + w));
         loaded.warnings().forEach(w -> err.println("WARN: " + w));
         if (!opt.ok() || !loaded.ok()) {
@@ -652,8 +653,8 @@ public class Sjws_nettask {
             }
         }
         loaded = applyProcessMode(loaded, choice, hooks);
-        boolean bindContent = resolveBind(opt, loaded, err);
-        if (child) {
+        boolean bindContent = resolveBind(opt, loaded, err, hooks);
+        if (child || "1".equals(env.get(ReloadHook.SIGHUP_ENV))) {
             ReloadHook.installSighup();
         }
         PrintStream logOut = out;
@@ -741,14 +742,21 @@ public class Sjws_nettask {
             return loaded;
         }
         return loaded.withDocument(loaded.document().withNode(
-                new sjws_nettask.config.NodeSettings(sjws_nettask.config.NodeSettings.Mode.parse(mode), node.labels())));
+                new sjws_nettask.config.NodeSettings(sjws_nettask.config.NodeSettings.Mode.parse(mode), node.labels(),
+                        node.maxStaleness())));
     }
 
     /**
      * Content port: an explicit flag or variable, then {@code server.bind_content}, then off for
-     * {@code control} and on otherwise. A difference from the role default is logged.
+     * {@code control} and on for standalone. Data binds only when a verified last-good is present,
+     * unless the operator forced a bind. A difference from the role default is logged.
      */
     static boolean resolveBind(Daemon.Options opt, sjws_nettask.config.ConfigLoader.Loaded loaded, PrintStream err) {
+        return resolveBind(opt, loaded, err, null);
+    }
+
+    static boolean resolveBind(Daemon.Options opt, sjws_nettask.config.ConfigLoader.Loaded loaded, PrintStream err,
+            ServiceHooks hooks) {
         var mode = loaded.document().node().mode();
         boolean byRole = mode != sjws_nettask.config.NodeSettings.Mode.CONTROL;
         Boolean chosen = opt.bindContent();
@@ -758,13 +766,47 @@ public class Sjws_nettask {
             source = "server.bind_content";
         }
         if (chosen == null) {
+            if (mode == sjws_nettask.config.NodeSettings.Mode.DATA) {
+                return hasVerifiedLastGood(loaded, hooks);
+            }
             return byRole;
         }
         if (chosen.booleanValue() != byRole) {
             err.println("WARN: " + source + "=" + chosen + " overrides the " + mode.wire()
                     + " content-port default");
         }
+        if (chosen.booleanValue() && mode == sjws_nettask.config.NodeSettings.Mode.DATA
+                && !hasVerifiedLastGood(loaded, hooks)) {
+            err.println("WARN: " + source + "=true binds the content port with no verified last-good");
+        }
         return chosen;
+    }
+
+    /**
+     * The pin a normal boot resolves from the bootstrap ({@code --bootstrap} or
+     * {@code WEB_SERVER_BOOTSTRAP}), for missing-config recovery. Null when there is none or it
+     * does not read; the full bootstrap load later reports that error.
+     */
+    static java.nio.file.Path recoveryPin(java.nio.file.Path bootstrap) {
+        if (bootstrap == null) {
+            return null;
+        }
+        try {
+            return sjws_nettask.service.Bootstrap.pinFile(bootstrap);
+        } catch (java.io.IOException e) {
+            return null;
+        }
+    }
+
+    /** Signed {@code last-good.json} in the document state dir or the bootstrap {@code state-dir}. */
+    static boolean hasVerifiedLastGood(sjws_nettask.config.ConfigLoader.Loaded loaded, ServiceHooks hooks) {
+        var pin = hooks != null ? hooks.pinFile() : null;
+        if (loaded != null && sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(loaded.document().stateDir(), pin)
+                .isPresent()) {
+            return true;
+        }
+        return hooks != null
+                && sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(hooks.stateDir(), pin).isPresent();
     }
 
     /**

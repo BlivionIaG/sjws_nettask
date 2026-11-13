@@ -55,11 +55,22 @@ node:
   mode: standalone  # standalone (default), control, or data
   labels: {}        # up to 64 keys; each key and value is 1..63 of [A-Za-z0-9_.:-]
   state_dir: /var/lib/sjws_nettask   # optional; local, not part of the canonical hash
+  max_staleness: 15m                 # optional; 1ms..7d; no default ceiling
 ```
 
 `schema` must be 1 when it is present. A reload or a remote apply rejects a non-zero
 `version` that is lower than the one already running. `node.mode` is kept until
 restart; `labels` apply on the next successful apply.
+
+`node.max_staleness` is an optional data-node ceiling on last-good freshness. A
+data node is ready when it has a verified signed last-good whose `expiresAtMillis`
+is still in the future, and, when this key is set, whose `issuedAtMillis` is still
+within that duration. There is no default ceiling: omitting the key leaves only
+the signed expiry in force. The content port stays unbound until that signed
+last-good exists (unless `--bind-content` or `server.bind_content` forces a bind).
+Past max-staleness the process keeps serving and `/readyz` is 503; it does not
+drain. An unsigned `<stateDir>/config/last-good.json` written as a local boot
+file is not a verified last-good for readiness.
 
 There is no `node.role` key. `--role` and `WEB_SERVER_ROLE` are the command-line
 form of `node.mode`. Precedence is `--role`, then `WEB_SERVER_ROLE`, then
@@ -81,7 +92,11 @@ document, so they do not contain a key password. The temp file and its directory
 are fsynced before the atomic rename, and the write runs after the reload lock is
 released. Standalone and control do not write this file and do not boot from it.
 A file left by an older build at `<file>.last-good` is still read once when the
-JSON file is absent. A failed apply leaves both the running config and this file
+JSON file is absent. When a bootstrap pin is set, only a signed `last-good.json`
+that verifies under the pin is a boot source; an unsigned file stops startup with
+an error. A recovery file must not be a symlink, must be owned by root or the
+service user, and must not be group- or world-writable (nor may its directories).
+A failed apply leaves both the running config and this file
 as they were.
 
 In a duration, a bare integer is seconds and `1m` is one minute (`ms`, `s`, `m`,
@@ -455,6 +470,13 @@ A request without the key (no address, or no header) shares one extra bucket. Th
 `rate-limit` filter type uses this same table. Its `capacity` is the burst and
 `refill-per-second` is the steady rate; `max-keys` only sizes the table.
 
+A later v2 can split a named global limit across ready gateways (`share = rate / ready count`,
+same split for burst). The control plane publishes the per-node share when membership changes;
+this server only applies a share it is given. That API is not in this tree, and there is no
+config flag that enables it. Until it lands, every `rate_limit` stays local. When a share *is*
+applied, a later missing snapshot keeps the last share; a node that has never received a share
+fails closed (429) rather than falling back to the full local rate. See design §13.
+
 Weighted and canary routes list `backends` instead of `proxy` (a plain `proxy:` route is unchanged):
 
 ```yaml
@@ -584,6 +606,27 @@ page such as `Allow`, `Content-Range` or `Retry-After` are kept. Routes without
 
 `listing: false` answers a directory without `index.html` with 404, as if it did
 not exist. The route still shares the document root, access policy and file cache.
+
+These three fields are per route today. Node labels exist (`node.labels`) and the
+filter document already has a label selector, but a control-plane envelope cannot
+yet set `errors`, `problem_type` or `listing` per label. The intended contract,
+when that envelope field exists, is:
+
+- A versioned overlay lists one or more entries, each with a label selector (the
+  same comma-separated syntax as a filter `scope.labels`: `edge,!internal`; `*` or
+  omit matches every node) and, optionally, a route pattern. Each entry may set
+  `errors`, `problem_type` and/or `listing`.
+- The overlay is compiled when the snapshot is applied, using this node's labels.
+  The request path does not look at labels. An entry that does not match this node
+  is ignored for the compiled routes (it is still validated, so a bad value fails
+  the whole document).
+- A value the route itself sets always wins. The overlay fills only a field the
+  route left at the default (`errors: html`, `listing: true`, no `problem_type`).
+- A later label change on the node re-applies the same config version, the same
+  way a filter document of equal version is applied again.
+
+Until the control plane publishes that field, every route keeps the settings
+written on it in YAML. This server does not invent a local label-overlay key.
 
 ## Middleware
 

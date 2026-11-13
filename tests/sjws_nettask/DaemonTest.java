@@ -230,6 +230,17 @@ class DaemonTest {
     }
 
     @Test
+    void foregroundReloadEnvInstallsHangupHook() throws Exception {
+        var root = Files.createDirectory(tmp.resolve("html-reload-env"));
+        var pid = tmp.resolve("reload-env.pid");
+        int code = Sjws_nettask.run(
+                new String[] {"--pid-file=" + pid, "--shutdown-timeout=1",
+                        String.valueOf(freePort()), root.toString()},
+                Map.of(ReloadHook.SIGHUP_ENV, "1"), out, err, NO_H3, SjwsServer::close);
+        assertEquals(Sjws_nettask.EXIT_OK, code, err());
+    }
+
+    @Test
     void daemonPathsLeaveStandardStreamsAlone() throws Exception {
         var beforeOut = System.out;
         var beforeErr = System.err;

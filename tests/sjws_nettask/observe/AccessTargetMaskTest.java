@@ -181,6 +181,16 @@ class AccessTargetMaskTest {
     }
 
     @Test
+    void unionKeepsOutgoingOrderAndAddsIncoming() {
+        assertSame(AccessTargetMask.NONE, AccessTargetMask.union(null, null));
+        assertSame(AccessTargetMask.NONE, AccessTargetMask.union(AccessTargetMask.NONE, null));
+        assertArrayEquals(new String[] {"a"}, AccessTargetMask.union(null, new String[] {"a"}));
+        assertArrayEquals(new String[] {"a"}, AccessTargetMask.union(new String[] {"a"}, AccessTargetMask.NONE));
+        assertArrayEquals(new String[] {"old", "kept", "new"},
+                AccessTargetMask.union(new String[] {"old", "kept"}, new String[] {"kept", "new"}));
+    }
+
+    @Test
     void configReloadPicksUpMiddlewareQueryNames() throws Exception {
         Files.writeString(dir.resolve("index.html"), "ok");
         var log = dir.resolve("reload.log");
