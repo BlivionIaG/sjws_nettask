@@ -211,8 +211,19 @@ public final class CompressFilter implements RequestFilter {
         return (weak ? "W/" : "") + "\"" + value + "-" + coding + "\"";
     }
 
-    /** True when If-None-Match names the gzip representation this filter would emit. */
+    /**
+     * True when If-None-Match names the gzip representation this filter would emit. Only a
+     * successful (2xx) GET or HEAD may become a 304 (RFC 9110 13.1.2, 13.2.2); an upstream error
+     * or the result of an unsafe method is passed through unchanged.
+     */
     static boolean compressedValidatorHits(Request request, Response response) {
+        var method = request.method();
+        if (!"GET".equals(method) && !"HEAD".equals(method)) {
+            return false;
+        }
+        if (response.status() < 200 || response.status() > 299) {
+            return false;
+        }
         var inm = request.headers().ifNoneMatch();
         if (inm == null || inm.isBlank()) {
             return false;

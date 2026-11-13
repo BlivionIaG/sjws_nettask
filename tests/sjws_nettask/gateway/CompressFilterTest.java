@@ -2,6 +2,7 @@ package sjws_nettask.gateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -310,6 +311,33 @@ class CompressFilterTest {
         assertEquals(200, small.status());
         assertNull(small.headers().get("content-encoding"));
         assertEquals("\"x\"", small.headers().get("etag"));
+    }
+
+    @Test
+    void synthesizes304OnlyForSuccessfulGetOrHead() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
+        var plain = ("hello gzip ".repeat(40)).getBytes(StandardCharsets.UTF_8);
+        java.util.function.BiFunction<Integer, String, Response> run = (status, method) -> call(filter,
+                new Request(method, "/", RequestHeaders.of(Map.of(
+                        "accept-encoding", List.of("gzip"),
+                        "if-none-match", List.of("*")))),
+                (r) -> new Response(status, ResponseHeaders.of()
+                        .add("content-type", "text/plain")
+                        .add("etag", "\"abc\""), Body.Bytes.of(plain)));
+        // Upstream errors keep their status and body.
+        for (int status : new int[] {404, 412, 500}) {
+            var response = run.apply(status, "GET");
+            assertEquals(status, response.status(), "GET " + status);
+            assertFalse(response.body() instanceof Body.Empty, "GET " + status);
+        }
+        // Unsafe-method results are never hidden behind a 304.
+        for (var method : new String[] {"POST", "PUT", "DELETE", "PATCH"}) {
+            var response = run.apply(200, method);
+            assertEquals(200, response.status(), method);
+            assertEquals("gzip", response.headers().get("content-encoding"), method);
+        }
+        assertEquals(304, run.apply(200, "GET").status());
+        assertEquals(304, run.apply(200, "HEAD").status());
     }
 
     @Test
