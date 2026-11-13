@@ -395,13 +395,17 @@ public final class StaticFileHandler implements Handler {
     }
 
     public static Response methodNotAllowed() {
-        var r = html(405, "<!DOCTYPE html><html><body><h1>405 Method Not Allowed</h1></body></html>", false);
+        var r = error(405, false);
         r.headers().add("allow", ALLOW);
         return r;
     }
 
     public static Response redirect(String location, boolean head) {
-        var r = html(301, "<!DOCTYPE html><html><body><a href=\"" + escape(location) + "\">Moved</a></body></html>",
+        // Same chrome as {@link #error}: doctype, charset, title and h1. The body still carries a
+        // link to the new location so a non-redirecting client can follow it.
+        var href = escape(location);
+        var r = html(301, "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"/><title>301 Moved Permanently</title>"
+                + "</head><body><h1>301 Moved Permanently</h1><p><a href=\"" + href + "\">Moved</a></p></body></html>",
                 head);
         r.headers().add("location", location);
         return r;
