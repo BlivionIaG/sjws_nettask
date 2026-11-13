@@ -84,6 +84,8 @@ if [ "$LOADGEN" = java ]; then
   fi
   if [ -n "${RATE_MIB_S:-}" ]; then GEN_EXTRA+=(--rate-mib-s "$RATE_MIB_S"); fi
   if [ "${LEAN_CONSUMER:-1}" = 0 ]; then GEN_EXTRA+=(--no-lean-consumer); fi
+  if [ -n "${CLAIM_DELAY_MS:-}" ]; then GEN_EXTRA+=(--claim-delay-ms "$CLAIM_DELAY_MS"); fi
+  if [ -n "${HANG_EVERY:-}" ]; then GEN_EXTRA+=(--hang-every "$HANG_EVERY"); fi
   # #415/#414: optional generator JVM flags (e.g. JFR on the generator to find its own hot spots).
   read -r -a GEN_JAVA_ARGS <<< "${GEN_JAVA_OPTS:-}"
   taskset -c "$GEN_CPUS" nice -n 10 java "${GEN_JAVA_ARGS[@]}" "$HERE_DIR/StreamLoad.java" \

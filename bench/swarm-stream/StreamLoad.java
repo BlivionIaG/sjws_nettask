@@ -304,14 +304,81 @@ public class StreamLoad {
     boolean leanConsumerActive() { return leanHttp && leanConsumer && "binary".equals(accept); }
     /** Harness commit stamped into result.json (--harness-commit, else env HARNESS_COMMIT). */
     String harnessCommit = "";
+    /** Test-only (#415 smoke): after a successful claim, sleep this many ms on every 11th stream. */
+    long claimDelayMs = 0;
+    /** Test-only (#415 smoke): every Nth consumer opens the session then does not read until cutoff. 0 = off. */
+    int hangEvery = 0;
   }
 
   public static void main(String[] a) throws Exception {
+    if (a.length > 0 && "--self-test".equals(a[0])) {
+      int n = selfTest();
+      System.out.println(n == 0 ? "self-test ok" : "self-test FAILED checks=" + n);
+      System.exit(n);
+    }
     Args args = parse(a);
     List<String> tokens = loadTokens(args.tokensFile);
     Result r = run(args, tokens);
     Files.writeString(Path.of(args.out), r.toJson());
     System.out.println(r.summary());
+  }
+
+  /**
+   * Pure unit checks of slotsInWindow / firstSlotAtOrAfter / accountWave (no server, no load).
+   * Mirrors tests/test_window_accounting.py. Returns the number of failed checks (0 = ok).
+   */
+  static int selfTest() {
+    int fail = 0;
+    fail += selfCheck("slots 0,10,0,100", slotsInWindow(0, 10, 0, 100) == 10);
+    fail += selfCheck("slots 5,10,0,100", slotsInWindow(5, 10, 0, 100) == 10);
+    fail += selfCheck("slots 5,10,6,96", slotsInWindow(5, 10, 6, 96) == 9);
+    fail += selfCheck("slots 200,10,0,100", slotsInWindow(200, 10, 0, 100) == 0);
+    fail += selfCheck("slots empty", slotsInWindow(0, 10, 100, 100) == 0);
+    fail += selfCheck("first 5,10,0", firstSlotAtOrAfter(5, 10, 0) == 5);
+    fail += selfCheck("first 5,10,6", firstSlotAtOrAfter(5, 10, 6) == 15);
+    fail += selfCheck("first 5,10,15", firstSlotAtOrAfter(5, 10, 15) == 15);
+    long iv = 9_000_000L, start = 10_000_000_000L, end = 30_000_000_000L, epoch = 0;
+    for (long off : new long[]{0, iv / 3, iv - 1}) {
+      long n = slotsInWindow(epoch + off, iv, start, end);
+      long per = (end - start) / iv;
+      fail += selfCheck("full window off=" + off, n == per || n == per + 1);
+    }
+    // accountWave: one registered stream missing its last 2 slots; expected = slots in window.
+    SCHED_EXPECTED.reset(); SCHED_UNRECEIVED.reset(); SCHED_PHANTOM_STREAMS.reset();
+    SCHED_STREAMS_SHORT.reset(); LAT_CO.clearAll();
+    Win w = new Win(true, 1, iv);
+    w.startNs = start; w.endNs = end;
+    long phase = epoch + 123;
+    Track t = new Track(phase, iv);
+    long exp = slotsInWindow(phase, iv, start, end);
+    t.recv.set(exp - 2);
+    w.tracks.put(new StreamKey(1, 2), t);
+    long cutoff = end + 75_000_000_000L;
+    accountWave(w, cutoff);
+    fail += selfCheck("account expected", SCHED_EXPECTED.sum() == exp);
+    fail += selfCheck("account unreceived", SCHED_UNRECEIVED.sum() == 2);
+    fail += selfCheck("account streams short", SCHED_STREAMS_SHORT.sum() == 1);
+    fail += selfCheck("account no phantom", SCHED_PHANTOM_STREAMS.sum() == 0);
+    fail += selfCheck("account lat samples", LAT_CO.count() == 2);
+    // phantom: n=2, one unregistered
+    SCHED_EXPECTED.reset(); SCHED_UNRECEIVED.reset(); SCHED_PHANTOM_STREAMS.reset();
+    SCHED_STREAMS_SHORT.reset(); LAT_CO.clearAll();
+    Win w2 = new Win(true, 2, iv);
+    w2.startNs = start; w2.endNs = end;
+    Track t2 = new Track(phase, iv);
+    t2.recv.set(exp);
+    w2.tracks.put(new StreamKey(1, 2), t2);
+    accountWave(w2, cutoff);
+    long per = (end - start) / iv;
+    fail += selfCheck("phantom streams", SCHED_PHANTOM_STREAMS.sum() == 1);
+    fail += selfCheck("phantom expected", SCHED_EXPECTED.sum() == exp + per);
+    fail += selfCheck("phantom unreceived", SCHED_UNRECEIVED.sum() == per);
+    return fail;
+  }
+
+  static int selfCheck(String name, boolean ok) {
+    if (!ok) System.err.println("self-test FAIL: " + name);
+    return ok ? 0 : 1;
   }
 
   static Result run(Args args, List<String> tokens) throws Exception {
@@ -490,13 +557,14 @@ public class StreamLoad {
       mapping[i] = gid;
       String pool = label + gid; // Architecture 2026-10-30 15:13: G groups, streams round-robin
       String tok = tokens.get(i % tokens.size());
+      final int idx = i;
       consumers.add(Thread.startVirtualThread(() -> {
-        try { consumer(http, args, tok, pool, w, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals); }
+        try { consumer(http, args, tok, pool, w, idx, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "consumer " + pool, e); }
       }));
       if (i % 8 == 0) Thread.sleep(20); // slower admit ramp at 1k (was 10ms/32)
       producers.add(Thread.startVirtualThread(() -> {
-        try { producer(http, args, tok, pool, w, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries, groupOpenRefusals); }
+        try { producer(http, args, tok, pool, w, idx, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries, groupOpenRefusals); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "producer " + pool, e); }
       }));
     }
@@ -549,7 +617,7 @@ public class StreamLoad {
   }
 
   static void producer(HttpClient http, Args args, String token, String pool,
-      Win w, AtomicBoolean inTeardown,
+      Win w, int idx, AtomicBoolean inTeardown,
       ConcurrentLinkedQueue<Double> creditWaits,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong requests, AtomicLong credit429, AtomicLong producerTransportRetries,
@@ -564,6 +632,8 @@ public class StreamLoad {
       return;
     }
     if (claimSc != 200) throw new IOException("claim " + claimSc);
+    // Test-only smoke: delay every 11th claim so it returns mid-window or after the window.
+    if (w.account && args.claimDelayMs > 0 && idx % 11 == 0) Thread.sleep(args.claimDelayMs);
     Lease lease = parseLease(claim);
     String url = args.base + "/swarm/v1/leases/" + enc(lease.id) + ":chunk";
     String path = "/swarm/v1/leases/" + enc(lease.id) + ":chunk";
@@ -812,11 +882,11 @@ public class StreamLoad {
   }
 
   static void consumer(HttpClient http, Args args, String token, String pool,
-      Win w, AtomicBoolean inTeardown, LongAdder bytesRx,
+      Win w, int idx, AtomicBoolean inTeardown, LongAdder bytesRx,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong consumerConnectRetries, AtomicLong groupOpenRefusals) throws Exception {
     if (args.leanConsumerActive()) {
-      consumerLean(args, token, pool, w, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals);
+      consumerLean(args, token, pool, w, idx, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals);
       return;
     }
     AtomicBoolean stop = w.hardStop;
@@ -859,6 +929,10 @@ public class StreamLoad {
         try (InputStream in = get.body()) {
           w.consumerStreams.add(in); // closed at the drain cutoff (re-review optional)
           if (w.hardStop.get()) return;
+          if (args.hangEvery > 0 && idx % args.hangEvery == 0) { // test-only: hung stream
+            while (!w.hardStop.get()) LockSupport.parkNanos(100_000_000L);
+            return;
+          }
           if ("sse".equals(args.accept)) readSse(in, w, bytesRx);
           else readBinary(in, w, bytesRx);
         }
@@ -886,7 +960,7 @@ public class StreamLoad {
    * 201 a failure is an error, never a second :stream (Architecture review: no second session).
    */
   static void consumerLean(Args args, String token, String pool,
-      Win w, AtomicBoolean inTeardown, LongAdder bytesRx,
+      Win w, int idx, AtomicBoolean inTeardown, LongAdder bytesRx,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong consumerConnectRetries, AtomicLong groupOpenRefusals) throws Exception {
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
@@ -930,6 +1004,10 @@ public class StreamLoad {
       w.consumerSockets.add(lh);
       int gsc = lh.startGet(lh.head("GET", loc, token, null, CT, -1));
       if (gsc != 200) throw new IOException("replies " + gsc);
+      if (args.hangEvery > 0 && idx % args.hangEvery == 0) { // test-only: hung stream
+        while (!w.hardStop.get()) LockSupport.parkNanos(100_000_000L);
+        return;
+      }
       try {
         readBinaryLean(lh.bodyStream(), w, bytesRx);
       } catch (IOException e) {
@@ -1539,6 +1617,8 @@ public class StreamLoad {
         case "--lean-consumer" -> args.leanConsumer = true;
         case "--no-lean-consumer" -> args.leanConsumer = false;
         case "--harness-commit" -> args.harnessCommit = a[++i];
+        case "--claim-delay-ms" -> args.claimDelayMs = Long.parseLong(a[++i]);
+        case "--hang-every" -> args.hangEvery = Integer.parseInt(a[++i]);
         default -> throw new IllegalArgumentException(a[i]);
       }
     }
