@@ -228,4 +228,40 @@ class CpHostTest {
         assertThrows(IllegalArgumentException.class, () -> CpWitness.open(dir.resolve("w"), CpLaunch.nodeId(c.self()),
                 CpLaunch.voters(c), sjws_nettask.cluster.Clock.SYSTEM, new SimTransport()));
     }
+
+    @Test
+    void adminListenerAddressIsReportedOnceBound() throws Exception {
+        var deps = new CpTestDeps();
+        try (var host = CpLaunch.start(config(yaml("cp-1", 0, 0)), deps, err)) {
+            var listen = host.adminListen();
+            assertTrue(listen.startsWith("127.0.0.1:") || listen.startsWith("[::1]:"), listen);
+            int port = Integer.parseInt(listen.substring(listen.lastIndexOf(':') + 1));
+            assertTrue(port > 0, listen);
+            assertEquals("listening", host.adminState());
+            assertEquals(listen, CpHost.formatListen(new java.net.InetSocketAddress("127.0.0.1", port)));
+            var v6 = CpHost.formatListen(new java.net.InetSocketAddress("::1", 9));
+            assertTrue(v6.startsWith("[") && v6.endsWith("]:9"), v6);
+            assertEquals("", CpHost.formatListen(null));
+        }
+    }
+
+    @Test
+    void adminBindFailureWritesFailedAndKeepsTheHostUp() throws Exception {
+        var deps = new CpTestDeps();
+        try (var occupied = new java.net.ServerSocket()) {
+            occupied.setReuseAddress(false);
+            occupied.bind(new java.net.InetSocketAddress("127.0.0.1", 0));
+            int port = occupied.getLocalPort();
+            var y = yaml("cp-1", 0, 0);
+            y.put("admin", Map.of("listen", "127.0.0.1:" + port));
+            var errBuf = new ByteArrayOutputStream();
+            try (var host = (CpHost) CpLaunch.start(config(y), deps, new PrintStream(errBuf))) {
+                assertEquals("failed", host.adminState());
+                assertEquals("127.0.0.1:" + port, host.adminListen());
+                assertTrue(errBuf.toString().contains("admin listener failed to bind"), errBuf.toString());
+                assertNull(host.reload());
+            }
+        }
+    }
+
 }

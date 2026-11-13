@@ -66,6 +66,21 @@ class HealthBoardTest {
         assertEquals(503, new HaHandler(empty, unloaded).handle(new Request("GET", "/file")).status());
     }
 
+    @Test
+    void dataPlaneSupplierGatesReadiness() {
+        var board = new HealthBoard(false);
+        board.setSnapshotLoaded(true);
+        assertTrue(board.readyNow());
+        board.setDataPlaneReady(() -> false);
+        assertFalse(board.readyNow());
+        assertEquals(503, board.ready(false).status());
+        board.setDataPlaneReady(() -> true);
+        assertTrue(board.readyNow());
+        assertEquals(200, board.ready(false).status());
+        board.setDataPlaneReady(null);
+        assertTrue(board.readyNow());
+    }
+
     private static byte[] bytes(sjws_nettask.core.Response response) {
         var body = (sjws_nettask.core.Body.Bytes) response.body();
         var dup = body.data().duplicate();

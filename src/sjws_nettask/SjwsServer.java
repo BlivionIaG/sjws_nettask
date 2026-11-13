@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
 import java.nio.channels.ServerSocketChannel;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
@@ -113,6 +114,11 @@ public final class SjwsServer implements AutoCloseable {
      * Otherwise the chain, or a terminal that is not the static handler. Fixed at start.
      */
     private final Handler override;
+    /**
+     * Non-HA data node with no startup leaf: {@link #override} is a readiness wrapper over the live
+     * snapshot, and each HTTP/2 generation pins its own snapshot behind this readiness check.
+     */
+    private final java.util.function.BooleanSupplier snapshotReadiness;
     /** Null when the server was started without {@link HaSettings}. */
     private final HaRuntime ha;
     private final AltSvc altSvc = new AltSvc();
@@ -121,12 +127,16 @@ public final class SjwsServer implements AutoCloseable {
     /** Generations awaiting quiesce before their snapshot close; capped to bound memory. */
     private final java.util.ArrayDeque<sjws_nettask.h2.Http2Server.Generation> drainingGenerations =
             new java.util.ArrayDeque<>();
+    /** Outgoing mask names held until the generation they belong to quiesces. */
+    private final java.util.IdentityHashMap<sjws_nettask.h2.Http2Server.Generation, String[]> heldMaskNames =
+            new java.util.IdentityHashMap<>();
     private final ReentrantLock drainLock = new ReentrantLock();
     private static final int MAX_DRAINING_GENERATIONS = 4;
     /** Bound for deferred snapshot close; shortened in tests to cover the force path. */
     volatile java.time.Duration snapshotDrainTimeout = java.time.Duration.ofSeconds(30);
     /** Set only by a data-role bootstrap. The field type is {@code Object} so standalone does not name {@code cp}. */
     private Object controlPlane;
+    private Path pinFile;
     /** Released when {@link #close()} has finished, so a second caller waits for the drain. */
     private final CountDownLatch shutdownDone = new CountDownLatch(1);
     private volatile Duration shutdownTimeout = Daemon.DEFAULT_SHUTDOWN_TIMEOUT;
@@ -137,10 +147,22 @@ public final class SjwsServer implements AutoCloseable {
     private ServerSocketChannel tcp;
     private ClientManager manager;
     private Thread acceptThread;
+    /** The real accept loop after a late bind; {@link #acceptThread} is the lifecycle waiter. */
+    private volatile Thread contentAcceptThread;
     /** Released by {@link #close()} so a control process with no content port can leave {@link #awaitTermination()}. */
     private final CountDownLatch contentless = new CountDownLatch(1);
+    private Transport.Factory contentH3Factory;
+    private Transport.Factory contentH2Factory;
+    /**
+     * {@code sjws_nettask.cp.DataPlaneGuard} on a data node. Untyped so constructing a
+     * standalone server does not resolve that class.
+     */
+    private Object dataPlane;
+    private final ReentrantLock contentBindLock = new ReentrantLock();
     /** Set after a data node accepts a control-plane document. SIGHUP then keeps that document. */
     private final AtomicBoolean remoteApplied = new AtomicBoolean();
+    /** Restored at boot so a later {@link #attachControlPlane} can seed the applicator. */
+    private volatile sjws_nettask.cp.SignedSnapshot restoredLastGood;
     /** Re-reads bootstrap local settings. Null until the service hook attaches one. */
     private volatile Runnable localReload;
     private AutoCloseable reloadHook;
@@ -205,9 +227,10 @@ public final class SjwsServer implements AutoCloseable {
         }
         this.chain = built;
         this.chainLeaf = chainLeaf;
+        Handler published;
         if (haSettings == null) {
             this.ha = null;
-            this.override = selected;
+            published = selected;
         } else {
             // One handler read. The config snapshot is that handler until a generation is published.
             Supplier<Handler> generationLeaf;
@@ -219,8 +242,23 @@ public final class SjwsServer implements AutoCloseable {
                 generationLeaf = this.live::handler;
             }
             this.ha = HaRuntime.create(haSettings, generationLeaf);
-            this.override = this.ha.handler();
+            published = this.ha.handler();
         }
+        java.util.function.BooleanSupplier readiness = null;
+        if (snapshot.document().node().mode() == NodeSettings.Mode.DATA) {
+            var guard = sjws_nettask.cp.DataPlaneGuard.forDocument(snapshot.document());
+            this.dataPlane = guard;
+            if (this.ha != null) {
+                this.ha.health().setDataPlaneReady(guard::ready);
+            } else {
+                Handler current = published;
+                published = new DataReadyHandler(
+                        () -> current != null ? current : this.live.handler(), guard::ready);
+                readiness = current == null ? guard::ready : null;
+            }
+        }
+        this.override = published;
+        this.snapshotReadiness = readiness;
         if (config.cacheBytes() > Runtime.getRuntime().maxMemory() / 2) {
             System.err.println("WARN: --cache-bytes=" + config.cacheBytes()
                     + " is more than half of the maximum heap (" + Runtime.getRuntime().maxMemory()
@@ -293,7 +331,7 @@ public final class SjwsServer implements AutoCloseable {
             Function<StaticFileHandler, Handler> terminal, List<HandlerContributor> contributors)
             throws IOException {
         return start(ConfigLoader.standalone(config), H3Transports.defaultFactory(), H2_FACTORY, filters, terminal,
-                null, null, true, contributors);
+                null, null, true, contributors, null);
     }
 
     /**
@@ -390,13 +428,18 @@ public final class SjwsServer implements AutoCloseable {
 
     static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory, boolean bindContent,
             List<HandlerContributor> contributors) throws IOException {
-        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, contributors);
+        return start(loaded, h3Factory, bindContent, contributors, null);
+    }
+
+    static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory, boolean bindContent,
+            List<HandlerContributor> contributors, Path pin) throws IOException {
+        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, contributors, pin);
     }
 
     static SjwsServer start(ServerConfig config, Transport.Factory h3Factory, List<HandlerContributor> contributors)
             throws IOException {
         return start(ConfigLoader.standalone(config), h3Factory, H2_FACTORY, null, null, null, null, true,
-                contributors);
+                contributors, null);
     }
 
     /**
@@ -404,7 +447,7 @@ public final class SjwsServer implements AutoCloseable {
      *        for standalone and tests. A null verifier uses {@link SnapshotVerifier#forMode}.
      */
     public static SjwsServer start(ConfigLoader.Loaded loaded, SnapshotVerifier verifier) throws IOException {
-        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, null, verifier, true, null);
+        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, null, verifier, true, null, null);
     }
 
     public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory) throws IOException {
@@ -414,7 +457,21 @@ public final class SjwsServer implements AutoCloseable {
     /** {@code bindContent} false leaves the content port unbound. The process still stays up until {@link #close()}. */
     public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory, boolean bindContent)
             throws IOException {
-        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, null);
+        return start(loaded, h3Factory, bindContent, (Path) null);
+    }
+
+    /**
+     * {@code pin} is the data-node root public key, used only to verify a persisted last-good
+     * at start. Null is fail-closed for that check.
+     */
+    public static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory, boolean bindContent,
+            Path pin) throws IOException {
+        return start(loaded, h3Factory, H2_FACTORY, null, null, null, null, bindContent, null, pin);
+    }
+
+    /** Config-file startup with HA attached (data-role {@code /readyz} still follows last-good). */
+    public static SjwsServer start(ConfigLoader.Loaded loaded, HaSettings ha) throws IOException {
+        return start(loaded, H3Transports.defaultFactory(), H2_FACTORY, null, null, ha, null, true, null, null);
     }
 
     /** Package-visible so same-package tests can wire a custom {@code h2Factory} with a file-backed reload. */
@@ -427,13 +484,20 @@ public final class SjwsServer implements AutoCloseable {
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
             HaSettings ha) throws IOException {
-        return start(loaded, h3Factory, h2Factory, filters, terminal, ha, null, true, null);
+        return start(loaded, h3Factory, h2Factory, filters, terminal, ha, null, true, null, null);
     }
 
     private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
             Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
             HaSettings ha, SnapshotVerifier verifier, boolean bindContent, List<HandlerContributor> contributors)
             throws IOException {
+        return start(loaded, h3Factory, h2Factory, filters, terminal, ha, verifier, bindContent, contributors, null);
+    }
+
+    private static SjwsServer start(ConfigLoader.Loaded loaded, Transport.Factory h3Factory,
+            Transport.Factory h2Factory, RequestFilters filters, Function<StaticFileHandler, Handler> terminal,
+            HaSettings ha, SnapshotVerifier verifier, boolean bindContent, List<HandlerContributor> contributors,
+            Path pin) throws IOException {
         var board = new ChallengeBoard();
         var snapshot = ConfigSnapshot.compile(loaded.document(), board, 1);
         if (ha != null && ha.handler() instanceof StaticFileHandler injected) {
@@ -445,48 +509,30 @@ public final class SjwsServer implements AutoCloseable {
         }
         var server = new SjwsServer(snapshot, new ConfigReloader(loaded), board, filters, terminal, ha, verifier,
                 contributors);
-        if (bindContent) {
-            if (snapshot.document().server().h3Enabled()) {
-                server.startH3(h3Factory, storedCertificate(snapshot));
-            }
-            if (snapshot.document().server().h2Enabled()) {
-                server.startH2(h2Factory);
-            }
+        server.contentH3Factory = h3Factory;
+        server.contentH2Factory = h2Factory;
+        server.pinFile = pin;
+        boolean lastGoodPresent = false;
+        boolean lastGoodInstalled = false;
+        // Standalone has no pin; the guard keeps the control-plane classes unloaded there.
+        if (pin != null) {
+            var verified = sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(snapshot.document().stateDir(), pin)
+                    .orElse(null);
+            lastGoodPresent = verified != null;
+            lastGoodInstalled = lastGoodPresent && server.installVerifiedLastGood(verified);
+        }
+        if (bindContent && !(lastGoodPresent && !lastGoodInstalled)) {
             try {
-                server.tcp = bind(snapshot.document().server().port(), snapshot.document().server().backlog());
-            } catch (IOException e) {
-                server.close();
-                throw e;
-            }
-            Supplier<Handler> handlers = server.override != null ? () -> server.override : server.live::handler;
-            server.manager = new ClientManager(server.tcp, snapshot.document().server(), handlers, server.altSvc,
-                    null, server.armed);
-            server.attachGauges(server.slot.get().metrics());
-            if (server.ha != null) {
-                server.manager.setDrainSignal(server.ha.lifecycle()::closeAfterResponse);
-                server.manager.onAcceptLoopExit(() -> server.ha.health().setAlive(false));
-                IntSupplier pause = server.ha.settings().acceptPause();
-                if (pause != null) {
-                    server.manager.setAcceptPause(pause);
+                if (!server.bindContentPort()) {
+                    server.close();
+                    throw new IOException("content port was not bound");
                 }
-            }
-            server.acceptThread = new Thread(server.manager, "accept-loop");
-            server.acceptThread.start();
-            try {
-                server.openChallenge(snapshot);
             } catch (IOException e) {
                 server.close();
                 throw e;
             }
         } else {
-            server.acceptThread = new Thread(() -> {
-                try {
-                    server.contentless.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-            }, "service-idle");
-            server.acceptThread.start();
+            server.startIdleAccept();
         }
         server.leadership = leadershipFor(snapshot);
         server.reloadHook = ReloadHook.register(server::onReload);
@@ -551,7 +597,7 @@ public final class SjwsServer implements AutoCloseable {
             if (transport instanceof sjws_nettask.h2.Http2Server http2) {
                 // Pin a fully armed generation (filters + metrics around the snapshot terminal, or
                 // around a frozen override) so each Task captures one handler (#301 / B3).
-                Handler pinned = this.override != null ? this.override : this.live.handler();
+                Handler pinned = generationLeaf(this.live.get());
                 Handler armed = armedAround(pinned);
                 boolean bodies = liveNeedsBodies() || this.override != null;
                 http2.armHandler(armed, bodies);
@@ -561,6 +607,7 @@ public final class SjwsServer implements AutoCloseable {
             }
             // Custom h2Factory: no start-time arm — chain-control apply, metrics, and publish call
             // Transport.armHandler via armH2 (Codex P2 4421410868).
+            transport.shutdownTimeout(this.shutdownTimeout);
             transport.start();
             this.h2 = transport;
         } catch (Exception | LinkageError e) {
@@ -596,6 +643,12 @@ public final class SjwsServer implements AutoCloseable {
     private void openChallenge(ConfigSnapshot snapshot) throws IOException {
         var acme = snapshot.document().acme();
         if (acme.enabled() && !acme.onMainListener(snapshot.document().server().port())) {
+            if (this.challengeHttp != null && this.challengeHttp.port() == acme.httpPort()) {
+                return;
+            }
+            if (this.challengeHttp != null) {
+                this.challengeHttp = closeQuietly(this.challengeHttp);
+            }
             this.challengeHttp = ChallengeHttpServer.open(acme.httpPort(), this.board);
         }
     }
@@ -692,6 +745,9 @@ public final class SjwsServer implements AutoCloseable {
                             && this.live.get().document().node().mode() == NodeSettings.Mode.DATA) {
                         this.remoteApplied.set(true);
                     }
+                    if (incoming == null && result.applied()) {
+                        dataPlane().localMaxStaleness(result.snapshot().document().node().maxStaleness());
+                    }
                 }
             } catch (ConfigException e) {
                 var message = e.getMessage() == null ? "configuration rejected" : e.getMessage();
@@ -715,6 +771,76 @@ public final class SjwsServer implements AutoCloseable {
      */
     public void attachControlPlane(Object apply) {
         this.controlPlane = Objects.requireNonNull(apply, "apply");
+        if (apply instanceof sjws_nettask.cp.DataApply data && this.restoredLastGood != null) {
+            data.record(this.restoredLastGood);
+        }
+    }
+
+    /**
+     * Restores a persisted last-good into the running snapshot, then records it as the
+     * readiness source. Uses the already-verified in-memory envelope, not a second disk read.
+     * Returns false when the file does not verify or the document cannot be published.
+     */
+    public boolean installPersistedLastGood(Path stateDir, Path pin) {
+        var verified = sjws_nettask.cp.DataApply.tryReadVerifiedLastGood(stateDir, pin).orElse(null);
+        if (verified == null) {
+            dataPlane().clearLastGood();
+            return false;
+        }
+        return installVerifiedLastGood(verified);
+    }
+
+    private boolean installVerifiedLastGood(sjws_nettask.cp.DataApply.VerifiedLastGood verified) {
+        var snapshot = verified.snapshot();
+        this.reloadLock.lock();
+        try {
+            ConfigLoader.Loaded loaded;
+            try {
+                loaded = parseSnapshotYaml(snapshot.canonicalYaml());
+            } catch (IOException e) {
+                dataPlane().clearLastGood();
+                return false;
+            }
+            if (!loaded.ok() || loaded.document() == null) {
+                dataPlane().clearLastGood();
+                return false;
+            }
+            var published = applyEnvelope(snapshot, loaded.document());
+            if (!published.applied()) {
+                dataPlane().clearLastGood();
+                return false;
+            }
+            syncCredentialQueryParamsFromConfig(published.snapshot().document());
+            dataPlane().applied(snapshot, false);
+            dataPlane().pushedMaxStaleness(published.snapshot().document().node().maxStaleness());
+            this.remoteApplied.set(true);
+            this.restoredLastGood = snapshot;
+            if (this.controlPlane instanceof sjws_nettask.cp.DataApply apply) {
+                apply.record(snapshot);
+            }
+            if (this.pinFile != null) {
+                try {
+                    sjws_nettask.cp.LastGoodFiles.ratchetPin(this.pinFile, snapshot.version(), verified.bundleSerial());
+                } catch (IOException e) {
+                    System.err.println("WARN: pin floor was not updated: " + e.getMessage());
+                }
+            }
+            return true;
+        } finally {
+            this.reloadLock.unlock();
+        }
+    }
+
+    private ConfigLoader.Loaded parseSnapshotYaml(String yaml) throws IOException {
+        var dir = java.nio.file.Files.createTempDirectory("sjws-last-good-");
+        var file = dir.resolve("snap.yaml");
+        try {
+            java.nio.file.Files.writeString(file, yaml);
+            return ConfigLoader.load(new String[] {"--config=" + file}, java.util.Map.of());
+        } finally {
+            java.nio.file.Files.deleteIfExists(file);
+            java.nio.file.Files.deleteIfExists(dir);
+        }
     }
 
     /**
@@ -746,20 +872,7 @@ public final class SjwsServer implements AutoCloseable {
                 var errors = loaded.errors().isEmpty() ? java.util.List.of("configuration rejected") : loaded.errors();
                 return ReloadResult.rejected(this.live.get(), errors);
             }
-            var document = loaded.document();
-            if (document.bundleVersion() != snapshot.version() || document.schemaVersion() != snapshot.schema()) {
-                document = ConfigDocument.of(document.server(), document.acme(), document.routing(),
-                        document.middleware(), document.access(), document.node(), snapshot.schema(),
-                        snapshot.version(), this.live.get().document().configFile(), document.messaging())
-                        .withStateDir(document.stateDir());
-            }
-            var result = this.reloader.apply(this.live.get(), document, this.h3 != null, this.board, true);
-            if (result.applied() && snapshot.epoch() != result.snapshot().epoch()) {
-                var snap = result.snapshot().withEpoch(snapshot.epoch());
-                result = new ReloadResult(true, snap.generation(), result.warnings(), java.util.List.of(),
-                        result.needsRestart(), snap, result.tls());
-            }
-            var published = result.applied() && result.snapshot() == this.live.get() ? result : publish(result);
+            var published = applyEnvelope(snapshot, loaded.document());
             // Last-good (signed envelope, floor, trust, and the config sibling) is written only in DATA mode.
             if (published.applied() && this.live.get().document().node().mode() != NodeSettings.Mode.DATA) {
                 apply.record(snapshot);
@@ -771,6 +884,13 @@ public final class SjwsServer implements AutoCloseable {
                     System.err.println("WARN: control-plane last-good was not saved: " + e.getMessage());
                 }
                 persistLastGood(published.snapshot().document());
+                dataPlane().applied(snapshot, true);
+                dataPlane().pushedMaxStaleness(published.snapshot().document().node().maxStaleness());
+                try {
+                    bindContentPort();
+                } catch (IOException e) {
+                    System.err.println("WARN: content port was not bound after last-good: " + e.getMessage());
+                }
                 var appliedMw = published.snapshot().document().middleware();
                 syncCredentialQueryParamsFromConfig(published.snapshot().document());
                 sjws_nettask.config.MiddlewareSecrets.logStartupWarn(
@@ -780,6 +900,31 @@ public final class SjwsServer implements AutoCloseable {
         } finally {
             this.reloadLock.unlock();
         }
+    }
+
+    /**
+     * Applies a parsed envelope document under {@link #reloadLock}: adopts the envelope's schema,
+     * version and epoch, keeps this node's state dir, then publishes. The caller has already
+     * verified the envelope.
+     */
+    private ReloadResult applyEnvelope(sjws_nettask.cp.SignedSnapshot snapshot, ConfigDocument document) {
+        var localStateDir = this.live.get().document().stateDir();
+        var stateDir = localStateDir != null ? localStateDir : document.stateDir();
+        if (document.bundleVersion() != snapshot.version() || document.schemaVersion() != snapshot.schema()) {
+            document = ConfigDocument.of(document.server(), document.acme(), document.routing(),
+                    document.middleware(), document.access(), document.node(), snapshot.schema(),
+                    snapshot.version(), this.live.get().document().configFile(), document.messaging());
+        }
+        if (!Objects.equals(document.stateDir(), stateDir)) {
+            document = document.withStateDir(stateDir);
+        }
+        var result = this.reloader.apply(this.live.get(), document, this.h3 != null, this.board, true);
+        if (result.applied() && snapshot.epoch() != result.snapshot().epoch()) {
+            var snap = result.snapshot().withEpoch(snapshot.epoch());
+            result = new ReloadResult(true, snap.generation(), result.warnings(), java.util.List.of(),
+                    result.needsRestart(), snap, result.tls());
+        }
+        return result.applied() && result.snapshot() == this.live.get() ? result : publish(result);
     }
 
     private static boolean controlPlaneSectionsChanged(ConfigDocument current, ConfigDocument next) {
@@ -836,6 +981,10 @@ public final class SjwsServer implements AutoCloseable {
             }
         }
         var current = this.live.get();
+        var localDocument = this.reloader.readLocal(current.document().configFile());
+        if (localDocument != null) {
+            dataPlane().localMaxStaleness(localDocument.node().maxStaleness());
+        }
         return new ReloadResult(false, current.generation(), warnings, java.util.List.of(), java.util.List.of(),
                 current, null);
     }
@@ -867,6 +1016,9 @@ public final class SjwsServer implements AutoCloseable {
         }
         var replaced = this.live.get();
         var next = result.snapshot();
+        // Union of outgoing and incoming names, before any transport is armed with the new
+        // config, so a request that still enters the outgoing generation stays masked.
+        syncCredentialQueryParamsUnion(replaced.document(), next.document());
         // HTTP/2: one atomic generation = fully armed chain (filters/metrics) + attachBodies (#301
         // P1/P2a). In-flight Tasks keep the generation they captured; defer closing replaced pools
         // until those Tasks leave (P2b).
@@ -946,11 +1098,20 @@ public final class SjwsServer implements AutoCloseable {
         } else if (this.acme != null) {
             this.acme.update(result.snapshot().document().acme());
         }
+        // Outgoing-only names stay until the previous generation quiesces, so a request
+        // that already entered (tryEnter) and is still queued keeps them. Incoming names
+        // stay. A generation with no pins quiesces at once, so names drop in that case.
+        holdOutgoingMaskNames(previousH2, replaced.document());
+        syncCredentialQueryParamsFromConfig(next.document());
         return result;
     }
 
     private void persistLastGood(ConfigDocument document) {
         if (document.node().mode() != NodeSettings.Mode.DATA) {
+            return;
+        }
+        // Do not overwrite a signed control-plane last-good (readiness and expiry live there).
+        if (sjws_nettask.cp.DataApply.tryReadLastGood(document.stateDir()).isPresent()) {
             return;
         }
         try {
@@ -1253,7 +1414,19 @@ public final class SjwsServer implements AutoCloseable {
         if (control != null && control.isLive()) {
             return this.chainLeaf;
         }
-        return this.override != null ? this.override : next.handler();
+        return generationLeaf(next);
+    }
+
+    /**
+     * The leaf an HTTP/2 generation pins for {@code snapshot}: that snapshot's own handler (behind
+     * the data-node readiness check when that is the override), or the startup override.
+     */
+    private Handler generationLeaf(ConfigSnapshot snapshot) {
+        if (this.snapshotReadiness != null) {
+            Handler frozen = snapshot.handler();
+            return new DataReadyHandler(() -> frozen, this.snapshotReadiness);
+        }
+        return this.override != null ? this.override : snapshot.handler();
     }
 
     private Handler compileAroundTerminal(Handler terminal) {
@@ -1275,7 +1448,81 @@ public final class SjwsServer implements AutoCloseable {
         if (control != null && control.isLive()) {
             return;
         }
-        this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromMiddleware(document.middleware()));
+        this.slot.attachCredentialQueryParams(unionWithHeldMaskNames(
+                AccessTargetMask.namesFromMiddleware(document.middleware())));
+    }
+
+    private void syncCredentialQueryParamsUnion(sjws_nettask.config.ConfigDocument outgoing,
+            sjws_nettask.config.ConfigDocument incoming) {
+        var control = this.control;
+        if (control != null && control.isLive()) {
+            return;
+        }
+        this.slot.attachCredentialQueryParams(unionWithHeldMaskNames(AccessTargetMask.union(
+                AccessTargetMask.namesFromMiddleware(outgoing.middleware()),
+                AccessTargetMask.namesFromMiddleware(incoming.middleware()))));
+    }
+
+    /**
+     * Keeps {@code outgoing}'s mask names until {@code previous} quiesces. A later
+     * {@link #syncCredentialQueryParamsFromConfig} then unions those names with the
+     * published document so queued work on that generation stays masked. Null {@code previous}
+     * (no HTTP/2 generation) holds nothing.
+     */
+    private void holdOutgoingMaskNames(sjws_nettask.h2.Http2Server.Generation previous,
+            sjws_nettask.config.ConfigDocument outgoing) {
+        if (previous == null) {
+            return;
+        }
+        var names = AccessTargetMask.namesFromMiddleware(outgoing.middleware());
+        this.drainLock.lock();
+        try {
+            this.heldMaskNames.put(previous, names);
+        } finally {
+            this.drainLock.unlock();
+        }
+        previous.whenQuiesced(() -> {
+            this.drainLock.lock();
+            try {
+                this.heldMaskNames.remove(previous);
+            } finally {
+                this.drainLock.unlock();
+            }
+            // Refresh on another thread: do not acquire reloadLock on this call stack.
+            // forceQuiesce can run under the chain publication lock (trackDrainingGeneration
+            // from a chain-control apply); publication already waits for that lock while
+            // holding reloadLock. The delayed refresh takes reloadLock so it cannot replace
+            // a mid-publish pre-arm union with a stale document. Until it runs, the slot
+            // may still list the just-removed names (they stay masked).
+            Thread.ofVirtual().name("sjws-mask-retire").start(this::refreshHeldMaskNames);
+        });
+    }
+
+    /** Attaches published names unioned with every still-held outgoing list. */
+    private void refreshHeldMaskNames() {
+        this.reloadLock.lock();
+        try {
+            var live = this.live.get();
+            if (live != null) {
+                syncCredentialQueryParamsFromConfig(live.document());
+            }
+        } finally {
+            this.reloadLock.unlock();
+        }
+    }
+
+    /** Incoming names plus every still-held outgoing list, in first-seen order. */
+    private String[] unionWithHeldMaskNames(String[] incoming) {
+        this.drainLock.lock();
+        try {
+            var names = incoming;
+            for (var held : this.heldMaskNames.values()) {
+                names = AccessTargetMask.union(held, names);
+            }
+            return names;
+        } finally {
+            this.drainLock.unlock();
+        }
     }
 
     /**
@@ -1299,10 +1546,25 @@ public final class SjwsServer implements AutoCloseable {
      * just applied), not from startup middleware / override. HTTP/2 publish goes through
      * {@link #armH2} (generation + custom factory).
      */
+    private Handler withDataReadiness(Handler handler) {
+        if (handler == null || this.ha != null) {
+            return handler;
+        }
+        var guard = dataPlane();
+        if (!guard.active()) {
+            return handler;
+        }
+        if (handler instanceof DataReadyHandler) {
+            return handler;
+        }
+        return new DataReadyHandler(() -> handler, guard::ready);
+    }
+
     private void armSnapshot(Handler handler) {
         // onPublish runs only after {@link #chainControl} assigned {@link #control}, and after
         // apply/pinOuter has written {@link ChainControl#document()}.
         this.slot.attachCredentialQueryParams(AccessTargetMask.namesFromDocument(this.control.document()));
+        handler = withDataReadiness(handler);
         this.armed.set(handler);
         if (this.h3 != null) {
             this.h3.armHandler(handler);
@@ -1419,16 +1681,23 @@ public final class SjwsServer implements AutoCloseable {
             control.pinOuter(new ObserveRequestFilter(this.slot));
             return;
         }
-        if (this.armed.get() != null) {
-            return;
+        // Under the reload lock, so a concurrent publish cannot be overtaken by an older HTTP/2 generation.
+        this.reloadLock.lock();
+        try {
+            if (this.armed.get() != null) {
+                return;
+            }
+            Handler leaf = this.override != null ? this.override : request -> this.live.handler().handle(request);
+            var chain = ObserveRequestFilter.chain(this.slot, leaf);
+            this.armed.set(chain);
+            if (this.h3 != null) {
+                this.h3.armHandler(chain);
+            }
+            // HTTP/2 pins this generation's leaf, as startH2 and publish do.
+            armH2(this.h2 == null ? chain : ObserveRequestFilter.chain(this.slot, generationLeaf(this.live.get())), true);
+        } finally {
+            this.reloadLock.unlock();
         }
-        Handler leaf = this.override != null ? this.override : request -> this.live.handler().handle(request);
-        var chain = ObserveRequestFilter.chain(this.slot, leaf);
-        this.armed.set(chain);
-        if (this.h3 != null) {
-            this.h3.armHandler(chain);
-        }
-        armH2(chain, true);
     }
 
     /**
@@ -1449,7 +1718,129 @@ public final class SjwsServer implements AutoCloseable {
         return this.altSvc;
     }
 
-    public int tcpPort() {
+    /** True when the content TCP listener is bound. */
+    public boolean contentBound() {
+        return this.tcp != null && this.tcp.isOpen();
+    }
+
+    /**
+     * Data-role last-good / max-staleness guard. {@link sjws_nettask.cp.DataPlaneGuard#INACTIVE}
+     * when this process is not a data node.
+     */
+    public sjws_nettask.cp.DataPlaneGuard dataPlane() {
+        return this.dataPlane instanceof sjws_nettask.cp.DataPlaneGuard guard
+                ? guard
+                : sjws_nettask.cp.DataPlaneGuard.inactive();
+    }
+
+    /**
+     * Bind the content port if it is not bound yet. Idempotent. A data node calls this after
+     * the first verified last-good is applied. Returns false if the server is already closed.
+     */
+    public boolean bindContentPort() throws IOException {
+        this.contentBindLock.lock();
+        try {
+            if (this.closed.get()) {
+                return false;
+            }
+            if (contentBound()) {
+                return true;
+            }
+            var snapshot = this.live.get();
+            startIdleAccept();
+            try {
+                if (snapshot.document().server().h3Enabled()) {
+                    startH3(this.contentH3Factory, storedCertificate(snapshot));
+                }
+                if (snapshot.document().server().h2Enabled()) {
+                    startH2(this.contentH2Factory);
+                }
+                this.tcp = bind(snapshot.document().server().port(), snapshot.document().server().backlog());
+                Supplier<Handler> handlers = this.override != null ? () -> this.override : this.live::handler;
+                this.manager = new ClientManager(this.tcp, snapshot.document().server(), handlers, this.altSvc,
+                        null, this.armed);
+                this.manager.shutdownTimeout(this.shutdownTimeout);
+                attachGauges(this.slot.get().metrics());
+                if (this.ha != null) {
+                    this.manager.setDrainSignal(this.ha.lifecycle()::closeAfterResponse);
+                    this.manager.onAcceptLoopExit(() -> this.ha.health().setAlive(false));
+                    IntSupplier pause = this.ha.settings().acceptPause();
+                    if (pause != null) {
+                        this.manager.setAcceptPause(pause);
+                    }
+                }
+                openChallenge(snapshot);
+                if (this.closed.get()) {
+                    rollbackContentBind();
+                    return false;
+                }
+                // Start the accept loop, then release the lifecycle waiter so it can join this
+                // thread. Replacing acceptThread would return awaitTermination() on the idle join.
+                this.contentAcceptThread = new Thread(this.manager, "accept-loop");
+                this.contentAcceptThread.start();
+                this.contentless.countDown();
+                return true;
+            } catch (IOException | RuntimeException e) {
+                rollbackContentBind();
+                if (e instanceof IOException io) {
+                    throw io;
+                }
+                throw new IOException("content port was not bound: " + e.getMessage(), e);
+            }
+        } finally {
+            this.contentBindLock.unlock();
+        }
+    }
+
+    private void startIdleAccept() {
+        if (this.acceptThread != null) {
+            return;
+        }
+        this.acceptThread = new Thread(() -> {
+            try {
+                this.contentless.await();
+                if (this.closed.get()) {
+                    return;
+                }
+                Thread accept = this.contentAcceptThread;
+                if (accept != null) {
+                    accept.join();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "service-idle");
+        this.acceptThread.start();
+    }
+
+    /** Undo a failed late bind without shutting the process down. */
+    private void rollbackContentBind() {
+        this.challengeHttp = closeQuietly(this.challengeHttp);
+        if (this.manager != null) {
+            try {
+                this.manager.close();
+            } catch (RuntimeException e) {
+                System.err.println("WARN: " + e);
+            }
+            this.manager = null;
+        }
+        this.tcp = closeQuietly(this.tcp);
+        this.h2 = closeQuietly(this.h2);
+        this.h3 = closeQuietly(this.h3);
+    }
+
+    private static <T extends AutoCloseable> T closeQuietly(T resource) {
+        if (resource != null) {
+            try {
+                resource.close();
+            } catch (Exception e) {
+                System.err.println("WARN: " + e);
+            }
+        }
+        return null;
+    }
+
+        public int tcpPort() {
         if (this.tcp == null) {
             return -1;
         }
@@ -1555,7 +1946,17 @@ public final class SjwsServer implements AutoCloseable {
     @Override
     public void close() {
         long waitMs = this.shutdownTimeout.toMillis() + 3_000;
-        if (!this.closed.compareAndSet(false, true)) {
+        boolean first;
+        this.contentBindLock.lock();
+        try {
+            first = this.closed.compareAndSet(false, true);
+            if (first) {
+                this.contentless.countDown();
+            }
+        } finally {
+            this.contentBindLock.unlock();
+        }
+        if (!first) {
             try {
                 this.shutdownDone.await(waitMs, TimeUnit.MILLISECONDS);
             } catch (InterruptedException e) {
@@ -1563,7 +1964,6 @@ public final class SjwsServer implements AutoCloseable {
             }
             return;
         }
-        this.contentless.countDown();
         try {
             if (this.reloadHook != null) {
                 try {

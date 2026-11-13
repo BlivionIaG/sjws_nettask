@@ -18,7 +18,13 @@ Tests live in `tests/` because `test/` is listed in `.gitignore`.
 | `config/ConfigLoaderTest`, `config/RouteTableTest`, `ReloadServerTest`, `ReloadCoverageTest` | YAML file, routing table validation, immutable snapshot reload, challenge-port rebind, HTTP/3 cert swap on reload |
 | `ReloadHookTest` | reload hook registry |
 | `acme/AcmeTest`, `acme/AcmePebbleTest`, `tls/SwappableKeyManagerTest` | HTTP-01 handler, certificate storage, Pebble issuance when `PEBBLE_BIN` / `PEBBLE_CHALLTESTSRV_BIN` are set (required on Linux CI; pinned install in `.github/workflows/ci.yml`), hot cert swap |
+| `observe/AccessLogModesTest` | AccessLog FILE_0640 and DIR_0750 are unmodifiable (0640 / 0750) |
+| `CredentialMaskBeforePublishTest` | credential mask names: union at publish, outgoing names held until the previous HTTP/2 generation quiesces (queued task after tryEnter), retired afterwards |
+| `admin/MetricsViewTest` | admin Metrics view: two fake node snapshots summed and merged by histogram bucket (p50/p99 from merged buckets), nodes reporting n/m, local node from a real server |
+| `admin/ClusterViewTest` | admin Cluster view: UP/DEGRADED/DOWN from named checks, node detail, missing, failing and slow (timed-out) cluster status sources |
+| `admin/DrainControlTest` | admin drain: background drain with a fake HA drainer, idempotent operation id, start/reload refused while draining, stop during a drain, failed and interrupted drains shown |
 | `admin/AdminTuiTest` | admin console: start/stop/reload of a real server, failed reload rollback, rendering, commands, log tail |
+| `admin/QueueViewTest` | admin Queues view: counts, oldest pending age and paged dead letters from `LedgerInspector` snapshots of a real partition; no payloads, control characters masked |
 | `admin/cp/CpConsoleTest` | control-plane console: label selectors, diff, validation, stage/rollout/rollback on the fake CP, failover client, rendering, zero-cost guard |
 | `observe/ObservabilityTest` | access-log formats, lock-free queue, non-blocking writer, metrics snapshot and Prometheus text, `/healthz` and `/metrics` |
 | `observe/NodeReporterTest` | control heartbeat: 5 s cadence reuses the report, sequence advances only on a fresh take, cumulative 4xx/5xx, health and config generation suppliers, log2 histogram merge and p99 bucket bound |

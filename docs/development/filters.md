@@ -334,6 +334,11 @@ The schema:
 `labels` is comma-separated. `!name` means the node must not carry that label. `*` or omitting
 the selector matches every node. Omitting `scope` matches every request on every node.
 
+The same selector will be reused if a later control-plane overlay sets per-route
+`errors`, `problem_type` or `listing` by node label (see `docs/user/config-file.md`,
+Per-route error format and listings). That overlay is not implemented; routing
+YAML stays per route.
+
 `SjwsServer.chainControl(registry, nodeLabels)` opens a slot and does not change the request
 path. The first successful `apply` compiles the snapshot and installs that handler into the
 volatile slot each transport already reads (the same slot a metrics arm uses). Until then a

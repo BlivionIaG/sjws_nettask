@@ -38,6 +38,46 @@ public interface ServerControl extends AutoCloseable {
         return null;
     }
 
+    /**
+     * Message queues for the Queues view (#384): one row per topic and consumer group, read from
+     * Messaging Core snapshots. Empty when messaging is not enabled. Never throws.
+     */
+    default java.util.List<QueueView> queues() {
+        return java.util.List.of();
+    }
+
+    /**
+     * One page of dead-lettered entries (no payloads) of {@code group} on {@code topic}.
+     * @throws ControlException when the topic or group is unknown or messaging is not enabled
+     */
+    default java.util.List<QueueView.Entry> deadLetters(String topic, String group, long fromOffset, int limit)
+            throws ControlException {
+        throw new ControlException("messaging is not enabled");
+    }
+
+    /**
+     * Metrics for the Metrics view (#366): the nodes that reported and how many are known, or null
+     * when this control has none. Never throws.
+     */
+    default MetricsView.Report metrics() {
+        return null;
+    }
+
+    /**
+     * Starts a graceful drain without blocking (#381): stop accepting, let in-flight work finish
+     * up to the HA drain timeout, then close. Idempotent: while a drain runs, the same operation
+     * is returned. Cancelling a drain is not supported: HA's drain lifecycle has no cancel.
+     * @throws ControlException when the server is not running or drain is not supported
+     */
+    default DrainOperation drain() throws ControlException {
+        throw new ControlException("drain is not available for this server");
+    }
+
+    /** The last drain started from this control, or null. Never throws. */
+    default DrainOperation drainStatus() {
+        return null;
+    }
+
     /** Starts the server if stopped. @throws ControlException if it cannot start */
     void start() throws ControlException;
 

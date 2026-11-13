@@ -9,6 +9,9 @@ java -cp target/classes bench/HttpBench.java 64 10 1024    # connections seconds
 # Standalone vs gateway-mode-off (wrk). Both leave the control plane detached.
 # Official shape: warmup 5s, measure 30s, -t4 -c128, 1 KiB file. See tools/gateway-bench.sh.
 tools/gateway-bench.sh
+
+# Optional wrk2 (fixed-rate p99, printed only) and RSS are recorded by the script.
+# GATEWAY_BENCH_WRK2=1 tools/gateway-bench.sh
 # Shorter run, and fail if gateway-off is outside ±10% of standalone:
 # GATEWAY_BENCH_WARMUP=2s GATEWAY_BENCH_DURATION=10s GATEWAY_BENCH_MAX_DELTA=0.10 tools/gateway-bench.sh
 # Append-only log write-path prototype
