@@ -26,32 +26,55 @@ import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
+import sjws_nettask.core.buf.BufferPool;
+import sjws_nettask.core.buf.NoBufferLeaks;
 
 /** {@link Http1Connection}'s streamed request body and {@link Body.Stream} framing. */
 @org.junit.jupiter.api.extension.ExtendWith(sjws_nettask.core.buf.NoBufferLeaks.class)
 class Http1RequestBodyTest {
 
     private static String exchange(Handler handler, String raw, boolean halfClose) throws Exception {
-        var reaper = new ConnectionReaper(Duration.ofSeconds(5), Duration.ofSeconds(5), Duration.ofSeconds(5));
+        return exchange(handler, raw, halfClose, Duration.ofSeconds(5), null);
+    }
+
+    private static String exchange(Handler handler, String raw, boolean halfClose, Duration headTimeout)
+            throws Exception {
+        return exchange(handler, raw, halfClose, headTimeout, null);
+    }
+
+    private static String exchange(Handler handler, String raw, boolean halfClose, Duration headTimeout,
+            BufferPool pool) throws Exception {
+        var reaper = new ConnectionReaper(headTimeout, headTimeout, headTimeout);
         try (var server = ServerSocketChannel.open().bind(new InetSocketAddress("127.0.0.1", 0));
                 var client = SocketChannel.open(server.getLocalAddress())) {
             var accepted = server.accept();
-            var thread = Thread.ofVirtual().start(new Http1Connection(accepted, handler, ResponseHeaders::of, reaper));
+            var connection = new Http1Connection(accepted, handler, ResponseHeaders::of, reaper);
+            if (pool != null) {
+                connection = connection.withPool(pool);
+            }
+            var thread = Thread.ofVirtual().start(connection);
             client.write(ByteBuffer.wrap(raw.getBytes(StandardCharsets.ISO_8859_1)));
             if (halfClose) {
                 client.shutdownOutput();
             }
             var out = new ByteArrayOutputStream();
             var buf = ByteBuffer.allocate(4096);
-            while (client.read(buf) >= 0) {
-                out.write(buf.array(), 0, buf.position());
-                buf.clear();
+            try {
+                while (client.read(buf) >= 0) {
+                    out.write(buf.array(), 0, buf.position());
+                    buf.clear();
+                }
+            } catch (java.net.SocketException e) {
+                // Closing with an unread drained body can RST before the client finishes reading.
             }
             thread.join(5000);
             return out.toString(StandardCharsets.ISO_8859_1);
@@ -120,5 +143,211 @@ class Http1RequestBodyTest {
                 new Body.Stream(2, new sjws_nettask.core.TestSource(false, "ab".getBytes()))),
                 "GET / HTTP/1.0\r\nHost: h\r\n\r\n", false);
         assertTrue(known.endsWith("Content-Length: 2\r\n\r\nab") || known.endsWith("\r\n\r\nab"), known);
+    }
+
+    @Test
+    void chunkedBodyIsStreamedWithContinueAndTheConnectionStaysUsable() throws Exception {
+        var text = exchange(echo(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        + "7\r\nabcdefg\r\n0\r\n\r\n"
+                        + "POST /b HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                        + "2\r\nxy\r\n0\r\n\r\n",
+                false);
+        assertTrue(text.startsWith("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 "), text);
+        assertTrue(text.contains("got:abcdefg"), text);
+        assertTrue(text.endsWith("got:xy"), text);
+        assertEquals(-1L, exchangeLength("POST /z HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n"));
+    }
+
+    @Test
+    void truncatedChunkedBodyFailsTheReadAndCloses() throws Exception {
+        var text = exchange(echo(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n32\r\nabc", true);
+        assertTrue(text.startsWith("HTTP/1.1 502 "), text);
+        assertTrue(text.contains("mid-chunked body"), text);
+    }
+
+    @Test
+    void anUnreadChunkedBodyClosesTheConnection() throws Exception {
+        var seen = new AtomicReference<Long>();
+        Handler ignoring = request -> {
+            seen.set(request.body().length());
+            return new Response(200, ResponseHeaders.of(), Body.Bytes.of("ok".getBytes()));
+        };
+        var text = exchange(ignoring,
+                "PUT /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nabcd\r\n0\r\n\r\n",
+                false);
+        assertEquals(-1L, seen.get());
+        assertTrue(text.contains("Connection: close"), text);
+    }
+
+    @Test
+    void aMalformedChunkedBodyFailsAndALaterReadIsRejected() throws Exception {
+        var text = exchange(readTwiceAfterFailure(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\nxyz\r\n", true);
+        assertTrue(text.startsWith("HTTP/1.1 502 "), text);
+        assertTrue(text.contains("chunk size"), text);
+        assertTrue(text.contains("no longer readable"), text);
+    }
+
+    @Test
+    @Timeout(value = 3, unit = TimeUnit.SECONDS)
+    void anAnnouncedChunkSizeOverTheDecoderCapFailsTheRead() throws Exception {
+        // 0x4000000000000000 exceeds Long.MAX_VALUE/2, so the decoder is overLimit
+        // before any payload is copied and would otherwise spin on the leftover "x".
+        var text = exchange(echo(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n4000000000000000\r\nx",
+                true);
+        assertTrue(text.startsWith("HTTP/1.1 502 "), text);
+        assertTrue(text.contains("exceeded the decoder limit"), text);
+    }
+
+    @Test
+    void aSecondReadAfterATruncatedChunkedBodyIsRejected() throws Exception {
+        var text = exchange(readTwiceAfterFailure(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n32\r\nabc", true);
+        assertTrue(text.startsWith("HTTP/1.1 502 "), text);
+        assertTrue(text.contains("mid-chunked body"), text);
+        assertTrue(text.contains("no longer readable"), text);
+    }
+
+    /** Hits {@code throwFailed} after the reader has already recorded a failure. */
+    private static Handler readTwiceAfterFailure() {
+        return request -> {
+            var buf = new byte[8];
+            try {
+                while (request.body().read(buf, 0, buf.length) >= 0) {
+                    // drain until the decoder fails or the stream ends
+                }
+                return new Response(500, ResponseHeaders.of(), Body.Bytes.of("first-read-ok".getBytes()));
+            } catch (IOException first) {
+                try {
+                    request.body().read(buf, 0, buf.length);
+                    return new Response(500, ResponseHeaders.of(), Body.Bytes.of("second-read-ok".getBytes()));
+                } catch (IOException second) {
+                    var msg = first.getMessage() + ";" + second.getMessage();
+                    return new Response(502, ResponseHeaders.of(), Body.Bytes.of(msg.getBytes()));
+                }
+            }
+        };
+    }
+
+
+    @Test
+    void aDrainedChunkedGetBodyOverTheLimitClosesAfterTheResponse() throws Exception {
+        var data = "x".repeat(65_537);
+        var raw = "GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n10001\r\n" + data
+                + "\r\n0\r\n\r\n";
+        var text = exchange(ok(), raw, false);
+        assertTrue(text.startsWith("HTTP/1.1 200 "), text);
+        assertTrue(text.contains("Connection: close"), text);
+    }
+
+    @Test
+    void aTruncatedChunkedGetBodyClosesWithoutAFinalResponse() throws Exception {
+        var text = exchange(ok(), "GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n32\r\nabc", true);
+        assertFalse(text.startsWith("HTTP/1.1 200 "), text);
+    }
+
+    @Test
+    void aStalledChunkedGetBodyTimesOutWith408() throws Exception {
+        var text = exchange(ok(), "GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n32\r\nabc",
+                false, Duration.ofMillis(200));
+        assertTrue(text.contains("HTTP/1.1 408 "), text);
+    }
+
+    @Test
+    void aSplitChunkedGetBodyIsDrainedAfterASecondFill() throws Exception {
+        var text = exchangeSplit(ok(),
+                "GET / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n",
+                "4\r\nabcd\r\n0\r\n\r\n");
+        assertTrue(text.startsWith("HTTP/1.1 200 "), text);
+        assertTrue(text.contains("ok"), text);
+    }
+
+    @Test
+    void aChunkedGetWithContinueIsDrainedAfterTheInterimResponse() throws Exception {
+        var text = exchange(ok(),
+                "GET / HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                        + "4\r\nabcd\r\n0\r\n\r\n",
+                false);
+        assertTrue(text.startsWith("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 "), text);
+        assertTrue(text.contains("ok"), text);
+    }
+
+    @Test
+    void aSplitChunkedPostBodyIsReadAfterASecondFill() throws Exception {
+        var text = exchangeSplit(echo(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                "7\r\nabcdefg\r\n0\r\n\r\n");
+        assertTrue(text.contains("got:abcdefg"), text);
+    }
+
+    @Test
+    void aChunkedPostBodyIsReadFromADirectPooledBuffer() throws Exception {
+        var pool = NoBufferLeaks.watch(BufferPool.create(new BufferPool.Settings(true, 8L << 20, Map.of(), true, 1, 0)));
+        var text = exchange(echo(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                        + "7\r\nabcdefg\r\n0\r\n\r\n",
+                false, Duration.ofSeconds(5), pool);
+        assertTrue(text.contains("got:abcdefg"), text);
+    }
+
+    @Test
+    void aPostWithoutABodyCanKeepTheConnection() throws Exception {
+        var text = exchange(ok(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n"
+                        + "GET /b HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+                false);
+        assertEquals(2, text.split("HTTP/1.1 200 ", -1).length - 1, text);
+    }
+
+    private static Handler ok() {
+        return request -> new Response(200, ResponseHeaders.of(), Body.Bytes.of("ok".getBytes()));
+    }
+
+    private static String exchangeSplit(Handler handler, String first, String second) throws Exception {
+        var reaper = new ConnectionReaper(Duration.ofSeconds(5), Duration.ofSeconds(5), Duration.ofSeconds(5));
+        try (var server = ServerSocketChannel.open().bind(new InetSocketAddress("127.0.0.1", 0));
+                var client = SocketChannel.open(server.getLocalAddress())) {
+            var accepted = server.accept();
+            var thread = Thread.ofVirtual().start(new Http1Connection(accepted, handler, ResponseHeaders::of, reaper));
+            client.write(ByteBuffer.wrap(first.getBytes(StandardCharsets.ISO_8859_1)));
+            Thread.sleep(200);
+            client.write(ByteBuffer.wrap(second.getBytes(StandardCharsets.ISO_8859_1)));
+            client.shutdownOutput();
+            var out = new ByteArrayOutputStream();
+            var buf = ByteBuffer.allocate(4096);
+            try {
+                while (client.read(buf) >= 0) {
+                    out.write(buf.array(), 0, buf.position());
+                    buf.clear();
+                }
+            } catch (java.net.SocketException e) {
+                // Closing with an unread drained body can RST before the client finishes reading.
+            }
+            thread.join(5000);
+            return out.toString(StandardCharsets.ISO_8859_1);
+        } finally {
+            reaper.close();
+        }
+    }
+
+    private static long exchangeLength(String raw) throws Exception {
+        var seen = new AtomicReference<Long>();
+        Handler taking = request -> {
+            seen.set(request.body().length());
+            var buf = new byte[16];
+            try {
+                while (request.body().read(buf, 0, buf.length) >= 0) {
+                    // drain
+                }
+            } catch (IOException e) {
+                return new Response(502, ResponseHeaders.of(), Body.Bytes.of(e.getMessage().getBytes()));
+            }
+            return new Response(200, ResponseHeaders.of(), Body.Bytes.of("ok".getBytes()));
+        };
+        exchange(taking, raw, false);
+        return seen.get();
     }
 }

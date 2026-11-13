@@ -131,6 +131,50 @@ class EndpointsConfigTest {
         assertTrue(error("      endpoints: [\"http://a\"]\n      circuit: { max_ejection: 101 }\n").contains("max_ejection"));
         assertTrue(error("      endpoints: [\"http://a\"]\n      circuit: { open: 1 }\n").contains("open"));
         assertTrue(error("      url: \"http://a\"\n      circuit: { error_rate: 50% }\n").contains("error_rate"));
+        assertTrue(error("      url: \"http://a\"\n      active_health: {}\n").contains("only valid with endpoints"));
+        assertTrue(error("      endpoints: [\"http://a\"]\n      active_health: { method: POST }\n").contains("method"));
+        assertTrue(error("      endpoints: [\"http://a\"]\n      active_health: { path: health }\n").contains("path"));
+        assertTrue(error("      endpoints: [\"http://a\"]\n      active_health: { interval: 0s }\n").contains("interval"));
+        assertTrue(error("      endpoints: [\"http://a\"]\n      active_health: { probe: 1 }\n").contains("probe"));
+    }
+
+    @Test
+    void activeHealthParsesAndRoundTrips() throws IOException {
+        var loaded = load("""
+                routing:
+                  upstreams:
+                    svc:
+                      endpoints: ["http://10.0.0.1:8080", "http://10.0.0.2:8080"]
+                      active_health:
+                        path: /health
+                        method: get
+                        interval: 5s
+                        eject_interval: 500ms
+                        timeout: 250ms
+                    defaults:
+                      endpoints: ["http://10.0.0.3:8080"]
+                      active_health: {}
+                    none:
+                      endpoints: ["http://10.0.0.4:8080"]
+                """);
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        var svc = loaded.document().routing().upstreams().get("svc").activeHealth();
+        assertEquals("/health", svc.path());
+        assertEquals("GET", svc.method());
+        assertEquals(Duration.ofSeconds(5), svc.interval());
+        assertEquals(Duration.ofMillis(500), svc.ejectInterval());
+        assertEquals(Duration.ofMillis(250), svc.timeout());
+        assertEquals(sjws_nettask.routing.ActiveHealth.DEFAULT,
+                loaded.document().routing().upstreams().get("defaults").activeHealth());
+        assertNull(loaded.document().routing().upstreams().get("none").activeHealth());
+        var text = ConfigCodec.text(loaded.document());
+        assertTrue(text.contains("active_health:"), text);
+        var copy = this.dir.resolve("active-copy.yaml");
+        Files.writeString(copy, text);
+        var again = ConfigLoader.load(new String[] {"--config=" + copy, "--no-h3"}, Map.of());
+        assertTrue(again.ok(), again.errors() + "\n" + text);
+        assertEquals(loaded.document().canonicalHash(), again.document().canonicalHash());
+        assertEquals(svc, again.document().routing().upstreams().get("svc").activeHealth());
     }
 
     private static HttpServer up(String name) throws IOException {

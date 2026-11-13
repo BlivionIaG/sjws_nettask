@@ -27,10 +27,19 @@ import java.time.Duration;
  * {@code Settings} record does not carry them yet.
  *
  * @param maxBody request body cap, bytes (fits in a positive {@code int})
+ * @param activeHealth optional active probes for a multi-endpoint upstream, or null when unset
  */
 public record Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout,
         Duration idleReadTimeout, int maxBody, boolean preserveHost, sjws_nettask.routing.Resilience resilience,
-        Upstream.Discovery discovery) {
+        Upstream.Discovery discovery, sjws_nettask.routing.ActiveHealth activeHealth) {
+
+    /** No active health probes. */
+    public Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout, Duration idleReadTimeout,
+            int maxBody, boolean preserveHost, sjws_nettask.routing.Resilience resilience,
+            Upstream.Discovery discovery) {
+        this(name, url, connectTimeout, responseTimeout, idleReadTimeout, maxBody, preserveHost, resilience, discovery,
+                null);
+    }
 
     /**
      * {@code endpoints:} instead of one {@code url}: the static endpoint set (the default

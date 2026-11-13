@@ -9,7 +9,8 @@ metrics observe wrapper, or non-static terminal is armed — and leaves it empty
 path. Gateway filters therefore see headers such as `x-api-key` and `authorization` over h2/h2c
 once a chain is live. The HTTP/1.1 ALPN fallback on the HTTP/2 TLS listener uses the same
 `attachBodies` gate (#446).
-`GatewayFilters.install(registry)` binds all six. `SjwsServer.chainControl` still does not
+`GatewayFilters.install(registry)` binds the built-in factories (`api-key`, `basic-auth`, `jwt`,
+`rate-limit`, `cors`, `request-size`, `header-rewrite`, `compress`, and `ip-acl`). `SjwsServer.chainControl` still does not
 change the request path until the first successful `apply`.
 
 ```java
@@ -34,6 +35,25 @@ process, leaf not a symlink). A control-plane proposal must use `keys-file`; inl
 refused with 400. Local config may still use inline `keys` (a WARN points at the file form).
 `header` defaults to `x-api-key`. `query`, when set, is read only if the header is absent (the
 value is not percent-decoded). A miss is 401 with `WWW-Authenticate: ApiKey`.
+
+## basic-auth
+
+RFC 7617 `Authorization: Basic`. `users` is one `user:password` per line (or comma-separated
+when the value has no newline). `users-file` is the same format in a regular file; on POSIX
+the file must not be group- or world-readable (mode `0600` is the usual form). Exactly one of
+`users` or `users-file` is required; the file is read when the filter is built. A password may
+contain colons. Empty usernames and empty passwords are rejected. At most 1024 users, and a
+file is at most 64 KiB.
+
+Each `user:password` is hashed with SHA-256 when the filter is built; the raw password is not
+kept. A presented credential is hashed once and compared with every stored hash. `realm`
+defaults to `sjws` and is quoted in `WWW-Authenticate: Basic realm="...", charset="UTF-8"`.
+A miss, a missing header, a non-Basic scheme, or a malformed token is 401 with that
+challenge and `Cache-Control: no-store`. When more than one `Authorization` value is
+present, only the first is used. The request path does no I/O. A control-plane proposal must
+use `users-file`; inline `users` is refused with 400.
+Local config may still use inline `users` (a WARN points at the file form). Viewer reads mask
+any retained inline `users` values.
 
 ## jwt
 
@@ -63,10 +83,10 @@ The header must not carry `crit`, `jku`, `jwk`, `x5u` or `x5c`. `typ`, when pres
 must name one. The signature is checked before the claims. A bad token is 401 with
 `WWW-Authenticate: Bearer`, not a 500. There is no remote key fetch.
 
-HMAC secrets and API keys must not sit in the control-plane canonical document. Use
-`keys-file` / `hmac-keys-file` so each node reads a local `0600` file; a proposal that still
-carries inline `keys` or `hmac-keys` is refused, and viewer reads mask those fields. Public JWT
-keys can travel with the projection. Publishing a new snapshot is the rotation: in-flight
+HMAC secrets, API keys and Basic-auth credentials must not sit in the control-plane canonical
+document. Use `keys-file` / `hmac-keys-file` / `users-file` so each node reads a local `0600`
+file; a proposal that still carries inline `keys`, `hmac-keys` or `users` is refused, and viewer
+reads mask those fields. Public JWT keys can travel with the projection. Publishing a new snapshot is the rotation: in-flight
 requests keep the previous filter. For clusters that still have inline secrets in older log
 entries or snapshots, see the operator note under middleware in
 [config-file.md](../user/config-file.md) (file refs, key rotation, snapshot and compaction).
@@ -163,3 +183,23 @@ A compressed response gets `Content-Encoding: gzip` and `Vary: Accept-Encoding` 
 existing Vary, left alone when Vary is `*`). Stale `Content-Length`, `Content-MD5` and
 `Accept-Ranges` are removed; the transport writes `Content-Length` from the new body. A present
 ETag is suffixed with `-gzip` inside the quotes.
+
+
+## ip-acl
+
+Client-address allow and deny lists, compiled to `routing.Cidr` when the filter is built.
+`allow` and `deny` are addresses or CIDRs (IPv4 and IPv6), one per line, or comma-separated
+when the value has no newline. At least one list is required. A `#` line is ignored. At most
+4096 entries per list.
+
+The request path reads `request.peer()` and does not allocate for a known address. The peer
+address is normalized before matching, so an IPv4-mapped IPv6 peer is compared as IPv4. A
+missing peer is refused (fail closed). A deny match always wins. An allow list without a deny
+list admits only listed addresses. A deny list without an allow list admits everyone except
+the denied addresses. IPv4 and IPv6 lists are separate: `0.0.0.0/0` does not match IPv6
+peers, and `::/0` does not match IPv4 peers. A refusal is 403; there is no hide-as-404 mode.
+Scope (route / labels) is the same as every other gateway entry. The filter is off, with no
+cost, until a document names it.
+
+Put `ip-acl` first in the chain (lowest `order`) so a refused peer does not reach later
+filters.

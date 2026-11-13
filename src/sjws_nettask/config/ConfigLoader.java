@@ -659,13 +659,17 @@ public final class ConfigLoader {
             }
             var body = YamlValues.mapping(entry.getValue(), "routing.upstreams." + name);
             YamlValues.knownKeys(body, List.of("url", "connect_timeout", "response_timeout", "idle_read_timeout",
-                    "max_body", "preserve_host", "retry", "circuit", "endpoints", "lb"), "routing.upstreams." + name);
+                    "max_body", "preserve_host", "retry", "circuit", "endpoints", "lb", "active_health"),
+                    "routing.upstreams." + name);
             boolean multi = body.containsKey("endpoints");
             if (multi == body.containsKey("url")) {
                 throw new ConfigException("routing.upstreams." + name + ": exactly one of url or endpoints is required");
             }
             if (body.containsKey("lb") && !multi) {
                 throw new ConfigException("routing.upstreams." + name + ".lb is only valid with endpoints");
+            }
+            if (body.containsKey("active_health") && !multi) {
+                throw new ConfigException("routing.upstreams." + name + ".active_health is only valid with endpoints");
             }
             var endpointUrls = new ArrayList<URI>();
             var endpoints = multi ? endpoints(body.get("endpoints"), name, endpointUrls) : null;
@@ -708,7 +712,11 @@ public final class ConfigLoader {
                 circuit = circuit(body.get("circuit"), "routing.upstreams." + name + ".circuit");
             }
             var resilience = retry == null && circuit == null ? null : new sjws_nettask.routing.Resilience(retry, circuit);
-            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience, discovery));
+            var activeHealth = body.containsKey("active_health")
+                    ? activeHealth(body.get("active_health"), "routing.upstreams." + name + ".active_health")
+                    : null;
+            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience, discovery,
+                    activeHealth));
         }
         return Map.copyOf(out);
     }
@@ -815,6 +823,30 @@ public final class ConfigLoader {
         int max = map.containsKey("max_ejection") ? percent(map.get("max_ejection"), path + ".max_ejection", 0)
                 : d.maxEjectionPercent();
         return new sjws_nettask.routing.EndpointBalancer.Outlier(failures, rate, min, window, ejectFor, max);
+    }
+
+    /**
+     * {@code active_health: {path: /health, method: HEAD, interval: 10s, eject_interval: 2s, timeout: 1s}}
+     * on a multi-endpoint upstream. Off unless the block is present.
+     */
+    private static sjws_nettask.routing.ActiveHealth activeHealth(Object value, String path) {
+        var map = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(map, List.of("path", "method", "interval", "eject_interval", "timeout"), path);
+        var d = sjws_nettask.routing.ActiveHealth.DEFAULT;
+        var probePath = map.containsKey("path") ? text(map.get("path"), path + ".path") : d.path();
+        var method = map.containsKey("method") ? text(map.get("method"), path + ".method") : d.method();
+        var interval = map.containsKey("interval")
+                ? timeout(text(map.get("interval"), path + ".interval"), path + ".interval") : d.interval();
+        var eject = map.containsKey("eject_interval")
+                ? timeout(text(map.get("eject_interval"), path + ".eject_interval"), path + ".eject_interval")
+                : d.ejectInterval();
+        var probeTimeout = map.containsKey("timeout")
+                ? timeout(text(map.get("timeout"), path + ".timeout"), path + ".timeout") : d.timeout();
+        try {
+            return new sjws_nettask.routing.ActiveHealth(probePath, method, interval, eject, probeTimeout);
+        } catch (IllegalArgumentException e) {
+            throw new ConfigException(path + ": " + e.getMessage());
+        }
     }
 
     /** {@code 50%} or {@code 50}: an integer percentage, {@code min}..100. */
@@ -1144,8 +1176,8 @@ public final class ConfigLoader {
                 throw new ConfigException(path + ": " + e.getMessage());
             }
             if (MiddlewareSecrets.hasInline(options)) {
-                warnings.add(path + ": inline keys/hmac-keys sit in the file in clear; prefer keys-file / "
-                        + "hmac-keys-file (required for control-plane proposals)");
+                warnings.add(path + ": inline secret options sit in the file in clear; prefer keys-file / "
+                        + "hmac-keys-file / users-file (required for control-plane proposals)");
             }
         }
         if (!specs.isEmpty()) {

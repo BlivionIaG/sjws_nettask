@@ -74,13 +74,43 @@ public record Cidr(byte[] network, int bits) {
         if (peer == null || peer.getAddress() == null) {
             return false;
         }
-        var a = peer.getAddress().getAddress();
-        if (a.length != this.network.length) {
+        return containsAddress(addressBytes(peer.getAddress()));
+    }
+
+    /**
+     * Bytes to match against a {@link Cidr}. An IPv4-mapped IPv6 address is returned as four
+     * IPv4 bytes; any other address is returned as {@link InetAddress#getAddress()}.
+     */
+    public static byte[] addressBytes(InetAddress address) {
+        if (address == null) {
+            return null;
+        }
+        var raw = address.getAddress();
+        if (raw.length != 16) {
+            return raw;
+        }
+        for (int i = 0; i < 10; i++) {
+            if (raw[i] != 0) {
+                return raw;
+            }
+        }
+        if (raw[10] != (byte) 0xff || raw[11] != (byte) 0xff) {
+            return raw;
+        }
+        return new byte[] {raw[12], raw[13], raw[14], raw[15]};
+    }
+
+    /**
+     * Same check as {@link #contains(InetSocketAddress)} against already-extracted address
+     * bytes, so a caller scanning many CIDRs can extract the peer once.
+     */
+    public boolean containsAddress(byte[] address) {
+        if (address == null || address.length != this.network.length) {
             return false;
         }
         int full = this.bits / 8;
         for (int i = 0; i < full; i++) {
-            if (a[i] != this.network[i]) {
+            if (address[i] != this.network[i]) {
                 return false;
             }
         }
@@ -89,6 +119,6 @@ public record Cidr(byte[] network, int bits) {
             return true;
         }
         int mask = 0xff << (8 - rest);
-        return (a[full] & mask) == (this.network[full] & mask);
+        return (address[full] & mask) == (this.network[full] & mask);
     }
 }

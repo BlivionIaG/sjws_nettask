@@ -429,11 +429,10 @@ and the request path is unchanged. The records map onto `Route(host, prefix, rew
 handler)` and `ProxyHandler.Settings(url, connectTimeout, responseTimeout,
 idleReadTimeout, maxBody, proto, trustedProxies, preserveHost, maxIdle)`. The proxy is a Netty
 HTTP/1.1 client with up to 256 idle keep-alive connections per upstream, and it streams
-response bodies with backpressure. HTTP/1.1 request bodies with a `Content-Length` are
-streamed upstream (over `max_body` is 413); so are HTTP/3 request bodies with a `content-length`. A chunked request
-body (or an HTTP/3 body of unknown length) is 501 for now, as is a declared body that the transport did not attach
-(HTTP/2 attaches none today); see
-`docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
+response bodies with backpressure. HTTP/1.1, HTTP/2 and HTTP/3 request bodies are streamed upstream, including a
+chunked HTTP/1.1 body and an HTTP/2 or HTTP/3 body of unknown length (over `max_body` is 413,
+enforced as the body is read when the length is unknown). A declared body that the transport did
+not attach is still 501; see `docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
 TCP and h2c, and `https` on HTTP/2 over TLS and HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
 bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read-ahead window)
 and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB), with a per-peer share
@@ -535,6 +534,7 @@ upstreams:
     lb: weighted_random            # default; round_robin | least_request
     retry: { attempts: 2 }         # a retry goes to a different endpoint
     circuit: { failures: 5, eject_for: 10s, error_rate: 50%, min_requests: 20, window: 10s, max_ejection: 50% }  # defaults
+    # active_health: { path: /, method: HEAD, interval: 10s, eject_interval: 2s, timeout: 1s }  # off unless present
 ```
 
 All endpoints share one scheme and path (no query, fragment or userinfo); up to 1024, default
@@ -546,9 +546,21 @@ always on with the defaults above, per endpoint, per attempt: an endpoint is eje
 `error_rate` or more. It comes back after `eject_for` through one probe, doubling on each repeat
 (up to 32×). If more than `max_ejection` of the endpoints are ejected, the balancer ignores ejection
 ("panic") and spreads over all of them. When every endpoint is ejected or tried, the request still
-goes somewhere rather than failing fast. The endpoint list can be replaced at run time by the
-control plane (see `docs/ha/discovery.md`); a reload keeps a list the control plane has set.
-A plain `url` upstream is unchanged and pays nothing for this.
+goes somewhere rather than failing fast, unless `active_health` is on (see below). The endpoint list
+can be replaced at run time by the control plane (see `docs/ha/discovery.md`); a reload keeps a list
+the control plane has set. A plain `url` upstream is unchanged and pays nothing for this.
+
+`active_health` is optional and only valid with `endpoints`. Off unless the block is present
+(`active_health: {}` uses the defaults). The balancer then sends a synthetic `GET` or `HEAD`
+(`method`, default `HEAD`) to `path` (an origin-form target, default `/`, not prefixed with the
+upstream path). 2xx is success; any other status, a timeout or a connect failure is a failure.
+Probes use the same per-endpoint circuit as client traffic and share its one half-open slot:
+`interval` (default 10s) while the endpoint is in rotation, `eject_interval` (default 2s) after
+`eject_for` while it is ejected, `timeout` (default 1s) for connect and the response head. With
+`active_health` on, a client request is not used as a probe; ejected endpoints stay out of rotation
+until a probe succeeds, and if every endpoint is ejected and the balancer is not in panic the
+request is 503 with `Retry-After`. Unset means no probe threads, timers or allocations. Probe
+results stay on the node and are never pushed to the control plane.
 
 `trusted_proxies` is a list of IP or CIDR literals (no DNS).
 
@@ -660,14 +672,16 @@ middleware:
       keys-file: /etc/sjws/api-keys   # preferred; mode 0600/0400, owned by this process
 ```
 
-Gateway credential options (`api-key` `keys`, `jwt` `hmac-keys`) may be inline in a local
-file. Prefer `keys-file` / `hmac-keys-file`. A control-plane proposal that still carries the
-inline form is refused with 400; see [gateway filters](../development/gateway.md).
+Gateway credential options (`api-key` `keys`, `jwt` `hmac-keys`, `basic-auth` `users`) may be
+inline in a local file. Prefer `keys-file` / `hmac-keys-file` / `users-file`. A control-plane
+proposal that still carries the inline form is refused with 400; see [gateway
+filters](../development/gateway.md).
 
-Older Raft log entries and signed snapshots can still carry inline `keys` / `hmac-keys` from
-before file refs. Operators should move those credentials to `keys-file` / `hmac-keys-file` on
-each node, rotate the affected keys, propose and activate a config that uses only the file
-refs, then let a snapshot and log compaction run so the old entries are dropped. A control-plane
+Older Raft log entries and signed snapshots can still carry inline `keys` / `hmac-keys` /
+`users` from before file refs. Operators should move those credentials to `keys-file` /
+`hmac-keys-file` / `users-file` on each node, rotate the affected credentials, propose and
+activate a config that uses only the file refs, then let a snapshot and log compaction run so
+the old entries are dropped. A control-plane
 process logs a single WARN at startup while applied, activated, or last-good config still holds
 the inline form (filter/route and field names only; values are never logged).
 
