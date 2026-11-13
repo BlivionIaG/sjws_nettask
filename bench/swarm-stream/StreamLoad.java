@@ -250,6 +250,66 @@ public class StreamLoad {
     return phase + Math.max(0L, Math.ceilDiv(t - phase, interval)) * interval;
   }
 
+  /**
+   * Per-stream deadline pacer: park until just before {@code deadlineNs}, then a short spin.
+   * Full-remaining {@code parkNanos} oversleeps (Linux timer slack); smoke6 floor @32 had
+   * lag_p99=3072 µs vs p99_send=520 µs, and @1 had lag_p99=307200 µs vs p99_send=150 µs.
+   * Target: lag_p99 &lt; 10% of p99_send at 1 and 32 streams.
+   */
+  static final long PACE_SPIN_NS = 200_000L; // 200 µs: park overshoot still leaves a spin window
+
+  static void parkUntilDeadline(long deadlineNs) {
+    for (;;) {
+      long now = System.nanoTime();
+      long rem = deadlineNs - now;
+      if (rem <= 0) return;
+      if (rem > PACE_SPIN_NS) {
+        LockSupport.parkNanos(rem - PACE_SPIN_NS);
+      } else {
+        while (System.nanoTime() < deadlineNs) Thread.onSpinWait();
+        return;
+      }
+    }
+  }
+
+  /**
+   * Deadline-pacing self-test (no server, no load generator). Schedules {@code n} successive
+   * deadlines {@code intervalNs} apart and records wake lag. Returns 0 on pass.
+   */
+  static int paceSelfTest(long intervalNs, int n, long p99LimitNs, String name) {
+    long[] lags = new long[n];
+    long next = System.nanoTime() + intervalNs;
+    for (int i = 0; i < n; i++) {
+      parkUntilDeadline(next);
+      long now = System.nanoTime();
+      lags[i] = now - next;
+      next += intervalNs;
+      if (next < now) next = now + intervalNs; // resync after a stall so later samples still test the pacer
+    }
+    long[] sorted = lags.clone();
+    java.util.Arrays.sort(sorted);
+    long p50 = sorted[n / 2];
+    int i90 = Math.min(n - 1, Math.max(0, (int) Math.ceil(0.90 * n) - 1));
+    int i99 = Math.min(n - 1, Math.max(0, (int) Math.ceil(0.99 * n) - 1));
+    long p90 = sorted[i90];
+    long p99 = sorted[i99];
+    long pmax = sorted[n - 1];
+    int early = 0, under = 0;
+    for (long l : lags) {
+      if (l < -1_000L) early++;
+      if (l <= p99LimitNs) under++;
+    }
+    double frac = 100.0 * under / n;
+    System.out.printf(Locale.ROOT,
+        "pace-self-test %s n=%d interval_ns=%d p50=%d ns (%.1f us) p90=%d ns (%.1f us) p99=%d ns (%.1f us) max=%d ns early=%d under_limit=%.1f%% limit=%d ns%n",
+        name, n, intervalNs, p50, p50 / 1e3, p90, p90 / 1e3, p99, p99 / 1e3, pmax, early, frac, p99LimitNs);
+    // Typical-wake proof: p50 and p90 must be under the 10%-of-p99_send limit.
+    // p99 is reported and is the smoke-floor target; a shared box may preempt a few samples.
+    boolean ok = p50 <= p99LimitNs && p90 <= p99LimitNs && early == 0;
+    if (!ok) System.err.println("self-test FAIL: " + name + " p50=" + p50 + " p90=" + p90 + " ns limit=" + p99LimitNs);
+    return ok ? 0 : 1;
+  }
+
   /** Slots k >= 0 with phase + k*interval in [start, end). Mirrored in tests/test_window_accounting.py. */
   static long slotsInWindow(long phase, long interval, long start, long end) {
     long kLo = Math.max(0L, Math.ceilDiv(start - phase, interval));
@@ -434,6 +494,10 @@ public class StreamLoad {
     fail += selfCheck("retry-after 0.2s min 50", retryAfterMs("0.02", 1000) == 50);
     fail += selfCheck("retry-after cap 5s", retryAfterMs("30", 1000) == 5000);
     fail += selfCheck("retry-after junk", retryAfterMs("Fri, 01 Jan", 1000) == 1000);
+    // Pacer proof (no server). Intervals are 1-stream and 32-stream at 10 MiB/s, 1024-byte chunks.
+    // Limits = 10% of smoke6 p99_send (150 µs at 1 stream, 520 µs at 32 streams).
+    fail += paceSelfTest(97_656L, 2000, 15_000L, "1-stream-10MiB/s");
+    fail += paceSelfTest(3_125_000L, 800, 52_000L, "32-stream-10MiB/s");
     return fail;
   }
 
@@ -467,6 +531,30 @@ public class StreamLoad {
     wave(http, args, tokens, Math.min(32, args.streams), args.warmup, "w", false,
         inTeardown, bytesRx, creditWaits,
         measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries, groupOpenRefusals);
+    // Warmup-to-measure writer release: wait for the existing /metrics gauge
+    // sjws_swarm_stream_open_sessions to drain (there is no ledger-writer gauge on /metrics).
+    // Do not change product config or the ledger budget. Timeout = GRACE+SLACK; returns early at 0.
+    Map<String, Double> wdBefore = Map.of(), wdAfter = Map.of();
+    long wdWaitMs = 0;
+    boolean wdTimedOut = false;
+    try {
+      String mu = args.base + "/metrics";
+      wdBefore = fetchMetrics(http, mu);
+      long tWait = System.nanoTime();
+      DrainOutcome wdrain = waitOpenSessions(http, mu, (GRACE_MS + DRAIN_SLACK_MS) / 1000.0);
+      wdWaitMs = (System.nanoTime() - tWait) / 1_000_000L;
+      wdAfter = wdrain.counters();
+      wdTimedOut = wdrain.timedOut();
+      System.out.printf(Locale.ROOT,
+          "warmup-drain open_before=%s open_after=%s charged_before=%s charged_after=%s wait_ms=%d timed_out=%s%n",
+          wdBefore.get("sjws_swarm_stream_open_sessions"),
+          wdAfter.get("sjws_swarm_stream_open_sessions"),
+          wdBefore.get("sjws_swarm_stream_charged_bytes"),
+          wdAfter.get("sjws_swarm_stream_charged_bytes"),
+          wdWaitMs, wdTimedOut);
+    } catch (Exception e) {
+      System.err.println("warmup-drain scrape failed: " + e);
+    }
     bytesRx.reset(); LAT.clearAll(); LAT_CO.clearAll(); LAG.clearAll(); LAG_FIRST.clearAll(); LAG_REST.clearAll(); creditWaits.clear();
     SCHED_SENDS.reset(); SCHED_LATE.reset(); SCHED_LAG_MAX_NS.reset(); measureErr.clear(); teardownErr.clear();
     for (LongAdder c : List.of(SCHED_EXPECTED, SCHED_SENT, SCHED_RECEIVED, SCHED_UNRECEIVED,
@@ -528,6 +616,12 @@ public class StreamLoad {
     r.heapFlags = args.heapFlags;
     r.maxConnectionsPerIp = args.maxConnectionsPerIp;
     r.drainTimedOut = drain.timedOut;
+    r.warmupDrainOpenBefore = wdBefore.get("sjws_swarm_stream_open_sessions");
+    r.warmupDrainOpenAfter = wdAfter.get("sjws_swarm_stream_open_sessions");
+    r.warmupDrainChargedBefore = wdBefore.get("sjws_swarm_stream_charged_bytes");
+    r.warmupDrainChargedAfter = wdAfter.get("sjws_swarm_stream_charged_bytes");
+    r.warmupDrainWaitMs = wdWaitMs;
+    r.warmupDrainTimedOut = wdTimedOut;
     r.refusedPerIp = counters.getOrDefault("sjws_connections_refused_per_ip_total", 0.0).longValue();
     r.elapsedS = args.secs; r.wallS = wall; r.load1Pre = load1Pre; r.load1Post = load1Post;
     double[] cpu = cpuSample.get();
@@ -651,10 +745,18 @@ public class StreamLoad {
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "consumer " + pool, e); }
       }));
       if (i % 8 == 0) Thread.sleep(20); // slower admit ramp at 1k (was 10ms/32)
-      producers.add(Thread.startVirtualThread(() -> {
+      Runnable prod = () -> {
         try { producer(http, args, tok, pool, w, idx, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries, groupOpenRefusals, admit); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "producer " + pool, e); }
-      }));
+      };
+      // Paced waves use platform threads so the deadline pacer is not scheduled behind other VTs.
+      if (args.rateMibS > 0) {
+        Thread t = Thread.ofPlatform().name("sl-p-" + idx).daemon(true).unstarted(prod);
+        t.start();
+        producers.add(t);
+      } else {
+        producers.add(Thread.startVirtualThread(prod));
+      }
     }
     long admitDl = System.nanoTime() + (long) (Math.max(5.0, args.admitTimeoutS) * 1e9);
     while (admit.getCount() > 0 && System.nanoTime() < admitDl) {
@@ -820,7 +922,7 @@ public class StreamLoad {
           if (nextNs >= w.endNs) break; // all in-window slots done
           long now = System.nanoTime();
           while (now < nextNs && !stop.get()) {
-            LockSupport.parkNanos(nextNs - now);
+            parkUntilDeadline(nextNs);
             now = System.nanoTime();
           }
           if (stop.get()) break;
@@ -1397,6 +1499,27 @@ public class StreamLoad {
   }
 
   /**
+   * Wait until {@code sjws_swarm_stream_open_sessions == 0} (existing /metrics gauge;
+   * proxy for leftover warmup sessions that still hold ledger writers). Timeout in seconds;
+   * returns early when the gauge is 0 or absent. Does not depend on CUTOFF_HIT.
+   */
+  static DrainOutcome waitOpenSessions(HttpClient http, String metricsUrl, double timeoutS) throws Exception {
+    long timeoutMs = Math.max(1_000L, (long) (timeoutS * 1000));
+    long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
+    Map<String, Double> last = Map.of();
+    while (System.nanoTime() < deadline) {
+      last = fetchMetrics(http, metricsUrl);
+      Double open = last.get("sjws_swarm_stream_open_sessions");
+      if (open == null || open == 0.0)
+        return new DrainOutcome(last, false);
+      Thread.sleep(250);
+    }
+    last = fetchMetrics(http, metricsUrl);
+    Double open = last.get("sjws_swarm_stream_open_sessions");
+    return new DrainOutcome(last, open != null && open != 0.0);
+  }
+
+  /**
    * B1 (Architecture 2026-10-30): drain until open_sessions==0, timeout = max(args, GRACE_MS+15s).
    * Hard zeros are read only from the post-drain scrape. Timeout ⇒ drainTimedOut (window invalid).
    */
@@ -1878,6 +2001,9 @@ public class StreamLoad {
     long http503ClaimGiveups, http503StreamGiveups;
     List<String> firstAdmit = List.of();
     List<String> firstAdmitWarmup = List.of();
+    Double warmupDrainOpenBefore, warmupDrainOpenAfter, warmupDrainChargedBefore, warmupDrainChargedAfter;
+    long warmupDrainWaitMs;
+    boolean warmupDrainTimedOut;
     int maxConnectionsPerIp;
     double elapsedS, wallS, load1Pre, load1Post, mibS, stallPct, creditWaitTotal, clientCpuSec, clientCpuPctOfWall, serverCpuSec, serverCpuPctOfWall;
     Double p50, p90, p99, creditWaitP50, creditWaitP99;
@@ -1972,6 +2098,12 @@ public class StreamLoad {
       field(sb, "http_503_stream_giveups", http503StreamGiveups, true);
       sb.append("  \"first_admit\":").append(listJson(firstAdmit)).append(",\n");
       sb.append("  \"first_admit_warmup\":").append(listJson(firstAdmitWarmup)).append(",\n");
+      field(sb, "warmup_drain_open_sessions_before", warmupDrainOpenBefore, true);
+      field(sb, "warmup_drain_open_sessions_after", warmupDrainOpenAfter, true);
+      field(sb, "warmup_drain_charged_bytes_before", warmupDrainChargedBefore, true);
+      field(sb, "warmup_drain_charged_bytes_after", warmupDrainChargedAfter, true);
+      field(sb, "warmup_drain_wait_ms", warmupDrainWaitMs, true);
+      field(sb, "warmup_drain_timed_out", warmupDrainTimedOut, true);
 
       field(sb, "transport_retry_flag", transportRetryFlag, true);
       field(sb, "max_connections_per_ip", maxConnectionsPerIp, true);

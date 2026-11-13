@@ -190,3 +190,22 @@ java -Dlean0.jar=path/to/sjws_nettask-*.jar -cp /tmp/lean0-admit Lean0AdmitTest
 
 The 1000-stream closed-loop 503s are the shipped ledger writer budget (see issue #414);
 this test does not raise that budget.
+
+
+## Deadline pacer, warmup drain, NOISY platform exclusion
+
+Paced waves (`--rate-mib-s`) wait with `parkUntilDeadline`: `LockSupport.parkNanos` to 200 µs
+before the slot, then a short `onSpinWait` spin. `StreamLoad --self-test` includes a no-server
+pacer proof at the 1-stream and 32-stream 10 MiB/s intervals (target: typical lag under 10% of
+smoke6 `p99_send`). Paced producers run on platform threads.
+
+After warmup, the generator scrapes `/metrics` and waits (timeout GRACE+SLACK, early return at 0)
+for `sjws_swarm_stream_open_sessions` to drain, logging the before/after gauges into `result.json`.
+That is the existing session gauge, used as a proxy; there is no ledger-writer gauge. Product
+config and the writer budget are not changed. `LEAN_CONSUMER=0` at 1000 streams is reported as
+budget-limited, not a harness FAIL; a 32-stream lean0 closed-loop is the under-budget per-chunk
+cost metric.
+
+NOISY uses the HTTP v5 platform exclusion: `host-main.cjs` / uid 999 (and the v5 comm set) is
+excluded from the foreign-CPU average, with `platform_cpu_avg_cores` still recorded. When NOISY,
+`foreign_trigger_procs` lists name, PID and CPU of each foreign process that contributed.

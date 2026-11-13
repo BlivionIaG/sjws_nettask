@@ -293,6 +293,24 @@ def merge(parts: list[dict], gen_cores: int, secs: float | None) -> dict:
     out["gen_procs"] = len(parts)
 
     # writer_count: last (one.sh amends later)
+    # Warmup-to-measure drain (existing /metrics open_sessions gauge). Take the max
+    # leftover / longest wait across generator processes.
+    def _maxf(key):
+        vs = [r.get(key) for r in parts if r.get(key) is not None]
+        return max(vs) if vs else None
+    out["warmup_drain_open_sessions_before"] = _maxf("warmup_drain_open_sessions_before")
+    out["warmup_drain_open_sessions_after"] = _maxf("warmup_drain_open_sessions_after")
+    out["warmup_drain_charged_bytes_before"] = _maxf("warmup_drain_charged_bytes_before")
+    out["warmup_drain_charged_bytes_after"] = _maxf("warmup_drain_charged_bytes_after")
+    out["warmup_drain_wait_ms"] = _maxf("warmup_drain_wait_ms")
+    out["warmup_drain_timed_out"] = any(bool(r.get("warmup_drain_timed_out")) for r in parts)
+    # first_admit: concatenate a few from each proc (measure, then warmup)
+    fa, fw = [], []
+    for r in parts:
+        fa.extend(r.get("first_admit") or [])
+        fw.extend(r.get("first_admit_warmup") or [])
+    out["first_admit"] = fa[:40]
+    out["first_admit_warmup"] = fw[:40]
     return out
 
 

@@ -69,6 +69,50 @@ def main():
     ], load1_end=5.5)
     assert not j["noisy"], j
 
+    # HTTP v5: sand-host (uid 999 / host-main.cjs) is excluded from NOISY foreign CPU
+    # but platform_cpu is still recorded. 0.8 platform cores + 0.08 foreign → not NOISY.
+    def samp_plat(ts, foreign, platform, load1=1.0):
+        return {
+            "ts": ts,
+            "foreign_jiffies_sum": sum(foreign.values()),
+            "platform_jiffies_sum": sum(platform.values()),
+            "per_pid_jiffies": dict(foreign),
+            "platform_per_pid_jiffies": dict(platform),
+            "pid_meta": {str(k): {"pid": k, "cmd": "/exec-daemon/node /opt/sand/sand-host/host-main.cjs",
+                                  "comm": "node", "uid": 999, "platform": True} for k in platform}
+                       | {str(k): {"pid": k, "cmd": "some-other", "comm": "other", "uid": 1000, "platform": False}
+                          for k in foreign},
+            "foreign_load_proc": False,
+            "load1": load1,
+        }
+    # 0.8 platform cores over 5s: delta = 0.8*100*5 = 400; 0.08 foreign: 40
+    j = fc.judge([
+        samp_plat(0, {8: 1000}, {3617: 2000}),
+        samp_plat(5, {8: 1000 + 40}, {3617: 2000 + 400}),
+    ], load1_end=1.0)
+    assert not j["noisy"], j
+    assert j["foreign_cpu_avg_cores"] < 0.2, j
+    assert j["platform_cpu_avg_cores"] > 0.7, j
+    assert abs(j["platform_cpu_avg_cores"] - 0.8) < 0.05, j
+
+    # Same 0.8 cores if they were foreign (no platform split) still NOISY
+    j = fc.judge([
+        samp(0, {3617: 2000}),
+        samp(5, {3617: 2000 + 400}),
+    ], load1_end=1.0)
+    assert j["noisy"] and j["foreign_cpu_avg_cores"] > 0.5, j
+    # trigger list names the process
+    assert j["foreign_trigger_procs"], j
+    assert j["foreign_trigger_procs"][0]["pid"] == 3617, j
+    assert j["foreign_trigger_procs"][0]["cpu"] > 0.5, j
+
+    # is_platform unit checks (v5 set)
+    assert fc.is_platform(999, "node foo", "node")
+    assert fc.is_platform(1000, "/exec-daemon/node /opt/sand/sand-host/host-main.cjs", "node")
+    assert fc.is_platform(0, "/pod-daemon --x", "pod-daemon")
+    assert fc.is_platform(0, "python3 /usr/local/bin/sand-memory-watch", "sand-memory-watch")
+    assert not fc.is_platform(1000, "/exec-daemon/node /usr/local/bin/sand-web-bot-auth.mjs", "node")
+
     print("OK test_foreign_cpu")
 
 if __name__ == "__main__":
