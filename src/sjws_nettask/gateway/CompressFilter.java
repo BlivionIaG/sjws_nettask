@@ -92,13 +92,13 @@ public final class CompressFilter implements RequestFilter {
         var response = next.proceed(request);
         // Request-side no-transform also forbids an intermediary from changing the
         // representation, including a gzip-specific 304.
-        boolean gzip = chooseGzip(request.headers().acceptEncoding())
-                && !hasCacheDirective(request.headers(), "no-transform");
+        var acceptEncoding = acceptEncoding(request.headers());
+        boolean gzip = chooseGzip(acceptEncoding) && !hasCacheDirective(request.headers(), "no-transform");
         if (gzip && compressible(response)) {
             if (compressedValidatorHits(request, response)) {
                 return notModifiedGzip(response);
             }
-            return gzip(response, acceptsIdentity(request.headers().acceptEncoding()));
+            return gzip(response, acceptsIdentity(acceptEncoding));
         }
         if (compressible(response)) {
             // Identity is still negotiated: caches must not reuse it for a gzip request.
@@ -189,6 +189,11 @@ public final class CompressFilter implements RequestFilter {
         headers.set("content-encoding", "gzip");
         headers.remove("content-length");
         headers.remove("content-md5");
+        // Digests over the content or the selected representation (RFC 9530, and the legacy
+        // RFC 3230 instance digest) no longer match once the content coding changes.
+        headers.remove("content-digest");
+        headers.remove("repr-digest");
+        headers.remove("digest");
         headers.remove("accept-ranges");
         var etag = headers.get("etag");
         if (etag != null) {
@@ -253,6 +258,19 @@ public final class CompressFilter implements RequestFilter {
         var vary = mergeVary(headers);
         headers.set("vary", vary == null ? "Accept-Encoding" : vary);
         return copy(response, headers, response.body());
+    }
+
+    /**
+     * Every Accept-Encoding field of the request as one list (RFC 9110 5.3: repeated fields are
+     * equivalent to one comma-joined field), so a later {@code gzip;q=0} is not ignored. Null when
+     * the request has none.
+     */
+    static String acceptEncoding(RequestHeaders headers) {
+        var values = headers.values("accept-encoding");
+        if (values.isEmpty()) {
+            return headers.acceptEncoding();
+        }
+        return values.size() == 1 ? values.getFirst() : String.join(",", values);
     }
 
     /** True if any request Cache-Control field carries {@code directive} (RFC 9111). */

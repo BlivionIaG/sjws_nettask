@@ -393,6 +393,68 @@ class CompressFilterTest {
     }
 
     @Test
+    void negotiatesAcrossRepeatedAcceptEncodingFields() throws Exception {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
+        var plain = "hello gzip ".repeat(40);
+        var body = Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8));
+        java.util.function.Function<Request, Response> inner = (r) -> new Response(200,
+                ResponseHeaders.of().add("content-type", "text/plain"), body);
+        // A later field's gzip;q=0 overrides the earlier wildcard.
+        var refused = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("*", "gzip;q=0")))), inner);
+        assertNull(refused.headers().get("content-encoding"));
+        assertTrue(refused.body() == body);
+        assertEquals("Accept-Encoding", refused.headers().get("vary"));
+        // gzip offered only in a later field is still selected.
+        var later = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("br", "gzip")))), inner);
+        assertEquals("gzip", later.headers().get("content-encoding"));
+        assertEquals(plain, gunzip(later));
+        // identity;q=0 in a later field forces gzip even when it does not shrink the body.
+        var noise = new byte[300];
+        new java.util.Random(7).nextBytes(noise);
+        var incompressible = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip", "identity;q=0")))), (r) -> new Response(200,
+                        ResponseHeaders.of().add("content-type", "text/plain"), Body.Bytes.of(noise)));
+        assertEquals("gzip", incompressible.headers().get("content-encoding"));
+        assertEquals("*,gzip;q=0", CompressFilter.acceptEncoding(RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("*", "gzip;q=0")))));
+        assertEquals("gzip", CompressFilter.acceptEncoding(RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip")))));
+        assertNull(CompressFilter.acceptEncoding(RequestHeaders.of(Map.of())));
+    }
+
+    @Test
+    void dropsDigestHeadersInvalidatedByCompression() throws Exception {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
+        var plain = "hello gzip ".repeat(40);
+        java.util.function.Function<Request, Response> inner = (r) -> new Response(200, ResponseHeaders.of()
+                .add("content-type", "text/plain")
+                .add("etag", "\"abc\"")
+                .add("content-digest", "sha-256=:AAAA:")
+                .add("repr-digest", "sha-256=:BBBB:")
+                .add("digest", "SHA-256=CCCC")
+                .add("content-md5", "DDDD"),
+                Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8)));
+        var compressed = call(filter, request("gzip"), inner);
+        assertEquals("gzip", compressed.headers().get("content-encoding"));
+        assertEquals(plain, gunzip(compressed));
+        for (var name : List.of("content-digest", "repr-digest", "digest", "content-md5")) {
+            assertNull(compressed.headers().get(name), name + " must not describe the identity bytes");
+        }
+        var notModified = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-none-match", List.of("\"abc-gzip\"")))), inner);
+        assertEquals(304, notModified.status());
+        assertNull(notModified.headers().get("content-digest"));
+        assertNull(notModified.headers().get("repr-digest"));
+        // An identity response keeps its digests.
+        var identity = call(filter, request(null), inner);
+        assertEquals("sha-256=:AAAA:", identity.headers().get("content-digest"));
+        assertEquals("sha-256=:BBBB:", identity.headers().get("repr-digest"));
+    }
+
+    @Test
     void factoryIsInstalled() throws Exception {
         var filters = GatewayFilters.install(RequestFilters.create())
                 .add(GatewayTestSupport.spec("compress", Map.of()));

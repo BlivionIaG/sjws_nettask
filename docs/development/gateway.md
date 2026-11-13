@@ -167,7 +167,8 @@ gzip response compression negotiated from `Accept-Encoding`. Off, with no cost, 
 names this filter. This land is gzip only; `encodings` that include `br` are rejected at apply time
 so brotli is not advertised before it is implemented.
 
-The request path looks at `Accept-Encoding` after the inner handler returns. gzip (or `x-gzip`, or
+The request path looks at `Accept-Encoding` after the inner handler returns; repeated
+`Accept-Encoding` fields are combined into one list before negotiation. gzip (or `x-gzip`, or
 `*` with q > 0) is required; a missing header is left uncompressed. The filter skips 1xx/204/304,
 206 and `Content-Range`, an already encoded body (other than `identity`), a missing or
 non-compressible `Content-Type`, and bodies shorter than `min_size` (default 256). Default
@@ -180,8 +181,8 @@ then replaced with a new `Body.Bytes` so `FilterChain` can close the original so
 HTTP/1.1 keep-alive). If gzip does not shrink a buffered body, the original response is kept.
 
 A compressed response gets `Content-Encoding: gzip` and `Vary: Accept-Encoding` (merged into an
-existing Vary, left alone when Vary is `*`). Stale `Content-Length`, `Content-MD5` and
-`Accept-Ranges` are removed; the transport writes `Content-Length` from the new body. A present
+existing Vary, left alone when Vary is `*`). Stale `Content-Length`, `Content-MD5`,
+`Content-Digest`, `Repr-Digest`, `Digest` and `Accept-Ranges` are removed; the transport writes `Content-Length` from the new body. A present
 ETag is suffixed with `-gzip` inside the quotes.
 
 
