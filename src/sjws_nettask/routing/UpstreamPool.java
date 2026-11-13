@@ -80,6 +80,13 @@ final class UpstreamPool implements AutoCloseable {
         }
     }
 
+    /** The per-upstream {@code max_connections} cap was reached; answer 503 locally. */
+    static final class ConnectionLimit extends IOException {
+        ConnectionLimit() {
+            super("upstream connection limit");
+        }
+    }
+
     private static final ReentrantLock LOOPS_LOCK = new ReentrantLock();
     private static EventLoopGroup loops;
     private static int users;
@@ -94,9 +101,15 @@ final class UpstreamPool implements AutoCloseable {
     private volatile boolean retired;
 
     private final ByteBudget budget;
+    private final Admission admission;
 
     UpstreamPool(URI upstream, Duration connectTimeout, int maxIdle, ByteBudget budget) {
+        this(upstream, connectTimeout, maxIdle, budget, null);
+    }
+
+    UpstreamPool(URI upstream, Duration connectTimeout, int maxIdle, ByteBudget budget, Admission admission) {
         this.budget = java.util.Objects.requireNonNull(budget);
+        this.admission = admission;
         boolean tls = "https".equals(upstream.getScheme());
         this.host = upstream.getHost();
         this.port = upstream.getPort() > 0 ? upstream.getPort() : tls ? 443 : 80;
@@ -174,6 +187,13 @@ final class UpstreamPool implements AutoCloseable {
                 return new Lease(ch, true);
             }
         }
+        Admission.Hold slot = null;
+        if (this.admission != null && this.admission.limitsConnections()) {
+            slot = this.admission.tryConnection();
+            if (slot == null) {
+                throw new ConnectionLimit();
+            }
+        }
         Duration wait = timeout == null || timeout.isZero() || timeout.isNegative() ? this.connectTimeout : timeout;
         long waitMs = wait.equals(this.connectTimeout)
                 ? this.connectTimeout.toMillis() + 1000
@@ -189,22 +209,73 @@ final class UpstreamPool implements AutoCloseable {
                 connected.completeExceptionally(new java.nio.channels.ClosedChannelException());
             }
         });
+        // Hold the slot until the channel actually closes, including when the wait is
+        // interrupted or times out while the socket is still connecting (Codex P2 on #475).
+        Admission.Hold releasedOnClose = null;
+        if (slot != null) {
+            var ch = future.channel();
+            if (ch != null) {
+                var held = slot;
+                ch.closeFuture().addListener(f -> held.release());
+                releasedOnClose = held;
+                slot = null;
+            }
+        }
         try {
-            return new Lease(connected.get(waitMs, TimeUnit.MILLISECONDS), false);
+            var ch = connected.get(waitMs, TimeUnit.MILLISECONDS);
+            if (slot != null) {
+                var held = slot;
+                ch.closeFuture().addListener(f -> held.release());
+                slot = null;
+            }
+            return new Lease(ch, false);
         } catch (TimeoutException e) {
             abandonConnect(future);
+            awaitAbandonedSlot(future, releasedOnClose != null ? releasedOnClose : slot);
             throw new ConnectTimeout("connect to " + this.host + ":" + this.port + " timed out");
         } catch (InterruptedException e) {
-            // e.g. EndpointBalancer.close() -> probeWorkers.shutdownNow() mid-connect: nobody will
-            // take this lease, so the socket must not outlive the wait (Codex P2 on #477).
+            // Cancel and close; keep the slot on closeFuture until the socket is gone so
+            // repeated resets cannot start more connects than max_connections.
             abandonConnect(future);
-            throw e; // propagates the interrupt to the caller
+            if (slot != null) {
+                slot.release();
+            }
+            throw e;
         } catch (ExecutionException e) {
+            abandonConnect(future);
+            awaitAbandonedSlot(future, releasedOnClose != null ? releasedOnClose : slot);
             var cause = e.getCause();
             if (cause instanceof io.netty.channel.ConnectTimeoutException) {
                 throw new ConnectTimeout(cause.getMessage());
             }
             throw new ConnectFailed("connect to " + this.host + ":" + this.port + ": " + cause, cause);
+        }
+    }
+
+    /**
+     * Waits for an abandoned connect's slot to free so a retry sees an accurate cap.
+     * No wait when there is no slot (max_connections unset): close stays asynchronous
+     * (Codex P1 on #475). Releases the hold only after close is confirmed; otherwise
+     * the closeFuture listener keeps it. Hold.release is idempotent.
+     */
+    private void awaitAbandonedSlot(io.netty.channel.ChannelFuture future, Admission.Hold slot) {
+        if (slot == null) {
+            return;
+        }
+        var ch = future.channel();
+        if (ch == null) {
+            slot.release(); // no channel, so no close listener was attached
+            return;
+        }
+        boolean closed = false;
+        try {
+            closed = ch.closeFuture().await(Math.max(1, this.connectTimeout.toMillis()), TimeUnit.MILLISECONDS)
+                    && ch.closeFuture().isDone();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (closed) {
+            slot.release();
         }
     }
 

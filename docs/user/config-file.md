@@ -522,6 +522,26 @@ a dead or overloaded upstream, not a flaky one. At 20% random 503s and 5000 req/
 trips about once a second (see `bench/proxy-routing/resilience.sh`). Pair it with `retry`, or raise
 `failures`, when the upstream has a steady error rate.
 
+Per-upstream admission limits are also off unless set (no cost when absent). When a cap is reached
+the proxy answers 503 with `Retry-After: 1` immediately, without contacting the upstream and
+without counting as a circuit failure:
+
+```yaml
+upstreams:
+  api:
+    url: "http://127.0.0.1:9000"
+    max_pending: 128        # concurrent outstanding exchanges to this upstream
+    max_connections: 64     # concurrent sockets (in use, connecting, or idle)
+```
+
+`max_pending` is the number of exchanges that have been admitted and have not yet finished
+(the response body was closed, or the exchange ended in an error). Retries of one request share
+one slot. `max_connections` caps live sockets, including idle keep-alives: a request that can
+reuse an idle connection does not need a new slot; one that cannot, because every socket is busy
+and the cap is reached, is refused. Both counters are per upstream: a multi-endpoint balancer
+shares one pair across its endpoint set. The pending slot is released on completion, abort, reset
+and timeout.
+
 An upstream can list several endpoints instead of one `url` (exactly one of the two). It then
 balances over them, with one pool per endpoint and a circuit per endpoint:
 

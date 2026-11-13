@@ -69,7 +69,9 @@ import sjws_nettask.core.StaticFileHandler;
  * connect/IO failures before the response head 502 (one retry on a fresh connection when a
  * pooled one turned out stale and the request had no body); connect or response-head timeouts
  * 504; a non-origin-form target or an unusable method 400. After the head, a failure aborts the
- * client connection/stream (never a short response).
+ * client connection/stream (never a short response). An admission refusal ({@code max_pending}
+ * or {@code max_connections}) is 503 with {@code Retry-After: 1}, marked
+ * {@link Response#localAdmission() local}, and does not contact the upstream.
  */
 public final class ProxyHandler implements Handler, AutoCloseable {
 
@@ -142,6 +144,8 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     private final Resilience.Retry retry;
     private final Resilience.RetryBudget retryBudget;
     private final Resilience.CircuitBreaker breaker;
+    /** Null when {@code max_pending} and {@code max_connections} are both unset. */
+    private final Admission admission;
 
 
     public ProxyHandler(Settings settings) {
@@ -155,12 +159,19 @@ public final class ProxyHandler implements Handler, AutoCloseable {
 
     /** @param resilience retries and circuit breaking, or null for neither */
     public ProxyHandler(Settings settings, ByteBudget budget, Resilience resilience) {
+        this(settings, budget, resilience, null);
+    }
+
+    /** @param admission per-upstream pending/connection caps, or null when both are unset */
+    public ProxyHandler(Settings settings, ByteBudget budget, Resilience resilience, Admission admission) {
         this.settings = settings;
         this.retry = resilience == null ? null : resilience.retry();
         this.retryBudget = this.retry == null ? null : new Resilience.RetryBudget(this.retry.budgetPercent());
         this.breaker = resilience == null || resilience.circuit() == null ? null
                 : new Resilience.CircuitBreaker(resilience.circuit());
-        this.pool = new UpstreamPool(settings.upstream(), settings.connectTimeout(), settings.maxIdle(), budget);
+        this.admission = admission;
+        this.pool = new UpstreamPool(settings.upstream(), settings.connectTimeout(), settings.maxIdle(), budget,
+                admission);
         var path = settings.upstream().getRawPath();
         this.basePath = path == null || path.isEmpty() || path.equals("/") ? ""
                 : path.endsWith("/") ? path.substring(0, path.length() - 1) : path;
@@ -200,6 +211,32 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         return response != null && response.localAdmission();
     }
 
+    /** 503 + Retry-After: 1, marked local, for a pending or connection cap. */
+    static Response overloaded(boolean head) {
+        var response = StaticFileHandler.error(503, head);
+        response.headers().add("retry-after", "1");
+        return localRefusal(response);
+    }
+
+    /**
+     * Holds the pending slot until a live upstream stream is closed; otherwise releases it now.
+     * {@code pending} may be null.
+     */
+    static Response withPending(Response response, Admission.Hold pending) {
+        if (pending == null) {
+            return response;
+        }
+        if (response.body() instanceof Body.Stream stream) {
+            var source = stream.source();
+            if (source != Source.EMPTY && !(source instanceof Source s && s.closed())) {
+                return new Response(response.status(), response.headers(),
+                        new Body.Stream(stream.length(), new ReleasingSource(source, pending)),
+                        response.headOnly(), response.localAdmission());
+            }
+        }
+        pending.release();
+        return response;
+    }
 
     public Settings settings() {
         return this.settings;
@@ -241,19 +278,45 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         } catch (IllegalArgumentException e) {
             return StaticFileHandler.error(400, head);
         }
-        if (this.retry == null && this.breaker == null) {
-            try {
-                return exchange(request, out, length, true);
-            } catch (RequestBodyTooLarge e) {
-                return StaticFileHandler.error(413, head);
-            } catch (IOException e) {
-                return StaticFileHandler.error(status(e), head);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return StaticFileHandler.error(502, head);
+        Admission.Hold pending = null;
+        if (this.admission != null && this.admission.limitsPending()) {
+            pending = this.admission.tryPending();
+            if (pending == null) {
+                return overloaded(head);
             }
         }
-        return resilient(request, out, length, head);
+        if (this.retry == null && this.breaker == null) {
+            try {
+                var response = exchange(request, out, length, true);
+                var hold = pending;
+                pending = null;
+                return withPending(response, hold);
+            } catch (UpstreamPool.ConnectionLimit e) {
+                var hold = pending;
+                pending = null;
+                return withPending(overloaded(head), hold);
+            } catch (RequestBodyTooLarge e) {
+                return StaticFileHandler.error(413, head); // the finally releases the pending slot
+            } catch (IOException e) {
+                if (pending != null) {
+                    pending.release();
+                    pending = null;
+                }
+                return StaticFileHandler.error(status(e), head);
+            } catch (InterruptedException e) {
+                if (pending != null) {
+                    pending.release();
+                    pending = null;
+                }
+                Thread.currentThread().interrupt();
+                return StaticFileHandler.error(502, head);
+            } finally {
+                if (pending != null) {
+                    pending.release();
+                }
+            }
+        }
+        return resilient(request, out, length, head, pending);
     }
 
     /**
@@ -282,6 +345,8 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         }
         try {
             return exchange(request, out, length, true);
+        } catch (UpstreamPool.ConnectionLimit e) {
+            return overloaded(head);
         } catch (RequestBodyTooLarge e) {
             return StaticFileHandler.error(413, head);
         }
@@ -370,66 +435,101 @@ public final class ProxyHandler implements Handler, AutoCloseable {
      * is listed in {@code on}, the request is idempotent and bodyless, and the retry budget has a
      * token; nothing has reached the client before a retry (a retried 5xx body is discarded).
      */
-    private Response resilient(Request request, HttpRequest out, long length, boolean head) {
+    private Response resilient(Request request, HttpRequest out, long length, boolean head,
+            Admission.Hold pending) {
         var retry = this.retry;
         boolean mayRetry = retry != null && length == 0 && idempotent(request.method());
         if (retry != null) {
             this.retryBudget.deposit();
         }
         if (this.breaker != null && !this.breaker.allow()) {
+            if (pending != null) {
+                pending.release();
+                pending = null;
+            }
             var open = StaticFileHandler.error(503, head);
             open.headers().add("retry-after", Long.toString(this.breaker.retryAfterSeconds()));
             return open;
         }
-        int tries = 0;
-        while (true) {
-            Resilience.On failed;
-            Response response = null;
-            int errorStatus = 0;
-            try {
-                response = exchange(request, tries == 0 ? out : rebuild(out), length, true);
-                failed = kind(response);
-            } catch (RequestBodyTooLarge e) {
-                if (this.breaker != null) {
-                    this.breaker.release(); // local 413, not an upstream verdict
-                }
-                return StaticFileHandler.error(413, head);
-            } catch (IOException e) {
-                failed = kind(e);
-                errorStatus = status(e);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                if (this.breaker != null) {
-                    this.breaker.release(); // the client went away: no verdict on the upstream
-                }
-                return StaticFileHandler.error(502, head);
-            }
-            boolean again = failed != null && mayRetry && tries < retry.attempts() && retry.on().contains(failed)
-                    && this.retryBudget.withdraw();
-            if (!again) {
-                // one verdict per request, after its retries: a retry that recovers is a success
-                if (this.breaker != null) {
-                    if (failed == null) {
-                        this.breaker.success();
-                    } else {
-                        this.breaker.failure();
+        try {
+            int tries = 0;
+            while (true) {
+                Resilience.On failed;
+                Response response = null;
+                int errorStatus = 0;
+                try {
+                    response = exchange(request, tries == 0 ? out : rebuild(out), length, true);
+                    if (isLocalRefusal(response)) {
+                        if (this.breaker != null) {
+                            this.breaker.release();
+                        }
+                        var hold = pending;
+                        pending = null;
+                        return withPending(response, hold);
                     }
+                    failed = kind(response);
+                } catch (UpstreamPool.ConnectionLimit e) {
+                    if (this.breaker != null) {
+                        this.breaker.release();
+                    }
+                    var hold = pending;
+                    pending = null;
+                    return withPending(overloaded(head), hold);
+                } catch (RequestBodyTooLarge e) {
+                    if (this.breaker != null) {
+                        this.breaker.release(); // local 413, not an upstream verdict
+                    }
+                    return StaticFileHandler.error(413, head); // the finally releases the pending slot
+                } catch (IOException e) {
+                    failed = kind(e);
+                    errorStatus = status(e);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    if (this.breaker != null) {
+                        this.breaker.release(); // the client went away: no verdict on the upstream
+                    }
+                    if (pending != null) {
+                        pending.release();
+                        pending = null;
+                    }
+                    return StaticFileHandler.error(502, head);
                 }
-                if (failed == null) {
-                    return response;
+                boolean again = failed != null && mayRetry && tries < retry.attempts() && retry.on().contains(failed)
+                        && this.retryBudget.withdraw();
+                if (!again) {
+                    // one verdict per request, after its retries: a retry that recovers is a success
+                    if (this.breaker != null) {
+                        if (failed == null) {
+                            this.breaker.success();
+                        } else {
+                            this.breaker.failure();
+                        }
+                    }
+                    var outResponse = failed == null ? response
+                            : response != null ? response : StaticFileHandler.error(errorStatus, head);
+                    var hold = pending;
+                    pending = null;
+                    return withPending(outResponse, hold);
                 }
-                return response != null ? response : StaticFileHandler.error(errorStatus, head);
+                if (response != null) {
+                    Body.discard(response.body()); // the 5xx is replaced by the next attempt
+                }
+                tries++;
             }
-            if (response != null) {
-                Body.discard(response.body()); // the 5xx is replaced by the next attempt
+        } finally {
+            if (pending != null) {
+                pending.release();
             }
-            tries++;
         }
     }
 
     /** Circuit state, for tests and metrics; CLOSED when no breaker is configured. */
     String circuitState() {
         return this.breaker == null ? "CLOSED" : this.breaker.state().name();
+    }
+
+    public Admission admission() {
+        return this.admission;
     }
 
     private static final class ResponseTimeout extends IOException {
@@ -766,6 +866,35 @@ public final class ProxyHandler implements Handler, AutoCloseable {
             } else {
                 this.ex.abandon();
                 this.pool.release(this.ex.channel, false);
+            }
+        }
+
+        boolean closed() {
+            return this.closed;
+        }
+    }
+
+    /** Releases a pending slot when the wrapped upstream stream is closed. */
+    static final class ReleasingSource implements Body.Stream.Source {
+        private final Body.Stream.Source inner;
+        private final Admission.Hold pending;
+
+        ReleasingSource(Body.Stream.Source inner, Admission.Hold pending) {
+            this.inner = inner;
+            this.pending = pending;
+        }
+
+        @Override
+        public java.nio.ByteBuffer next() throws IOException {
+            return this.inner.next();
+        }
+
+        @Override
+        public void close() {
+            try {
+                this.inner.close();
+            } finally {
+                this.pending.release();
             }
         }
     }
