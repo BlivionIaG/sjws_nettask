@@ -224,6 +224,95 @@ class CompressFilterTest {
     }
 
     @Test
+    void addsVaryToEligibleIdentityResponses() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
+        var plain = "hello gzip ".repeat(40);
+        var identity = call(filter, request(null), text(plain, "text/plain"));
+        assertNull(identity.headers().get("content-encoding"));
+        assertEquals("Accept-Encoding", identity.headers().get("vary"));
+        var refused = call(filter, request("gzip;q=0"), text(plain, "text/plain"));
+        assertEquals("Accept-Encoding", refused.headers().get("vary"));
+        var small = call(filter, request(null), text("short", "text/plain"));
+        assertNull(small.headers().get("vary"), "ineligible responses must not advertise negotiation");
+        var merged = call(filter, request("identity"), (r) -> {
+            var headers = ResponseHeaders.of().add("content-type", "text/plain").add("vary", "Origin");
+            return new Response(200, headers, Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8)));
+        });
+        assertEquals("Origin, Accept-Encoding", merged.headers().get("vary"));
+        int varyFields = 0;
+        for (var entry : merged.headers().entries()) {
+            if ("vary".equals(entry.getKey())) {
+                varyFields++;
+            }
+        }
+        assertEquals(1, varyFields);
+    }
+
+    @Test
+    void leavesNoTransformResponsesUncompressed() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
+        var plain = "hello gzip ".repeat(40).getBytes(StandardCharsets.UTF_8);
+        var body = Body.Bytes.of(plain);
+        var response = call(filter, request("gzip"), (r) -> {
+            var headers = ResponseHeaders.of()
+                    .add("content-type", "text/plain")
+                    .add("cache-control", "public, max-age=60")
+                    .add("cache-control", "No-Transform");
+            return new Response(200, headers, body);
+        });
+        assertNull(response.headers().get("content-encoding"));
+        assertTrue(response.body() == body, "no-transform must leave the body alone");
+        // Same directive on a single field, mixed with others.
+        var single = call(filter, request("gzip"), (r) -> {
+            var headers = ResponseHeaders.of()
+                    .add("content-type", "text/plain")
+                    .add("cache-control", "max-age=10, no-transform, public");
+            return new Response(200, headers, body);
+        });
+        assertNull(single.headers().get("content-encoding"));
+        assertTrue(single.body() == body);
+    }
+
+    @Test
+    void compressedEtagOnIfNoneMatchReturns304() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
+        var plain = "hello gzip ".repeat(40);
+        // Inner handler compares If-None-Match only to the unsuffixed ETag, like FileMeta.notModified().
+        java.util.function.Function<Request, Response> inner = (r) -> {
+            var etag = "\"abc\"";
+            if (r.headers().ifNoneMatch() != null
+                    && r.headers().ifNoneMatch().contains(etag)
+                    && !r.headers().ifNoneMatch().contains("-gzip")) {
+                return new Response(304, ResponseHeaders.of().add("etag", etag), Body.Empty.INSTANCE);
+            }
+            var headers = ResponseHeaders.of()
+                    .add("content-type", "text/plain")
+                    .add("etag", etag)
+                    .add("last-modified", "Wed, 11 Nov 2026 17:00:00 GMT");
+            return new Response(200, headers, Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8)));
+        };
+        var conditional = new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-none-match", List.of("\"abc-gzip\""))));
+        var response = call(filter, conditional, inner);
+        assertEquals(304, response.status());
+        assertEquals("\"abc-gzip\"", response.headers().get("etag"));
+        assertEquals("gzip", response.headers().get("content-encoding"));
+        assertEquals("Accept-Encoding", response.headers().get("vary"));
+        assertTrue(response.body() instanceof Body.Empty);
+        // A body we would not compress must not be turned into 304 just because the client
+        // sent a gzip-suffixed validator.
+        var small = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-none-match", List.of("\"x-gzip\"")))),
+                (r) -> new Response(200, ResponseHeaders.of().add("content-type", "text/plain").add("etag", "\"x\""),
+                        Body.Bytes.of("short".getBytes(StandardCharsets.UTF_8))));
+        assertEquals(200, small.status());
+        assertNull(small.headers().get("content-encoding"));
+        assertEquals("\"x\"", small.headers().get("etag"));
+    }
+
+    @Test
     void factoryIsInstalled() throws Exception {
         var filters = GatewayFilters.install(RequestFilters.create())
                 .add(GatewayTestSupport.spec("compress", Map.of()));

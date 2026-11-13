@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.zip.GZIPOutputStream;
 import sjws_nettask.core.Body;
+import sjws_nettask.core.EntityTag;
 import sjws_nettask.core.MiddlewareSpec;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestFilter;
@@ -88,8 +89,16 @@ public final class CompressFilter implements RequestFilter {
     @Override
     public Response filter(Request request, Chain next) {
         var response = next.proceed(request);
-        if (chooseGzip(request.headers().acceptEncoding()) && compressible(response)) {
+        boolean gzip = chooseGzip(request.headers().acceptEncoding());
+        if (gzip && compressible(response)) {
+            if (compressedValidatorHits(request, response)) {
+                return notModifiedGzip(response);
+            }
             return gzip(response);
+        }
+        if (compressible(response)) {
+            // Identity is still negotiated: caches must not reuse it for a gzip request.
+            return withAcceptEncodingVary(response);
         }
         return response;
     }
@@ -104,6 +113,9 @@ public final class CompressFilter implements RequestFilter {
         }
         var encoding = headers.get("content-encoding");
         if (encoding != null && !isIdentity(encoding)) {
+            return false;
+        }
+        if (hasCacheDirective(headers, "no-transform")) {
             return false;
         }
         if (!typeAllowed(mediaType(headers.get("content-type")))) {
@@ -140,10 +152,11 @@ public final class CompressFilter implements RequestFilter {
         var compressed = gzipBytes(plain);
         if (compressed.length >= plain.length) {
             // A consumed stream cannot be re-read; return the bytes we already own.
-            return consumed
+            var identity = consumed
                     ? new Response(original.status(), original.headers(), Body.Bytes.of(plain),
                             original.headOnly(), original.localAdmission())
                     : original;
+            return withAcceptEncodingVary(identity);
         }
         return new Response(original.status(), encodedHeaders(original.headers()),
                 Body.Bytes.of(compressed), original.headOnly(), original.localAdmission());
@@ -196,6 +209,57 @@ public final class CompressFilter implements RequestFilter {
             return t;
         }
         return (weak ? "W/" : "") + "\"" + value + "-" + coding + "\"";
+    }
+
+    /** True when If-None-Match names the gzip representation this filter would emit. */
+    static boolean compressedValidatorHits(Request request, Response response) {
+        var inm = request.headers().ifNoneMatch();
+        if (inm == null || inm.isBlank()) {
+            return false;
+        }
+        var etag = response.headers().get("etag");
+        if (etag == null) {
+            return false;
+        }
+        var tagged = withCoding(etag, "gzip");
+        return tagged != null && EntityTag.noneMatchHits(inm, tagged);
+    }
+
+    static Response notModifiedGzip(Response original) {
+        return new Response(304, encodedHeaders(original.headers()), Body.Empty.INSTANCE,
+                original.headOnly(), original.localAdmission());
+    }
+
+    static Response withAcceptEncodingVary(Response response) {
+        var headers = response.headers().copy();
+        var vary = mergeVary(headers);
+        headers.set("vary", vary == null ? "Accept-Encoding" : vary);
+        return new Response(response.status(), headers, response.body(), response.headOnly(),
+                response.localAdmission());
+    }
+
+    /** True if any Cache-Control field carries {@code directive} (RFC 9111, case-insensitive). */
+    static boolean hasCacheDirective(ResponseHeaders headers, String directive) {
+        for (var entry : headers.entries()) {
+            if (!"cache-control".equals(entry.getKey())) {
+                continue;
+            }
+            var raw = entry.getValue();
+            if (raw == null || raw.isBlank()) {
+                continue;
+            }
+            for (var part : raw.split(",")) {
+                var token = part.trim();
+                int eq = token.indexOf('=');
+                if (eq >= 0) {
+                    token = token.substring(0, eq).trim();
+                }
+                if (directive.equalsIgnoreCase(token)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
