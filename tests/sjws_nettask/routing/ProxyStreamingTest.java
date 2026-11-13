@@ -219,7 +219,68 @@ class ProxyStreamingTest {
                     return -1;
                 }
             };
-            assertEquals(501, p.handle(new Request("POST", "/echo").withBody(unknown)).status());
+            assertEquals(200, p.handle(new Request("POST", "/echo").withBody(unknown)).status(),
+                    "an attached empty unknown-length body is forwarded, not 501");
+            var once = new java.util.concurrent.atomic.AtomicBoolean();
+            RequestBody chunked = new RequestBody() {
+                @Override
+                public long length() {
+                    return -1;
+                }
+
+                @Override
+                public int read(byte[] into, int off, int len) {
+                    if (!once.compareAndSet(false, true)) {
+                        return -1;
+                    }
+                    var src = "chunk-ok".getBytes();
+                    System.arraycopy(src, 0, into, off, src.length);
+                    return src.length;
+                }
+            };
+            var echoed = p.handle(new Request("POST", "/echo").withBody(chunked));
+            assertEquals(200, echoed.status());
+            assertEquals("chunk-ok", new String(drain(echoed.body()), StandardCharsets.UTF_8));
+            RequestBody oversized = new RequestBody() {
+                @Override
+                public long length() {
+                    return -1;
+                }
+
+                @Override
+                public int read(byte[] into, int off, int len) {
+                    int n = Math.min(len, 8192);
+                    return n;
+                }
+            };
+            var tight = new ProxyHandler(new ProxyHandler.Settings(this.base, Duration.ofSeconds(2),
+                    Duration.ofSeconds(5), Duration.ofSeconds(5), 1024, null, List.of(), false, 8));
+            try (tight) {
+                assertEquals(413, tight.handle(new Request("POST", "/echo").withBody(oversized)).status());
+            }
+            // A circuit or retry must not reclassify the local 413 as an upstream failure.
+            var gated = new ProxyHandler(new ProxyHandler.Settings(this.base, Duration.ofSeconds(2),
+                    Duration.ofSeconds(5), Duration.ofSeconds(5), 1024, null, List.of(), false, 8),
+                    ByteBudget.shared(),
+                    new Resilience(null, new Resilience.Circuit(1, Duration.ofSeconds(30))));
+            try (gated) {
+                assertEquals(413, gated.handle(new Request("POST", "/echo").withBody(oversized)).status());
+                var smallBytes = "ok".getBytes(StandardCharsets.UTF_8);
+                var smallIn = new java.io.ByteArrayInputStream(smallBytes);
+                RequestBody small = new RequestBody() {
+                    @Override
+                    public long length() {
+                        return smallBytes.length;
+                    }
+
+                    @Override
+                    public int read(byte[] into, int off, int len) {
+                        return smallIn.read(into, off, len);
+                    }
+                };
+                assertEquals(200, gated.handle(new Request("POST", "/echo").withBody(small)).status(),
+                        "a local 413 must not trip the circuit");
+            }
         }
     }
 
@@ -354,6 +415,15 @@ class ProxyStreamingTest {
                     .POST(java.net.http.HttpRequest.BodyPublishers.ofString(payload)).build(),
                     java.net.http.HttpResponse.BodyHandlers.ofString());
             assertEquals(payload, echo.body());
+            try (var s = new Socket("127.0.0.1", port)) {
+                var body = "hello-chunked";
+                var req = "POST /api/echo HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                        + Integer.toHexString(body.length()) + "\r\n" + body + "\r\n0\r\n\r\n";
+                s.getOutputStream().write(req.getBytes(StandardCharsets.US_ASCII));
+                var got = new String(s.getInputStream().readAllBytes(), StandardCharsets.US_ASCII);
+                assertTrue(got.contains("hello-chunked"), got);
+                assertTrue(got.startsWith("HTTP/1.1 200 "), got);
+            }
             var chunked = client.send(java.net.http.HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/chunked")).build(),
                     java.net.http.HttpResponse.BodyHandlers.ofString());
             assertEquals("part0;part1;part2;part3;part4;", chunked.body());

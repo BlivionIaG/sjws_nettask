@@ -659,8 +659,8 @@ public final class ConfigLoader {
             }
             var body = YamlValues.mapping(entry.getValue(), "routing.upstreams." + name);
             YamlValues.knownKeys(body, List.of("url", "connect_timeout", "response_timeout", "idle_read_timeout",
-                    "max_body", "preserve_host", "retry", "circuit", "endpoints", "lb", "active_health"),
-                    "routing.upstreams." + name);
+                    "max_body", "preserve_host", "retry", "circuit", "endpoints", "lb", "active_health",
+                    "max_pending", "max_connections"), "routing.upstreams." + name);
             boolean multi = body.containsKey("endpoints");
             if (multi == body.containsKey("url")) {
                 throw new ConfigException("routing.upstreams." + name + ": exactly one of url or endpoints is required");
@@ -712,11 +712,19 @@ public final class ConfigLoader {
                 circuit = circuit(body.get("circuit"), "routing.upstreams." + name + ".circuit");
             }
             var resilience = retry == null && circuit == null ? null : new sjws_nettask.routing.Resilience(retry, circuit);
+            int maxPending = body.containsKey("max_pending")
+                    ? integer(body.get("max_pending"), "routing.upstreams." + name + ".max_pending", 1,
+                            Integer.MAX_VALUE)
+                    : 0;
+            int maxConnections = body.containsKey("max_connections")
+                    ? integer(body.get("max_connections"), "routing.upstreams." + name + ".max_connections", 1,
+                            Integer.MAX_VALUE)
+                    : 0;
             var activeHealth = body.containsKey("active_health")
                     ? activeHealth(body.get("active_health"), "routing.upstreams." + name + ".active_health")
                     : null;
-            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience, discovery,
-                    activeHealth));
+            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience, maxPending,
+                    maxConnections, discovery, activeHealth));
         }
         return Map.copyOf(out);
     }
@@ -1176,8 +1184,8 @@ public final class ConfigLoader {
                 throw new ConfigException(path + ": " + e.getMessage());
             }
             if (MiddlewareSecrets.hasInline(options)) {
-                warnings.add(path + ": inline keys/hmac-keys sit in the file in clear; prefer keys-file / "
-                        + "hmac-keys-file (required for control-plane proposals)");
+                warnings.add(path + ": inline secret options sit in the file in clear; prefer keys-file / "
+                        + "hmac-keys-file / users-file (required for control-plane proposals)");
             }
         }
         if (!specs.isEmpty()) {

@@ -429,11 +429,10 @@ and the request path is unchanged. The records map onto `Route(host, prefix, rew
 handler)` and `ProxyHandler.Settings(url, connectTimeout, responseTimeout,
 idleReadTimeout, maxBody, proto, trustedProxies, preserveHost, maxIdle)`. The proxy is a Netty
 HTTP/1.1 client with up to 256 idle keep-alive connections per upstream, and it streams
-response bodies with backpressure. HTTP/1.1 request bodies with a `Content-Length` are
-streamed upstream (over `max_body` is 413); so are HTTP/3 request bodies with a `content-length`. A chunked request
-body (or an HTTP/3 body of unknown length) is 501 for now, as is a declared body that the transport did not attach
-(HTTP/2 attaches none today); see
-`docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
+response bodies with backpressure. HTTP/1.1, HTTP/2 and HTTP/3 request bodies are streamed upstream, including a
+chunked HTTP/1.1 body and an HTTP/2 or HTTP/3 body of unknown length (over `max_body` is 413,
+enforced as the body is read when the length is unknown). A declared body that the transport did
+not attach is still 501; see `docs/design/proxy-routing.md` §12. `proto` is `routing.forwarded_proto` (`auto` is `http` on plain
 TCP and h2c, and `https` on HTTP/2 over TLS and HTTP/3). `idle_read_timeout` (default 30s) bounds the gap between upstream body
 bytes. Proxied body bytes held in memory are bounded per request (a 256 KiB read-ahead window)
 and in total (`-Dsjws.proxy.maxInflightBytes`, default 64 MiB), with a per-peer share
@@ -522,6 +521,26 @@ success. An upstream is a single endpoint, so an open circuit is an outage of th
 a dead or overloaded upstream, not a flaky one. At 20% random 503s and 5000 req/s, `failures: 5`
 trips about once a second (see `bench/proxy-routing/resilience.sh`). Pair it with `retry`, or raise
 `failures`, when the upstream has a steady error rate.
+
+Per-upstream admission limits are also off unless set (no cost when absent). When a cap is reached
+the proxy answers 503 with `Retry-After: 1` immediately, without contacting the upstream and
+without counting as a circuit failure:
+
+```yaml
+upstreams:
+  api:
+    url: "http://127.0.0.1:9000"
+    max_pending: 128        # concurrent outstanding exchanges to this upstream
+    max_connections: 64     # concurrent sockets (in use, connecting, or idle)
+```
+
+`max_pending` is the number of exchanges that have been admitted and have not yet finished
+(the response body was closed, or the exchange ended in an error). Retries of one request share
+one slot. `max_connections` caps live sockets, including idle keep-alives: a request that can
+reuse an idle connection does not need a new slot; one that cannot, because every socket is busy
+and the cap is reached, is refused. Both counters are per upstream: a multi-endpoint balancer
+shares one pair across its endpoint set. The pending slot is released on completion, abort, reset
+and timeout.
 
 An upstream can list several endpoints instead of one `url` (exactly one of the two). It then
 balances over them, with one pool per endpoint and a circuit per endpoint:
@@ -673,14 +692,16 @@ middleware:
       keys-file: /etc/sjws/api-keys   # preferred; mode 0600/0400, owned by this process
 ```
 
-Gateway credential options (`api-key` `keys`, `jwt` `hmac-keys`) may be inline in a local
-file. Prefer `keys-file` / `hmac-keys-file`. A control-plane proposal that still carries the
-inline form is refused with 400; see [gateway filters](../development/gateway.md).
+Gateway credential options (`api-key` `keys`, `jwt` `hmac-keys`, `basic-auth` `users`) may be
+inline in a local file. Prefer `keys-file` / `hmac-keys-file` / `users-file`. A control-plane
+proposal that still carries the inline form is refused with 400; see [gateway
+filters](../development/gateway.md).
 
-Older Raft log entries and signed snapshots can still carry inline `keys` / `hmac-keys` from
-before file refs. Operators should move those credentials to `keys-file` / `hmac-keys-file` on
-each node, rotate the affected keys, propose and activate a config that uses only the file
-refs, then let a snapshot and log compaction run so the old entries are dropped. A control-plane
+Older Raft log entries and signed snapshots can still carry inline `keys` / `hmac-keys` /
+`users` from before file refs. Operators should move those credentials to `keys-file` /
+`hmac-keys-file` / `users-file` on each node, rotate the affected credentials, propose and
+activate a config that uses only the file refs, then let a snapshot and log compaction run so
+the old entries are dropped. A control-plane
 process logs a single WARN at startup while applied, activated, or last-good config still holds
 the inline form (filter/route and field names only; values are never logged).
 

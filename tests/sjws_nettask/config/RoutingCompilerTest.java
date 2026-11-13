@@ -20,6 +20,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
+import java.net.Inet6Address;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -94,6 +96,66 @@ class RoutingCompilerTest {
     }
 
     @Test
+    void admissionLimitsAreWiredOntoTheSharedProxy() throws IOException {
+        var unset = load("""
+                routing:
+                  enabled: true
+                  upstreams:
+                    api: { url: "http://127.0.0.1:9" }
+                  routes:
+                    - { prefix: /a, proxy: api }
+                """);
+        var unsetRouter = assertInstanceOf(Router.class,
+                ConfigSnapshot.compile(unset.document(), new sjws_nettask.acme.ChallengeBoard(), 1).handler());
+        var unsetProxy = assertInstanceOf(sjws_nettask.routing.ProxyHandler.class, unsetRouter.routes().get(0).handler());
+        assertNull(unsetProxy.admission());
+
+        var loaded = load("""
+                routing:
+                  enabled: true
+                  upstreams:
+                    api: { url: "http://127.0.0.1:9", max_pending: 3, max_connections: 2 }
+                  routes:
+                    - { prefix: /a, proxy: api }
+                    - { prefix: /b, proxy: api }
+                """);
+        var router = assertInstanceOf(Router.class,
+                ConfigSnapshot.compile(loaded.document(), new sjws_nettask.acme.ChallengeBoard(), 1).handler());
+        var proxy = assertInstanceOf(sjws_nettask.routing.ProxyHandler.class, router.routes().get(0).handler());
+        assertSame(proxy, router.routes().get(1).handler());
+        var admission = proxy.admission();
+        assertNotNull(admission);
+        assertTrue(admission.limitsPending());
+        assertTrue(admission.limitsConnections());
+        assertNotNull(admission.tryPending());
+        assertNotNull(admission.tryPending());
+        assertNotNull(admission.tryPending());
+        assertNull(admission.tryPending());
+        router.close();
+        unsetRouter.close();
+
+        var multi = load("""
+                routing:
+                  enabled: true
+                  upstreams:
+                    api:
+                      endpoints: ["http://127.0.0.1:9"]
+                      max_pending: 1
+                      max_connections: 1
+                  routes:
+                    - { prefix: /, proxy: api }
+                """);
+        var multiRouter = assertInstanceOf(Router.class,
+                ConfigSnapshot.compile(multi.document(), new sjws_nettask.acme.ChallengeBoard(), 1).handler());
+        var balancer = assertInstanceOf(sjws_nettask.routing.EndpointBalancer.class,
+                multiRouter.routes().get(0).handler());
+        assertNotNull(balancer.admission());
+        assertTrue(balancer.admission().limitsPending());
+        assertTrue(balancer.admission().limitsConnections());
+        multiRouter.close();
+    }
+
+    @Test
     void bracketedIpv6RouteHosts() throws IOException {
         var loaded = load("""
                 routing:
@@ -132,13 +194,17 @@ class RoutingCompilerTest {
     }
 
     @Test
-    void cidr() {
+    void cidr() throws Exception {
         var v4 = Cidr.parse("10.1.0.0/16");
         assertTrue(v4.contains(new InetSocketAddress("10.1.200.3", 1)));
         assertFalse(v4.contains(new InetSocketAddress("10.2.0.1", 1)));
         assertFalse(v4.contains(new InetSocketAddress("::1", 1)));
         assertFalse(v4.contains(null));
         assertFalse(v4.contains(InetSocketAddress.createUnresolved("x", 1)));
+        var bytes = java.net.InetAddress.getByName("10.1.200.3").getAddress();
+        assertTrue(v4.containsAddress(bytes));
+        assertFalse(v4.containsAddress(java.net.InetAddress.getByName("10.2.0.1").getAddress()));
+        assertFalse(v4.containsAddress(null));
         var odd = Cidr.parse(" 192.168.0.0/23 ");
         assertTrue(odd.contains(new InetSocketAddress("192.168.1.9", 1)));
         assertFalse(odd.contains(new InetSocketAddress("192.168.2.9", 1)));
@@ -148,6 +214,52 @@ class RoutingCompilerTest {
             "999.1.1.1"}) {
             assertThrows(IllegalArgumentException.class, () -> Cidr.parse(bad), bad);
         }
+    }
+
+    @Test
+    void cidrMatchesMappedIpv6PeerAsIpv4() throws Exception {
+        var mapped = mappedInet(10, 1, 200, 3);
+        var v4 = Cidr.parse("10.1.0.0/16");
+        assertTrue(v4.contains(new InetSocketAddress(mapped, 1)));
+        assertArrayEquals(new byte[] {10, 1, (byte) 200, 3}, Cidr.addressBytes(mapped));
+        assertTrue(Cidr.parse("0.0.0.0/0").contains(new InetSocketAddress(mapped, 1)));
+        assertFalse(Cidr.parse("::/0").contains(new InetSocketAddress(mapped, 1)));
+
+        var loopback = InetAddress.getByName("::1");
+        assertEquals(16, Cidr.addressBytes(loopback).length);
+        assertFalse(v4.contains(new InetSocketAddress(loopback, 1)));
+        assertTrue(Cidr.parse("::/0").contains(new InetSocketAddress(loopback, 1)));
+        assertFalse(Cidr.parse("0.0.0.0/0").contains(new InetSocketAddress(loopback, 1)));
+
+        var ipv4 = InetAddress.getByName("10.1.200.3");
+        assertArrayEquals(ipv4.getAddress(), Cidr.addressBytes(ipv4));
+        assertNull(Cidr.addressBytes(null));
+
+        var almost = new byte[16];
+        almost[9] = 1;
+        almost[10] = (byte) 0xff;
+        almost[11] = (byte) 0xff;
+        almost[12] = 10;
+        assertEquals(16, Cidr.addressBytes(Inet6Address.getByAddress(null, almost, -1)).length);
+        var prefixShort = new byte[16];
+        prefixShort[10] = (byte) 0xfe;
+        prefixShort[11] = (byte) 0xff;
+        assertEquals(16, Cidr.addressBytes(Inet6Address.getByAddress(null, prefixShort, -1)).length);
+        var prefixShort2 = new byte[16];
+        prefixShort2[10] = (byte) 0xff;
+        prefixShort2[11] = (byte) 0xfe;
+        assertEquals(16, Cidr.addressBytes(Inet6Address.getByAddress(null, prefixShort2, -1)).length);
+    }
+
+    private static InetAddress mappedInet(int a, int b, int c, int d) throws Exception {
+        var bytes = new byte[16];
+        bytes[10] = (byte) 0xff;
+        bytes[11] = (byte) 0xff;
+        bytes[12] = (byte) a;
+        bytes[13] = (byte) b;
+        bytes[14] = (byte) c;
+        bytes[15] = (byte) d;
+        return Inet6Address.getByAddress(null, bytes, -1);
     }
 
     /** The main entry point's path: config file → ConfigLoader → SjwsServer.start(loaded). */

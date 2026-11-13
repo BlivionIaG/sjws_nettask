@@ -236,6 +236,12 @@ public final class ConfigCodec {
                         .append('\n');
                 out.append("      max_body: ").append(upstream.maxBody()).append('\n');
                 out.append("      preserve_host: ").append(upstream.preserveHost()).append('\n');
+                if (upstream.maxPending() > 0) {
+                    out.append("      max_pending: ").append(upstream.maxPending()).append('\n');
+                }
+                if (upstream.maxConnections() > 0) {
+                    out.append("      max_connections: ").append(upstream.maxConnections()).append('\n');
+                }
                 var resilience = upstream.resilience();
                 if (resilience != null && resilience.retry() != null) {
                     var retry = resilience.retry();

@@ -32,6 +32,9 @@ import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -99,16 +102,25 @@ class EndpointBalancerTest {
 
     private EndpointBalancer balancer(StaticUpstreamSource src, Resilience.Retry retry, EndpointBalancer.Outlier o,
             Duration grace) {
-        return balancer(src, retry, o, grace, null);
+        return balancerWith(src, retry, o, grace, null, null);
+    }
+
+    private EndpointBalancer balancer(StaticUpstreamSource src, Resilience.Retry retry, EndpointBalancer.Outlier o,
+            Duration grace, Admission admission) {
+        return balancerWith(src, retry, o, grace, admission, null);
     }
 
     private EndpointBalancer balancer(StaticUpstreamSource src, Resilience.Retry retry, EndpointBalancer.Outlier o,
             Duration grace, ActiveHealth health) {
+        return balancerWith(src, retry, o, grace, null, health);
+    }
+
+    private EndpointBalancer balancerWith(StaticUpstreamSource src, Resilience.Retry retry, EndpointBalancer.Outlier o,
+            Duration grace, Admission admission, ActiveHealth health) {
         EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
-                URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http", null));
-        var b = health == null
-                ? new EndpointBalancer(src, pools, retry, o, grace, this.now::get)
-                : new EndpointBalancer(src, pools, retry, o, grace, this.now::get, health, false);
+                URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http",
+                null), ByteBudget.shared(), null, admission);
+        var b = new EndpointBalancer(src, pools, retry, o, grace, this.now::get, admission, health, false);
         this.balancers.add(b);
         return b;
     }
@@ -565,6 +577,198 @@ class EndpointBalancerTest {
         assertThrows(IllegalArgumentException.class,
                 () -> healthy.poolOf(ep(0, 1).authority()).proxy.probe("GET", null, Duration.ofSeconds(1)));
         assertEquals(200, healthy.poolOf(ep(0, 1).authority()).proxy.probe("HEAD", "/", Duration.ofSeconds(1)));
+    }
+
+    @Test
+    void maxPendingIsSharedAcrossTheEndpointSet() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var hits = new AtomicInteger();
+        // replace the first server with a holding handler
+        this.servers.get(0).stop(0);
+        var hold = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        hold.setExecutor(java.util.concurrent.Executors.newCachedThreadPool(r -> {
+            var th = new Thread(r);
+            th.setDaemon(true);
+            return th;
+        }));
+        hold.createContext("/", ex -> {
+            hits.incrementAndGet();
+            entered.countDown();
+            try {
+                if (!release.await(8, TimeUnit.SECONDS)) {
+                    throw new RuntimeException("release timed out");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            var body = "a".getBytes(StandardCharsets.UTF_8);
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        hold.start();
+        this.servers.set(0, hold);
+        var admission = Admission.of(1, 0);
+        var src = new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1), ep(1, 1)));
+        var b = balancer(src, null, null, Duration.ofSeconds(10), admission);
+        var held = new java.util.concurrent.CompletableFuture<sjws_nettask.core.Response>();
+        try {
+            Thread.ofPlatform().start(() -> held.complete(b.handle(new Request("GET", "/"))));
+            assertTrue(entered.await(8, TimeUnit.SECONDS));
+            var refused = b.handle(new Request("GET", "/"));
+            assertEquals(503, refused.status());
+            assertEquals("1", refused.headers().get("retry-after"));
+            assertTrue(ProxyHandler.isLocalRefusal(refused));
+            assertEquals(1, hits.get()); // second request must not go to the other endpoint
+        } finally {
+            release.countDown();
+        }
+        body(held.get(8, TimeUnit.SECONDS));
+        assertEquals(0, admission.pending());
+        var again = b.handle(new Request("GET", "/"));
+        assertEquals(200, again.status());
+        body(again);
+    }
+
+    @Test
+    void sharedMaxConnectionsRefusesASecondSocketAsALocal503() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var hits = new AtomicInteger();
+        var hold = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        hold.setExecutor(java.util.concurrent.Executors.newCachedThreadPool(r -> {
+            var th = new Thread(r);
+            th.setDaemon(true);
+            return th;
+        }));
+        hold.createContext("/", ex -> {
+            hits.incrementAndGet();
+            entered.countDown();
+            try {
+                if (!release.await(8, TimeUnit.SECONDS)) {
+                    throw new RuntimeException("release timed out");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            var body = "a".getBytes(StandardCharsets.UTF_8);
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        hold.start();
+        this.servers.set(0, hold);
+        var admission = Admission.of(0, 1);
+        var src = new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1), ep(1, 1)));
+        var b = balancer(src, null, null, Duration.ofSeconds(10), admission);
+        var held = new java.util.concurrent.CompletableFuture<sjws_nettask.core.Response>();
+        try {
+            Thread.ofPlatform().start(() -> held.complete(b.handle(new Request("GET", "/"))));
+            assertTrue(entered.await(8, TimeUnit.SECONDS));
+            var refused = b.handle(new Request("GET", "/"));
+            assertEquals(503, refused.status());
+            assertEquals("1", refused.headers().get("retry-after"));
+            assertTrue(ProxyHandler.isLocalRefusal(refused));
+            assertEquals(1, hits.get());
+        } finally {
+            release.countDown();
+        }
+        body(held.get(8, TimeUnit.SECONDS));
+        var again = b.handle(new Request("GET", "/"));
+        assertEquals(200, again.status());
+        body(again);
+    }
+
+    /**
+     * Codex P2 on #475: when a probe is refused by the proxy's own max_connections
+     * cap, the refusal never reached the upstream and must count as neither a
+     * health success nor a failure. Otherwise a healthy endpoint can be ejected,
+     * or an ejected endpoint's half-open reservation can stick, solely because
+     * the proxy is at its own cap.
+     */
+    @Test
+    void connectionLimitProbesDoNotCountAsHealthFailures() throws Exception {
+        var admission = Admission.of(0, 1);
+        var stolen = admission.tryConnection();
+        assertNotNull(stolen);
+        try {
+            var o = new EndpointBalancer.Outlier(3, 100, 1_000_000, Duration.ofSeconds(10),
+                    Duration.ofSeconds(1), 100);
+            var src = new StaticUpstreamSource(set(1, null, ep(0, 1)));
+            var b = balancerWith(src, null, o, Duration.ZERO, admission, testHealth());
+            var pool = b.poolOf(ep(0, 1).authority());
+            int hitsBefore = this.hits[0].get();
+            this.now.addAndGet(20_000_000_000L);
+            b.probeTick(); // first tick only staggers the first in-rotation probe
+            this.now.addAndGet(20_000_000_000L);
+            int sent = b.probesSent();
+            for (int i = 0; i < 5; i++) {
+                b.probeTick();
+                this.now.addAndGet(20_000_000_000L);
+            }
+            assertTrue(b.probesSent() >= sent + 3, "probes must have been attempted at the cap");
+            assertEquals(hitsBefore, this.hits[0].get(), "a cap refusal must not contact the upstream");
+            assertFalse(pool.health.ejected(), "local connection-limit refusals must not eject a healthy endpoint");
+            assertEquals(0, b.ejectedCount());
+
+            // Eject with real upstream probe failures (probes close their socket), then a
+            // cap-refused half-open probe must release the reservation so a later probe
+            // can recover.
+            stolen.release();
+            stolen = null;
+            this.failing.add("a");
+            int sentFail = b.probesSent();
+            int hitsBeforeFail = this.hits[0].get();
+            // Close is async; wait for the slot or the next probe is a local cap refusal.
+            for (int i = 0; i < 3; i++) {
+                this.now.addAndGet(20_000_000_000L);
+                b.probeTick();
+                for (int j = 0; j < 50 && admission.connections() > 0; j++) {
+                    Thread.sleep(20);
+                }
+                assertEquals(0, admission.connections(), "failed probe must have released its socket");
+            }
+            assertTrue(b.probesSent() >= sentFail + 3);
+            assertEquals(hitsBeforeFail + 3, this.hits[0].get(), "ejecting probes must have reached the upstream");
+            assertTrue(pool.health.ejected(), "real upstream probe failures must still eject");
+            for (int i = 0; i < 50 && admission.connections() > 0; i++) {
+                Thread.sleep(20);
+            }
+            assertEquals(0, admission.connections());
+            stolen = admission.tryConnection();
+            assertNotNull(stolen);
+            this.now.addAndGet(1_100_000_000L);
+            int hitsBeforeHalfOpen = this.hits[0].get();
+            int sentHalfOpen = b.probesSent();
+            b.probeTick();
+            assertTrue(b.probesSent() > sentHalfOpen);
+            assertEquals(hitsBeforeHalfOpen, this.hits[0].get(), "half-open cap refusal must not contact the upstream");
+            assertTrue(pool.health.ejected(), "local cap refusal must not count as success");
+            stolen.release();
+            stolen = null;
+            this.failing.clear();
+            this.now.addAndGet(1_100_000_000L);
+            b.probeTick();
+            assertFalse(pool.health.ejected(),
+                    "endpoint must recover after the cap refusal released the half-open slot");
+            assertEquals(0, b.ejectedCount());
+        } finally {
+            if (stolen != null) {
+                stolen.release();
+            }
+        }
+    }
+
+    @Test
+    void publicConstructorHasNoAdmission() {
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http",
+                null));
+        var b = new EndpointBalancer(new StaticUpstreamSource(set(1, null, ep(0, 1))), pools, null, null);
+        this.balancers.add(b);
+        assertNull(b.admission());
+        assertEquals("a", body(b.handle(new Request("GET", "/"))));
     }
 
 }
