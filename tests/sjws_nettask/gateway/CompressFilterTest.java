@@ -341,6 +341,56 @@ class CompressFilterTest {
     }
 
     @Test
+    void honorsRequestNoTransformBeforeCompressingOrSynthesizing304() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
+        var plain = "hello gzip ".repeat(40);
+        var body = Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8));
+        java.util.function.Function<Request, Response> inner = (r) -> new Response(200,
+                ResponseHeaders.of().add("content-type", "text/plain").add("etag", "\"abc\""), body);
+        var request = new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "cache-control", List.of("No-Transform"))));
+        var response = call(filter, request, inner);
+        assertNull(response.headers().get("content-encoding"));
+        assertTrue(response.body() == body, "request no-transform must leave the body alone");
+        assertEquals(200, response.status());
+        // Mixed with other directives, and a wildcard validator must not become a gzip 304.
+        var conditional = new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "cache-control", List.of("max-age=0", "no-transform, private"),
+                "if-none-match", List.of("*"))));
+        var notModified = call(filter, conditional, inner);
+        assertEquals(200, notModified.status());
+        assertNull(notModified.headers().get("content-encoding"));
+        assertTrue(notModified.body() == body);
+    }
+
+    @Test
+    void distinguishesGzipValidatorWhenUpstreamTagAlreadyEndsWithGzip() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
+        var plain = "hello gzip ".repeat(40);
+        java.util.function.Function<Request, Response> inner = (r) -> new Response(200,
+                ResponseHeaders.of().add("content-type", "text/plain").add("etag", "\"revision-gzip\""),
+                Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8)));
+        var compressed = call(filter, request("gzip"), inner);
+        assertEquals("gzip", compressed.headers().get("content-encoding"));
+        assertEquals("\"revision-gzip-gzip\"", compressed.headers().get("etag"));
+        assertEquals("\"revision-gzip-gzip\"", CompressFilter.withCoding("\"revision-gzip\"", "gzip"));
+        assertEquals("W/\"revision-gzip-gzip\"", CompressFilter.withCoding("W/\"revision-gzip\"", "gzip"));
+        var hit = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-none-match", List.of("\"revision-gzip-gzip\"")))), inner);
+        assertEquals(304, hit.status());
+        assertEquals("\"revision-gzip-gzip\"", hit.headers().get("etag"));
+        var miss = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-none-match", List.of("\"revision-gzip\"")))), inner);
+        assertEquals(200, miss.status());
+        assertEquals("gzip", miss.headers().get("content-encoding"));
+        assertEquals("\"revision-gzip-gzip\"", miss.headers().get("etag"));
+    }
+
+    @Test
     void factoryIsInstalled() throws Exception {
         var filters = GatewayFilters.install(RequestFilters.create())
                 .add(GatewayTestSupport.spec("compress", Map.of()));

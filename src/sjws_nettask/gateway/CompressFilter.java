@@ -29,6 +29,7 @@ import sjws_nettask.core.EntityTag;
 import sjws_nettask.core.MiddlewareSpec;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestFilter;
+import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.SafeOpen;
@@ -89,7 +90,10 @@ public final class CompressFilter implements RequestFilter {
     @Override
     public Response filter(Request request, Chain next) {
         var response = next.proceed(request);
-        boolean gzip = chooseGzip(request.headers().acceptEncoding());
+        // Request-side no-transform also forbids an intermediary from changing the
+        // representation, including a gzip-specific 304.
+        boolean gzip = chooseGzip(request.headers().acceptEncoding())
+                && !hasCacheDirective(request.headers(), "no-transform");
         if (gzip && compressible(response)) {
             if (compressedValidatorHits(request, response)) {
                 return notModifiedGzip(response);
@@ -205,9 +209,9 @@ public final class CompressFilter implements RequestFilter {
             return null;
         }
         var value = rest.substring(1, rest.length() - 1);
-        if (value.endsWith("-" + coding)) {
-            return t;
-        }
+        // Eligibility already skips responses this filter has gzipped. An upstream tag
+        // that happens to end in -gzip is still the identity validator and must not be
+        // reused as the strong tag of the compressed representation.
         return (weak ? "W/" : "") + "\"" + value + "-" + coding + "\"";
     }
 
@@ -249,25 +253,38 @@ public final class CompressFilter implements RequestFilter {
                 response.localAdmission());
     }
 
+    /** True if any request Cache-Control field carries {@code directive} (RFC 9111). */
+    static boolean hasCacheDirective(RequestHeaders headers, String directive) {
+        for (var raw : headers.values("cache-control")) {
+            if (cacheControlHas(raw, directive)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** True if any Cache-Control field carries {@code directive} (RFC 9111, case-insensitive). */
     static boolean hasCacheDirective(ResponseHeaders headers, String directive) {
         for (var entry : headers.entries()) {
-            if (!"cache-control".equals(entry.getKey())) {
-                continue;
+            if ("cache-control".equals(entry.getKey()) && cacheControlHas(entry.getValue(), directive)) {
+                return true;
             }
-            var raw = entry.getValue();
-            if (raw == null || raw.isBlank()) {
-                continue;
+        }
+        return false;
+    }
+
+    static boolean cacheControlHas(String raw, String directive) {
+        if (raw == null || raw.isBlank()) {
+            return false;
+        }
+        for (var part : raw.split(",")) {
+            var token = part.trim();
+            int eq = token.indexOf('=');
+            if (eq >= 0) {
+                token = token.substring(0, eq).trim();
             }
-            for (var part : raw.split(",")) {
-                var token = part.trim();
-                int eq = token.indexOf('=');
-                if (eq >= 0) {
-                    token = token.substring(0, eq).trim();
-                }
-                if (directive.equalsIgnoreCase(token)) {
-                    return true;
-                }
+            if (directive.equalsIgnoreCase(token)) {
+                return true;
             }
         }
         return false;
