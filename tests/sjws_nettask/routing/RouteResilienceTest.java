@@ -26,10 +26,15 @@ import java.time.Duration;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import sjws_nettask.core.Body;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.StaticFileHandler;
@@ -362,6 +367,124 @@ class RouteResilienceTest {
             a.close();
             b.close();
             ok.stop(0);
+        }
+    }
+
+    @Test
+    void oneShotTakesAndReleasesASharedPendingSlot() {
+        var admission = Admission.of(1, 0);
+        var ep = Endpoint.of("127.0.0.1", this.upstream.getAddress().getPort());
+        var src = new StaticUpstreamSource(new UpstreamSet("api", 1, new Endpoint[] {ep}, LbPolicy.ROUND_ROBIN));
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofSeconds(1), Duration.ofSeconds(2), 1024, "http",
+                null), ByteBudget.shared(), null, admission);
+        var balancer = new EndpointBalancer(src, pools, null, null, admission);
+        try {
+            var wrap = new RouteResilience(balancer, new Resilience(retry503(1), null));
+            var ok = wrap.handle(new Request("GET", "/"));
+            assertEquals(200, ok.status());
+            Body.discard(ok.body());
+            assertEquals(0, admission.pending());
+            var stolen = admission.tryPending();
+            assertNotNull(stolen);
+            var refused = wrap.handle(new Request("GET", "/"));
+            assertEquals(503, refused.status());
+            assertTrue(ProxyHandler.isLocalRefusal(refused));
+            assertEquals("1", refused.headers().get("retry-after"));
+            stolen.release();
+            var again = wrap.handle(new Request("GET", "/"));
+            assertEquals(200, again.status());
+            Body.discard(again.body());
+            assertEquals(0, admission.pending());
+        } finally {
+            balancer.close();
+        }
+    }
+
+    @Test
+    void routeConnectRetryRethrowsUnderAPendingCapAndDoesNotLeakTheSlot() throws Exception {
+        URI dead;
+        try (var s = new ServerSocket(0)) {
+            dead = URI.create("http://127.0.0.1:" + s.getLocalPort());
+        }
+        var admission = Admission.of(1, 0);
+        var deadEp = new Endpoint("dead", "127.0.0.1", dead.getPort(), 1_000_000, Map.of(),
+                Endpoint.Health.READY, null);
+        var liveEp = new Endpoint("live", "127.0.0.1", this.upstream.getAddress().getPort(), 1, Map.of(),
+                Endpoint.Health.READY, null);
+        var src = new StaticUpstreamSource(new UpstreamSet("api", 1, new Endpoint[] {deadEp, liveEp},
+                LbPolicy.WEIGHTED_RANDOM));
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofMillis(150), Duration.ofSeconds(1), 1024, "http",
+                null), ByteBudget.shared(), null, admission);
+        var balancer = new EndpointBalancer(src, pools, null, new EndpointBalancer.Outlier(100, 100, 1_000_000,
+                Duration.ofSeconds(10), Duration.ofSeconds(30), 100), admission);
+        try {
+            var wrap = new RouteResilience(balancer,
+                    new Resilience(new Resilience.Retry(1, EnumSet.of(On.CONNECT), 100), null));
+            var recovered = wrap.handle(new Request("GET", "/"));
+            assertEquals(200, recovered.status());
+            Body.discard(recovered.body());
+            assertEquals(1, this.hits.get());
+            assertEquals(0, admission.pending());
+        } finally {
+            balancer.close();
+        }
+    }
+
+    @Test
+    void interruptingOneShotOrHandleReleasesThePendingSlot() throws Exception {
+        var admission = Admission.of(1, 0);
+        var ep = new Endpoint("blackhole", "192.0.2.1", 9, 1, Map.of(), Endpoint.Health.READY, null);
+        var src = new StaticUpstreamSource(new UpstreamSet("api", 1, new Endpoint[] {ep}, LbPolicy.ROUND_ROBIN));
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofSeconds(5), Duration.ofSeconds(5), 1024, "http",
+                null), ByteBudget.shared(), null, admission);
+        var balancer = new EndpointBalancer(src, pools, null, null, admission);
+        try {
+            var interrupted = new AtomicBoolean();
+            var error = new AtomicReference<Throwable>();
+            var started = new CountDownLatch(1);
+            Thread one = Thread.ofPlatform().start(() -> {
+                started.countDown();
+                try {
+                    balancer.oneShot(new Request("GET", "/"));
+                } catch (InterruptedException e) {
+                    interrupted.set(true);
+                } catch (Throwable e) {
+                    error.set(e);
+                }
+            });
+            assertTrue(started.await(2, TimeUnit.SECONDS));
+            Thread.sleep(200);
+            one.interrupt();
+            one.join(3000);
+            assertTrue(interrupted.get(), "oneShot must rethrow the interrupt, not swallow it: " + error.get());
+            assertNull(error.get());
+            assertEquals(0, admission.pending());
+
+            var returned502 = new AtomicBoolean();
+            var handleErr = new AtomicReference<Throwable>();
+            var handleStarted = new CountDownLatch(1);
+            Thread handle = Thread.ofPlatform().start(() -> {
+                handleStarted.countDown();
+                try {
+                    var r = balancer.handle(new Request("GET", "/"));
+                    returned502.set(r.status() == 502);
+                } catch (Throwable e) {
+                    handleErr.set(e);
+                }
+            });
+            assertTrue(handleStarted.await(2, TimeUnit.SECONDS));
+            Thread.sleep(200);
+            handle.interrupt();
+            handle.join(3000);
+            assertTrue(returned502.get(),
+                    "handle must return 502 on interrupt, not leak: " + handleErr.get());
+            assertNull(handleErr.get());
+            assertEquals(0, admission.pending());
+        } finally {
+            balancer.close();
         }
     }
 }
