@@ -273,4 +273,95 @@ class RouteResilienceTest {
         assertEquals(503, wrap.handle(new Request("GET", "/")).status());
         assertEquals(2, this.hits.get(), "open circuit must not contact the upstream");
     }
+
+    private HttpServer okServer(AtomicInteger okHits) throws Exception {
+        var ok = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        ok.createContext("/", ex -> {
+            okHits.incrementAndGet();
+            var body = "ok".getBytes();
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        ok.start();
+        return ok;
+    }
+
+    @Test
+    void weightedRouteRetryPrefersAnUntriedBackend() throws Exception {
+        this.failFirst = Integer.MAX_VALUE; // this.upstream always answers 503
+        var okHits = new AtomicInteger();
+        var ok = okServer(okHits);
+        var healthy = new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://127.0.0.1:" + ok.getAddress().getPort()), Duration.ofSeconds(1),
+                Duration.ofSeconds(2), 1024, "http", null), ByteBudget.shared(), null);
+        try {
+            var weighted = new WeightedHandler(List.of(
+                    new WeightedHandler.Backend(this.proxy, 99, null),
+                    new WeightedHandler.Backend(healthy, 1, null)), null);
+            var wrap = new RouteResilience(weighted, new Resilience(retry503(1), null));
+            for (int i = 0; i < 50; i++) {
+                assertEquals(200, wrap.handle(new Request("GET", "/")).status(),
+                        "the retry must go to the untried healthy backend, try " + i);
+            }
+            assertEquals(50, okHits.get());
+            assertTrue(this.hits.get() <= 50, "the failing backend is tried at most once per request");
+
+            // A pin keeps its backend on retries.
+            var pinned = new WeightedHandler(List.of(
+                    new WeightedHandler.Backend(this.proxy, 0, new WeightedHandler.Match(false, "x-canary", null)),
+                    new WeightedHandler.Backend(healthy, 1, null)), null);
+            var pinWrap = new RouteResilience(pinned, new Resilience(retry503(1), null));
+            int before = this.hits.get();
+            int okBefore = okHits.get();
+            var canary = new Request("GET", "/",
+                    sjws_nettask.core.RequestHeaders.of(Map.of("x-canary", List.of("1"))), null, false);
+            assertEquals(503, pinWrap.handle(canary).status());
+            assertEquals(2, this.hits.get() - before, "a pinned request retries on its pinned backend");
+            assertEquals(okBefore, okHits.get());
+        } finally {
+            healthy.close();
+            ok.stop(0);
+        }
+    }
+
+    @Test
+    void weightedRouteRetryScopesEndpointHistoryToEachBalancer() throws Exception {
+        int deadPort;
+        try (var s = new ServerSocket(0)) {
+            deadPort = s.getLocalPort();
+        }
+        var okHits = new AtomicInteger();
+        var ok = okServer(okHits);
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofMillis(150), Duration.ofSeconds(1), 1024, "http",
+                null), ByteBudget.shared(), null);
+        var outlier = new EndpointBalancer.Outlier(100, 100, 1_000_000, Duration.ofSeconds(10),
+                Duration.ofSeconds(30), 100);
+        // A: one dead endpoint (index 0). B: index 0 is live and preferred, index 1 is dead.
+        var a = new EndpointBalancer(new StaticUpstreamSource(new UpstreamSet("a", 1, new Endpoint[] {
+                new Endpoint("a-dead", "127.0.0.1", deadPort, 1, Map.of(), Endpoint.Health.READY, null)},
+                LbPolicy.WEIGHTED_RANDOM)), pools, null, outlier);
+        var b = new EndpointBalancer(new StaticUpstreamSource(new UpstreamSet("b", 1, new Endpoint[] {
+                new Endpoint("b-live", "127.0.0.1", ok.getAddress().getPort(), 1_000_000, Map.of(),
+                        Endpoint.Health.READY, null),
+                new Endpoint("b-dead", "127.0.0.1", deadPort, 1, Map.of(), Endpoint.Health.READY, null)},
+                LbPolicy.WEIGHTED_RANDOM)), pools, null, outlier);
+        try {
+            var weighted = new WeightedHandler(List.of(
+                    new WeightedHandler.Backend(a, 1_000_000, null),
+                    new WeightedHandler.Backend(b, 1, null)), null);
+            var wrap = new RouteResilience(weighted,
+                    new Resilience(new Resilience.Retry(1, EnumSet.of(On.CONNECT), 100), null));
+            for (int i = 0; i < 10; i++) {
+                assertEquals(200, wrap.handle(new Request("GET", "/")).status(),
+                        "B's endpoint 0 was never tried and must not be excluded, try " + i);
+            }
+            assertEquals(10, okHits.get());
+        } finally {
+            a.close();
+            b.close();
+            ok.stop(0);
+        }
+    }
 }

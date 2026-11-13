@@ -78,6 +78,7 @@ public final class WeightedHandler implements Handler {
     private final Match[] pins; // null when no backend is pinned
     private final Match sticky;
     private final AliasTable table;
+    private final long[] weights;
 
     public WeightedHandler(List<Backend> backends, Match sticky) {
         if (backends.isEmpty()) {
@@ -98,6 +99,7 @@ public final class WeightedHandler implements Handler {
         this.pins = anyPin ? pins : null;
         this.sticky = sticky;
         this.table = new AliasTable(weights);
+        this.weights = weights;
     }
 
     @Override
@@ -110,22 +112,73 @@ public final class WeightedHandler implements Handler {
      * {@link RouteResilience} wrapper can apply a per-route policy without nesting.
      */
     Response oneShot(Request request) throws IOException, InterruptedException {
-        return oneShot(request, null, null);
+        return oneShot(request, null);
     }
 
-    Response oneShot(Request request, int[] tried, int[] nTried) throws IOException, InterruptedException {
-        var handler = this.handlers[select(request.headers())];
+    /**
+     * Per-request history of route-level retries: which backends were tried, and for each
+     * {@link EndpointBalancer} backend its own tried-endpoint indices (indices are private to one
+     * balancer's view, so they are never shared across backends).
+     */
+    final class Attempts {
+        private final int cap;
+        private final boolean[] backends = new boolean[WeightedHandler.this.handlers.length];
+        private final int[][] endpoints = new int[WeightedHandler.this.handlers.length][];
+        private final int[][] counts = new int[WeightedHandler.this.handlers.length][];
+
+        private Attempts(int cap) {
+            this.cap = Math.max(1, cap);
+        }
+
+        boolean tried(int backend) {
+            return this.backends[backend];
+        }
+    }
+
+    /** @param cap the most attempts one request can make (route retries + 1) */
+    Attempts attempts(int cap) {
+        return new Attempts(cap);
+    }
+
+    /**
+     * One try that, on a route retry, prefers a backend not tried yet (pins and sticky keep their
+     * backend) and keeps endpoint history per balancer.
+     *
+     * @param state null for a single try without history
+     */
+    Response oneShot(Request request, Attempts state) throws IOException, InterruptedException {
+        int i = state == null ? select(request.headers()) : select(request.headers(), state.backends);
+        var handler = this.handlers[i];
+        if (state != null) {
+            state.backends[i] = true;
+        }
         if (handler instanceof ProxyHandler proxy) {
             return proxy.attempt(request);
         }
         if (handler instanceof EndpointBalancer balancer) {
-            return balancer.oneShot(request, tried, nTried);
+            if (state == null) {
+                return balancer.oneShot(request);
+            }
+            if (state.endpoints[i] == null) {
+                state.endpoints[i] = new int[state.cap];
+                state.counts[i] = new int[1];
+            }
+            return balancer.oneShot(request, state.endpoints[i], state.counts[i]);
         }
         return handler.handle(request);
     }
 
     /** Index of the backend for these headers. Package-private for the distribution tests. */
     int select(RequestHeaders headers) {
+        return select(headers, null);
+    }
+
+    /**
+     * Like {@link #select(RequestHeaders)}, but a random (non-pinned, non-sticky) pick that lands
+     * on a backend in {@code tried} is redrawn by weight among the untried weighted backends.
+     * Falls back to the original pick when every weighted backend has been tried.
+     */
+    int select(RequestHeaders headers, boolean[] tried) {
         if (this.pins != null) {
             for (int i = 0; i < this.pins.length; i++) {
                 var pin = this.pins[i];
@@ -140,7 +193,30 @@ public final class WeightedHandler implements Handler {
                 return pick(mix(key.hashCode() * 0x9E3779B97F4A7C15L ^ key.length()));
             }
         }
-        return pick(ThreadLocalRandom.current().nextLong());
+        var random = ThreadLocalRandom.current();
+        int i = pick(random.nextLong());
+        if (tried == null || !tried[i]) {
+            return i;
+        }
+        long total = 0;
+        for (int j = 0; j < this.weights.length; j++) {
+            if (!tried[j]) {
+                total += this.weights[j];
+            }
+        }
+        if (total <= 0) {
+            return i;
+        }
+        long r = random.nextLong(total);
+        for (int j = 0; j < this.weights.length; j++) {
+            if (!tried[j]) {
+                r -= this.weights[j];
+                if (r < 0) {
+                    return j;
+                }
+            }
+        }
+        return i;
     }
 
     int pick(long bits) {
