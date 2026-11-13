@@ -1,8 +1,11 @@
 name: Release
 
-# Push a tag `vX.Y.Z` (or `vX.Y.Z-rc.N`) to build, verify and publish a GitHub Release.
-# workflow_dispatch is dry-run only: build + package on ubuntu-latest, never create a release.
-# See docs/operations/releasing.md and #413.
+# Push a tag `vX.Y.Z` (or `vX.Y.Z-rc.N`) to verify, package Linux/Windows/macOS
+# artifacts (portable jar+lib with all Netty QUIC natives, plus a per-OS jlink
+# runtime), and publish a GitHub Release.
+# workflow_dispatch is dry-run only: the same verify + package matrix, artifacts
+# uploaded, never a GitHub Release and never a v* tag.
+# See docs/operations/releasing.md and #410.
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+*']
@@ -21,28 +24,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  meta:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: write # create the release and upload assets (tag pushes only)
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      dry_run: ${{ steps.v.outputs.dry_run }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0 # full history for generated notes
-      - uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: '25'
-          cache: maven
-      - name: Install Prometheus
-        run: |
-          ver=3.15.0
-          curl -fsSL -o /tmp/prometheus.tar.gz "https://github.com/prometheus/prometheus/releases/download/v${ver}/prometheus-${ver}.linux-amd64.tar.gz"
-          tar -C /tmp -xzf /tmp/prometheus.tar.gz
-          echo "PROMTOOL=/tmp/prometheus-${ver}.linux-amd64/promtool" >> "$GITHUB_ENV"
-          echo "PROMETHEUS=/tmp/prometheus-${ver}.linux-amd64/prometheus" >> "$GITHUB_ENV"
-
       - name: Derive version from tag or dry-run input
         id: v
         env:
@@ -73,68 +63,123 @@ jobs:
           dry_run=$( [ "$EVENT_NAME" = workflow_dispatch ] && echo true || echo false )
           echo "Release mode: event=$EVENT_NAME tag=$tag version=$version dry_run=$dry_run"
 
-      # The pom keeps a -SNAPSHOT version on master; the tag (or dry-run input) decides the version.
+  verify:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: Install Prometheus
+        run: |
+          ver=3.15.0
+          curl -fsSL -o /tmp/prometheus.tar.gz "https://github.com/prometheus/prometheus/releases/download/v${ver}/prometheus-${ver}.linux-amd64.tar.gz"
+          tar -C /tmp -xzf /tmp/prometheus.tar.gz
+          echo "PROMTOOL=/tmp/prometheus-${ver}.linux-amd64/promtool" >> "$GITHUB_ENV"
+          echo "PROMETHEUS=/tmp/prometheus-${ver}.linux-amd64/prometheus" >> "$GITHUB_ENV"
+      - name: Install Pebble
+        run: |
+          ver=2.10.1
+          base="https://github.com/letsencrypt/pebble/releases/download/v${ver}"
+          curl -fsSL -o /tmp/pebble-linux-amd64.tar.gz "${base}/pebble-linux-amd64.tar.gz"
+          curl -fsSL -o /tmp/pebble-challtestsrv-linux-amd64.tar.gz "${base}/pebble-challtestsrv-linux-amd64.tar.gz"
+          echo "4f2fcb5bca8c85c9cf73ad140fccfc0d2be40bd81ab99879c79b7b8a0b4f70ed  /tmp/pebble-linux-amd64.tar.gz" | sha256sum -c -
+          echo "e93a5aa25ecdf3af2f9fbb2de32b0173e64a2eae81002a4ccfe35fa6f4f60b92  /tmp/pebble-challtestsrv-linux-amd64.tar.gz" | sha256sum -c -
+          tar -C /tmp -xzf /tmp/pebble-linux-amd64.tar.gz
+          tar -C /tmp -xzf /tmp/pebble-challtestsrv-linux-amd64.tar.gz
+          chmod +x /tmp/pebble-linux-amd64/linux/amd64/pebble \
+                   /tmp/pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv
+          echo "PEBBLE_BIN=/tmp/pebble-linux-amd64/linux/amd64/pebble" >> "$GITHUB_ENV"
+          echo "PEBBLE_CHALLTESTSRV_BIN=/tmp/pebble-challtestsrv-linux-amd64/linux/amd64/pebble-challtestsrv" >> "$GITHUB_ENV"
       - name: Set project version
         env:
-          VERSION: ${{ steps.v.outputs.version }}
+          VERSION: ${{ needs.meta.outputs.version }}
         run: mvn -B -q versions:set -DnewVersion="$VERSION" -DgenerateBackupPoms=false
-
       - name: Build and verify (tests, jar tests, coverage gate)
         run: mvn -B verify
 
-      - name: Package distribution
-        id: dist
+  package:
+    needs: [meta, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: Set project version
         env:
-          VERSION: ${{ steps.v.outputs.version }}
-          DRY_RUN: ${{ steps.v.outputs.dry_run }}
-        run: |
-          name="sjws_nettask-$VERSION"
-          mkdir -p "dist/$name"
-          cp "target/$name.jar" "dist/$name/"
-          cp -r target/lib "dist/$name/lib"
-          cp LICENSE README.md "dist/$name/"
-          # systemd units, the role sample configs and the same-host drop-in
-          mkdir -p "dist/$name/contrib"
-          cp contrib/*.service contrib/*.yaml contrib/*.conf contrib/sjws "dist/$name/contrib/"
-          (cd dist && tar czf "$name.tar.gz" "$name" && zip -qr "$name.zip" "$name")
-          cp "target/$name.jar" dist/
-          (cd dist && sha256sum "$name.tar.gz" "$name.zip" "$name.jar" > SHA256SUMS)
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          {
-            echo "### Distribution"
-            echo
-            if [ "$DRY_RUN" = true ]; then
-              echo "- mode: dry-run (no GitHub Release)"
-            else
-              echo "- mode: publish"
-            fi
-            echo "- version: \`$VERSION\`"
-            echo "- artifacts: \`$name.tar.gz\`, \`$name.zip\`, \`$name.jar\`, \`SHA256SUMS\`"
-            ls -lh "dist/$name.tar.gz" "dist/$name.zip" "dist/$name.jar" dist/SHA256SUMS
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload dry-run artifacts
-        if: steps.v.outputs.dry_run == 'true'
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: mvn -B -q versions:set -DnewVersion="$VERSION" -DgenerateBackupPoms=false
+      - name: Package (tests already ran on ubuntu-latest)
+        run: mvn -B -DskipTests package
+      - name: Build per-OS distribution and jlink runtime
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: tools/package-release.sh "$VERSION" dist
+      - name: Upload dry-run and release artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: release-dryrun-${{ steps.v.outputs.version }}
-          path: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/*.jar
-            dist/SHA256SUMS
+          name: release-${{ matrix.os }}-${{ needs.meta.outputs.version }}
+          path: dist/*
           if-no-files-found: error
 
+  publish:
+    needs: [meta, verify, package]
+    if: needs.meta.outputs.dry_run != 'true' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-*-${{ needs.meta.outputs.version }}
+          path: dist
+          merge-multiple: true
+      - name: Combine SHA256SUMS
+        run: |
+          set -euo pipefail
+          if ! compgen -G 'dist/SHA256SUMS-*' > /dev/null; then
+            echo "::error::no per-platform SHA256SUMS-* in dist/"
+            ls -la dist || true
+            exit 1
+          fi
+          cat dist/SHA256SUMS-* | awk 'NF && !seen[$0]++' > dist/SHA256SUMS
+          ls -lh dist
+          cat dist/SHA256SUMS
       - name: Publish GitHub Release
-        if: steps.v.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          DIST_NAME: ${{ steps.dist.outputs.name }}
-          TAG: ${{ steps.v.outputs.tag }}
-          PRERELEASE: ${{ steps.v.outputs.prerelease }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
         run: |
-          name="$DIST_NAME"
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/*.zip dist/*.jar dist/SHA256SUMS)
+          if [[ ${#assets[@]} -lt 2 ]]; then
+            echo "::error::no release assets in dist/"
+            exit 1
+          fi
           flags=(--title "sjws_nettask $TAG" --generate-notes --verify-tag)
           if [[ "$PRERELEASE" == true ]]; then flags+=(--prerelease); fi
-          gh release create "$TAG" "${flags[@]}" \
-            "dist/$name.tar.gz" "dist/$name.zip" "dist/$name.jar" dist/SHA256SUMS
+          gh release create "$TAG" "${flags[@]}" "${assets[@]}"

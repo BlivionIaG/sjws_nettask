@@ -33,7 +33,8 @@ that probe, and `--status`. Do not treat `systemctl is-active` as leader-ready o
 `ExecReload=/bin/kill -HUP $MAINPID` on the standalone unit and both role units. The
 daemon child handles `SIGHUP` by `ReloadHook.run()`. It is started in a new session
 (`setsid` when `/usr/bin/setsid` exists), so closing the terminal does not deliver
-`SIGHUP`. A foreground process is not given that handler and still dies on hangup.
+`SIGHUP`. A foreground process is not given that handler and still dies on hangup,
+unless `SJWS_RELOAD_SIGHUP=1` (the [launchd](launchd.md) sample sets it).
 On a data node that has accepted a pushed config, reload refreshes local bootstrap
 settings (listen, peers, labels, contact, pin) and does not replace that config.
 Before any push, reload re-reads the local YAML. `systemctl restart` is still a full
@@ -67,8 +68,8 @@ No flag, no variable, and no config file leaves the role to the bootstrap file.
 (including a file that omits `node`) rejects `--bootstrap`.
 
 A control process does not bind the content port unless `--bind-content` /
-`WEB_SERVER_BIND_CONTENT` or `server.bind_content: true` says so. Data and standalone
-bind it unless that flag or key turns it off. The sample control file sets
+`WEB_SERVER_BIND_CONTENT` or `server.bind_content: true` says so. Standalone binds it unless that flag or key turns it off. A data process binds it
+once a verified last-good has been applied, or earlier when that flag or key forces a bind. The sample control file sets
 `bind_content: false`. The document root in the file must still exist: the process
 builds the content snapshot even when it does not listen. The admin and watch listeners
 come from the `cp:` block (`cp.admin.listen`, `cp.watch.listen`, mTLS from `cp.tls`; see
@@ -84,7 +85,7 @@ flowchart TD
     s2 --> s3["3. Else node.mode, when a<br/>config file was named. A<br/>file without it is<br/>standalone"]
     s3 --> s4["4. Else the role in the<br/>bootstrap file, or<br/>standalone without one"]
     s4 --> s5["5. control or data<br/>without --bootstrap, or<br/>standalone with it: exit<br/>64"]
-    s5 --> s6["6. Content port:<br/>WEB_SERVER_BIND_CONTENT,<br/>then --bind-content, then<br/>server.bind_content, then<br/>the role: off for<br/>control, on for the<br/>others"]
+    s5 --> s6["6. Content port:<br/>WEB_SERVER_BIND_CONTENT,<br/>then --bind-content, then<br/>server.bind_content, then<br/>the role: off for control,<br/>on for standalone, data<br/>after a verified last-good<br/>is applied unless forced"]
 ```
 
 ## Bootstrap
@@ -149,10 +150,14 @@ process starts the watch client. `SjwsServer.drain()` remains the only drain.
 
 ```
 running pid=123 role=data data-role=gateway connection=pending config-version=0
+running pid=123 role=control connection=pending config-version=0 admin=127.0.0.1:9443 admin-state=listening
 ```
 
-The sidecar is `<pid-file>.status`. It is trusted only when `pid` and `start` match the pid
-file, so a recycled pid does not keep the previous node's version. Connection values outside
+The sidecar is `<pid-file>.status`. It is created mode `0600` (owner-only) by writing a
+temporary file with those permissions and renaming it into place. A pre-existing sidecar
+with looser permissions is tightened on the next write. It is trusted only when `pid` and
+`start` match the pid file, so a recycled pid does not keep the previous node's version.
+Connection values outside
 `pending`, `connecting`, `connected`, `disconnected`, `leader`, and `follower` are stored as
 `disconnected` and are not echoed. Standalone `--status` stays `running pid=<n>`.
 
@@ -178,19 +183,36 @@ implemented outside this daemon slice, in `sjws_nettask.cp`.
 3. **systemd active is the process, not `leaderReady()`.** The pid file is written when
    the process is up, including a control process that has not bound a content port.
    There is no `sd_notify`. Readiness is `/readyz` and `--status` (`role`, `connection`,
-   `config-version`). `--status` stays `connection=pending` until something calls
+   `config-version`, and for a control process `admin` / `admin-state` when the admin
+   listener is bound). `--status` stays `connection=pending` until something calls
    `attach`. Do not treat "service started" as "config applied".
 
-4. **Data node, control plane down.** Decided behaviour, implemented by the control-plane
-   and HA workstream: boot from last-good when that
-   snapshot is present; otherwise not-ready (`503` on `/readyz`, content port not bound)
-   and retry with backoff. Past max-staleness, readiness is false and the process keeps
-   serving. There is no automatic drain. For role data this daemon starts the watch client
-   (`cp.DataWatch`, a long poll), which moves `connection` between `pending`, `connected`
-   and `disconnected`. A missing config file on a data
-   node already boots from `<stateDir>/config/last-good.json` when the envelope hash
-   matches and `node.mode` is `data`. A leftover sibling `<file>.last-good` is read
-   once when that JSON file is absent (`LastGoodStore`). `Requires=` stays off the data unit.
+4. **Data node, control plane down.** Boot from a verified signed last-good when
+   that snapshot is present, and install those already-checked bytes as the running
+   configuration before `/readyz` may return 200 or the content port binds.
+   Otherwise not-ready (content port not bound, so `/readyz` is unreachable until
+   the first apply, then `503` if still not ready) and retry with backoff. Past
+   max-staleness, readiness is false and the process keeps serving. There is no
+   automatic drain. Readiness is `NodeLifecycle.dataPlane` against the signed
+   `expiresAtMillis` and an optional `node.max_staleness` ceiling on
+   `issuedAtMillis` (no default ceiling; the operator interval uses a monotonic
+   clock). The data-role content port binds only after that signed last-good has
+   been applied, unless `--bind-content` or `server.bind_content` forces a bind.
+   An explicit `--bind-content=false` still late-binds once a verified last-good
+   is applied. For role data this daemon starts the watch client (`cp.DataWatch`,
+   a long poll), which moves `connection` between `pending`, `connected` and
+   `disconnected`, and late-binds the content port after the first applied
+   snapshot. A missing config file on a data node boots from the same verified
+   last-good when the bootstrap pin is present. With a pin, an unsigned
+   `<stateDir>/config/last-good.json`, a signed one that does not verify, or a
+   leftover sibling `<file>.last-good` stops startup with an error. Without a pin,
+   the unsigned boot form of that file is read when `node.mode` is `data`, and the
+   sibling is read once when that JSON file is absent (`LastGoodStore`). Every
+   recovery file (and, with a pin, the trust, floor and pin files) is opened
+   without following a symlink, must be a regular file owned by root or the
+   service user, not group- or world-writable, under directories that pass the
+   same checks. An unsigned `LastGoodStore` boot file is not a verified last-good
+   for readiness. `Requires=` stays off the data unit.
 
 5. **SIGHUP is reload.** The daemon child installs `ReloadHook`. `ExecReload` is
    `kill -HUP`. A data node reloads local bootstrap settings only after
@@ -210,7 +232,8 @@ implemented outside this daemon slice, in `sjws_nettask.cp`.
    or `server.bind_content: true`. The admin and watch listeners are bound from
    `cp.admin.listen` and `cp.watch.listen`. `listen=` in the bootstrap is stored and not bound. A control
    process with the content port off still writes the pid file, so the unit can be
-   active.
+   active. `--status` reports the bound admin listener as `admin=<host:port>` and
+   `admin-state=listening` (or `not-bound` / `failed`).
 
 8. **Role precedence is CLI, then environment, then `node.mode`.** Logged at startup.
    The schema key is `node.mode`. There is no `node.role` key.

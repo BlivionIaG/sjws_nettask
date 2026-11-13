@@ -57,6 +57,29 @@ public final class NodeLifecycle {
         return true;
     }
 
+    /**
+     * Data role content port: bind when a verified last-good exists, or when the operator
+     * forced a bind ({@code --bind-content} / {@code server.bind_content}). Without last-good
+     * the default is unbound until the first applied snapshot.
+     */
+    public static boolean dataBindsContentPort(boolean operatorForced, boolean hasVerifiedLastGood) {
+        return operatorForced || hasVerifiedLastGood;
+    }
+
+    /**
+     * The signed envelope is stale when the local clock is past {@code expiresAtMillis}, or
+     * past {@code issuedAtMillis + maxStalenessMs} when the operator set a ceiling. No expiry
+     * and no ceiling is not stale. {@code maxStalenessMs} of 0 or less is unset; this method
+     * does not invent a default lifetime.
+     */
+    public static boolean pastMaxStaleness(long nowMillis, long expiresAtMillis, long issuedAtMillis,
+            long maxStalenessMs) {
+        if (expiresAtMillis > 0 && nowMillis > expiresAtMillis) {
+            return true;
+        }
+        return maxStalenessMs > 0 && issuedAtMillis > 0 && nowMillis > issuedAtMillis + maxStalenessMs;
+    }
+
     /** SIGHUP reads the local file. It does not open the watch. */
     public static boolean sighupPullsFromControlPlane() {
         return false;

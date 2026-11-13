@@ -40,6 +40,7 @@ import sjws_nettask.cluster.VoterSet;
 import sjws_nettask.config.ConfigLoader;
 import sjws_nettask.cp.AdminServer;
 import sjws_nettask.cp.CpStore;
+import sjws_nettask.cp.DataPlaneGuard;
 import sjws_nettask.cp.DataWatch;
 import sjws_nettask.cp.DataWatch.Applied;
 import sjws_nettask.cp.JoinTokens;
@@ -155,7 +156,7 @@ final class CpStoreControlPlane implements ControlPlane {
         try {
             server = SjwsServer.start(ConfigLoader.load(new String[] {"--config=" + yaml}, Map.of()));
             watch = DataWatch.open("127.0.0.1:" + relay.port(), id, tokenId, SECRET.getBytes(StandardCharsets.UTF_8),
-                    pin, home.resolve("state"), server, null, System::currentTimeMillis);
+                    pin, home.resolve("state"), server, null, DataPlaneGuard.WALL_CLOCK);
             var joined = new Joined(id, labels, server, watch, relay);
             long end = System.nanoTime() + Duration.ofSeconds(10).toNanos();
             while (watch.binding() == null || !"connected".equals(watch.binding().connectionState())) {

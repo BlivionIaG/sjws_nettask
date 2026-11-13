@@ -383,4 +383,57 @@ These build on the control-plane review on PR #38 (`UpstreamSet` snapshots swapp
 | **Weighted / canary routes** (implemented in B.2: `backends` with `pin` for the match and route-level `sticky`; retry/circuit stay per upstream) | `route.backends: [{upstream, weight}]`, plus optional `match: {header, cookie}` to pin canaries. Selection uses a precomputed alias table (O(1), no allocation); the sticky choice uses a hash of a header or cookie. Weights are part of the compiled snapshot, so a change is a config version. | Shipping the weights as config. A staged rollout (§9 of #38) can push weight steps as versions. | A per-route filter list (open question 1) to run the canary-only filters. |
 | **Retries** (implemented in B.1, per upstream: see `docs/user/config-file.md`) | Per-route `retry: {attempts, on: [connect, 502, 503, reset], budget: 10%}`. Only idempotent methods, or bodyless requests, are retried, and only before any response byte has been relayed. The next attempt picks a different endpoint. A token-bucket retry budget per upstream prevents storms. Phase 2 already retries stale keep-alive connections. | Nothing beyond the endpoint sets. | A way for filters to see the attempt count (a request attribute), so that logging and metrics are per try. |
 | **Circuit breaking** (B.1: consecutive failures per upstream; B.4: per endpoint with error-rate window and panic mode on multi-endpoint upstreams; `max_pending` is not done) | Per endpoint, a lock-free consecutive-failure / error-rate window (an `AtomicLong` packed state). States are closed, open (eject for `eject_for` with exponential backoff), and half-open (one probe). Ejected endpoints are skipped by load balancing. If more than `max_ejection` would be ejected, fall back to "panic" (use all). A per-upstream `max_pending` / `max_connections` limit gives 503 quickly. | Coarse health only (SUSPECT/DEAD). Local outlier state stays local and is never pushed back. | Nothing. Optionally an observer hook for state changes. |
-| **Rate limits** (implemented in B.3: `routing.RateLimitFilter`, GCRA in a fixed `AtomicLongArray`, per route through `RequestFilters.wrapping` plus `routing.rate_limit`; local only) | A filter, not a router feature: `RateLimitFilter{key: peer|header|route, rate, burst}`. It uses a sharded token bucket (striped `AtomicLong`s keyed by a hash, with a fixed table size, so there is no `computeIfAbsent` growth) and answers 429 with `Retry-After`. Local limits only in v1. A global limit would split the quota per node, with the share received from the CP (rate / ready gateway count). | v2 only: the per-node quota share, recomputed when gateway membership changes. | The chain's ordering (run before auth/proxy), per-route attachment, and a short-circuit response API, which `RequestFilters` already has. |
+| **Rate limits** (implemented in B.3: `routing.RateLimitFilter`, GCRA in a fixed `AtomicLongArray`, per route through `RequestFilters.wrapping` plus `routing.rate_limit`; local only. v2 cluster share is design-only until the CP/HA share API exists — see below) | A filter, not a router feature: `RateLimitFilter{key: peer|header|route, rate, burst}`. It uses a sharded token bucket (striped `AtomicLong`s keyed by a hash, with a fixed table size, so there is no `computeIfAbsent` growth) and answers 429 with `Retry-After`. Local limits only unless a CP share is applied. A global (v2) limit splits the configured rate and burst per ready gateway; the data plane applies a share it is given, it does not compute membership or gossip. | v2 only: a per-node quota-share snapshot for each named global limit, recomputed when ready-gateway membership changes. The wire type is owned by CP/HA; routing does not invent one. | The chain's ordering (run before auth/proxy), per-route attachment, and a short-circuit response API, which `RequestFilters` already has. The gateway `Quota` / `Quota.Factory` seam is the hook (`GatewayFilters.install`). |
+
+### Rate-limit v2: cluster quota share (design only)
+
+Local GCRA is done and remains the default. A cluster-wide (v2) limit is a **global** rate that
+is split across ready gateways: `share = configured_rate / ready_gateway_count` (and the same
+integer split for `burst`). Remainders from integer division are assigned by a stable hash of
+the node id so the shares sum to the configured totals. The share is recomputed when
+ready-gateway membership changes. **This is not implemented.** Implementation is blocked on a
+CP/HA API that publishes the share; the data plane must not invent gossip in `routing`.
+
+**Burst when there are more ready gateways than the configured burst.** The shares must sum to
+the configured burst. The earlier "at least 1 per node" floor is rejected here: with burst 1 and
+two ready gateways it would admit two requests at once and exceed the global burst. Some nodes
+therefore receive a burst share of 0. A zero-burst share means that node never admits a new
+request for that key. Today's `GcraTable` constructor rejects `burst < 1`, so the
+implementation must either accept a zero burst (treat it as "admit nothing") or apply a
+zero-admission share without constructing a GCRA table that forbids it. Rate shares may also
+be 0 when the ready count exceeds the configured rate; the same "admit nothing" rule applies.
+
+**Owners.** HA owns ready-gateway membership. The control plane owns computing the per-node
+share from that set and publishing it. The HTTP data plane (`routing.RateLimitFilter` /
+`GcraTable`, and the gateway `Quota` used by `gateway.RateLimitFilter`) only applies a share it
+is given. `docs/ha/discovery.md` is the membership interface (`UpstreamSet` is a different
+object: that snapshot is the *upstream* set, not the gateway set used for a quota split).
+
+**Hook.** The request path already calls `Quota.tryAcquire` / `tryAcquireAddress` and must stay
+non-blocking and free of I/O. `GatewayFilters.install(registry, factory)` is the seam: a later
+factory can install a share-aware `Quota` that resizes the existing GCRA refill from a share
+updated on another thread. Routing `rate_limit` should use the same applied-share rule once the
+API exists. When v2 is unset, the factory stays the local striped table — zero cost, identical
+to today.
+
+**Failure modes (chosen).** The alternative — falling back to the full local configured rate when
+a share is missing — is rejected: if every node did that, the cluster would admit up to *N* times
+the global budget.
+
+1. **v2 unset** (the default): local full rate, same as today.
+2. **Share applied at least once, later missing or stale** (CP unreachable, delayed snapshot):
+   **keep the last share.** The last value may be briefly too strict (a peer left, the share has
+   not yet been raised) or briefly too loose (a peer joined, the old share has not yet been
+   lowered). Both are preferred to a sudden opening of the full local rate.
+3. **v2 enabled on this node, but no share has ever arrived:** **fail closed** for that named
+   global key (429 with `Retry-After`). A joining node must not admit the full global rate alone
+   while it waits for the first snapshot.
+4. **Optional TTL.** If the CP snapshot carries a `valid_until` or generation bound, keep the
+   last share until that bound, then fail closed — do not open the full local rate. If the
+   snapshot has no TTL, keep the last share until a new snapshot arrives or v2 is unset.
+5. **Ready count is 0, or this node is not in the ready set:** fail closed.
+
+**When the CP API exists, acceptance is:** a two-node test (or fakes) where a membership change
+updates shares and the aggregate admit rate tracks the configured global rate within tolerance;
+feature off is identical to master (wrk with v2 off must stay in the master band); the failure
+modes above are tested.

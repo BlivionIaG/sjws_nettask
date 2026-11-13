@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd unit for sjws_nettask (foreground; launchd owns the process).
+  Do not pass the daemon flag here: that forks a child and exits, which
+  launchd treats as a crash.
+
+  Adjust ProgramArguments paths, the document root, and the port. Copy the jar
+  and its target/lib/ directory together (the manifest Class-Path is lib/).
+  Optionally set UserName.
+
+  Install (system-wide example):
+    sudo install -d -m 0755 /usr/local/sjws_nettask /usr/local/var/www /usr/local/var/log
+    sudo install -m 0644 contrib/launchd/sjws_nettask.plist /Library/LaunchDaemons/sjws_nettask.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/sjws_nettask.plist
+    sudo launchctl enable system/sjws_nettask
+    sudo launchctl kickstart -k system/sjws_nettask
+
+  Reload (SIGHUP, same as systemd ExecReload). This plist sets
+  SJWS_RELOAD_SIGHUP=1 so the foreground process treats hangup as reload:
+    sudo launchctl kill HUP system/sjws_nettask
+
+  Stop:
+    sudo launchctl bootout system /Library/LaunchDaemons/sjws_nettask.plist
+
+  See docs/operations/launchd.md.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>sjws_nettask</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/java</string>
+    <string>--add-opens=jdk.httpserver/sun.net.httpserver=ALL-UNNAMED</string>
+    <string>-jar</string>
+    <string>/usr/local/sjws_nettask/sjws_nettask.jar</string>
+    <string>--config=/usr/local/etc/sjws_nettask/sjws_nettask-standalone.yaml</string>
+    <string>--pid-file=/usr/local/var/run/sjws_nettask.pid</string>
+    <string>--shutdown-timeout=10</string>
+    <string>8080</string>
+    <string>/usr/local/var/www</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/usr/local/var/www</string>
+  <key>StandardOutPath</key>
+  <string>/usr/local/var/log/sjws_nettask.log</string>
+  <key>StandardErrorPath</key>
+  <string>/usr/local/var/log/sjws_nettask.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SJWS_RELOAD_SIGHUP</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ExitTimeOut</key>
+  <integer>45</integer>
+</dict>
+</plist>

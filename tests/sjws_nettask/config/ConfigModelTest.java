@@ -109,6 +109,16 @@ class ConfigModelTest {
         }
         tooMany.append("server:\n  root: ").append(abs).append('\n');
         assertTrue(error(tooMany.toString()).contains("at most"));
+        assertTrue(error("node:\n  max_staleness: 0\nserver:\n  root: " + abs + "\n").contains("max_staleness"));
+        assertTrue(error("node:\n  max_staleness: 8d\nserver:\n  root: " + abs + "\n").contains("7d"));
+        var stale = dir.resolve("stale.yaml");
+        Files.writeString(stale, "schema: 1\nnode:\n  mode: data\n  max_staleness: 15m\nserver:\n  port: 0\n  root: "
+                + abs + "\n");
+        var withStale = ConfigLoader.load(new String[] {"--config=" + stale}, Map.of());
+        assertTrue(withStale.ok(), withStale.errors().toString());
+        assertEquals(Duration.ofMinutes(15), withStale.document().node().maxStaleness());
+        assertTrue(withStale.document().canonicalText().contains("max_staleness: 15m")
+                || sjws_nettask.config.ConfigCodec.text(withStale.document()).contains("max_staleness: 15m"));
     }
 
     @Test
@@ -560,6 +570,12 @@ class ConfigModelTest {
         var extra = "{\"extra\":1,\"note\":\"z\",\"neg\":-2," + raw.substring(1);
         Files.writeString(dir.resolve("extra.json"), extra);
         assertEquals(data.canonicalText(), LastGoodStore.dataPlaneYaml(dir.resolve("extra.json")));
+        var signedShape = "schema: 1\nnode:\n  mode: data\n";
+        var signedHash = ConfigCodec.sha256(signedShape);
+        Files.writeString(dir.resolve("canonical-yaml.json"),
+                "{\"schema\":1,\"version\":4,\"canonicalHash\":\"" + signedHash
+                        + "\",\"canonicalYaml\":\"" + signedShape.replace("\n", "\\n") + "\"}\n");
+        assertEquals(signedShape, LastGoodStore.dataPlaneYaml(dir.resolve("canonical-yaml.json")));
 
         var shifted = base.server().toBuilder().tlsKeyPassword("pw").build();
         var hashed = ConfigDocument.of(shifted, base.acme(), base.routing(), base.middleware(), base.access(),

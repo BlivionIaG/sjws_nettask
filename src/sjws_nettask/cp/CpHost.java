@@ -29,8 +29,9 @@ import sjws_nettask.service.CpReloadable;
 /**
  * A full CONTROL-role voter (control-plane-hosting.md §1). Start order: config and timing check (done by
  * {@link CpLaunch}), {@code KeyRing.load}, {@code CpStore.open} with the peers, {@link WatchServer},
- * {@link AdminServer}, ready. Shutdown runs in reverse. Any failure closes what was opened and throws, so the
- * process exits non-zero.
+ * {@link AdminServer}, ready. Shutdown runs in reverse. A failure to bind or start the admin listener is
+ * recorded as {@code admin-state=failed} and the host stays up so store and watch remain available. Any
+ * other failure closes what was opened and throws, so the process exits non-zero.
  */
 public final class CpHost implements CpReloadable {
 
@@ -55,6 +56,8 @@ public final class CpHost implements CpReloadable {
     private sjws_nettask.cluster.ClusterTransport transport;
     private AutoCloseable watch;
     private AutoCloseable admin;
+    private volatile java.net.InetSocketAddress adminBound;
+    private volatile String adminState = "not-bound";
     private Thread insecureWarner;
     private volatile boolean closed;
 
@@ -126,12 +129,26 @@ public final class CpHost implements CpReloadable {
         var origins = java.util.Set.copyOf(config.adminAllowedOrigins());
         if (adminTls == null) {
             loopback(adminAt, "cp.admin.listen");
-            admin = AdminServer.startPlainForTests(store, now, 60_000L, origins);
-        } else {
-            admin = AdminServer.startMtls(store, adminAt, now, 60_000L, adminTls, origins);
-            tlsReloads.add(adminTls::reloadTls);
         }
-        events.add("admin");
+        try {
+            AdminServer started;
+            if (adminTls == null) {
+                started = AdminServer.startPlainForTests(store, now, 60_000L, origins, adminAt);
+            } else {
+                started = AdminServer.startMtls(store, adminAt, now, 60_000L, adminTls, origins);
+                tlsReloads.add(adminTls::reloadTls);
+            }
+            admin = started;
+            adminBound = started.address();
+            adminState = "listening";
+            events.add("admin");
+        } catch (IOException e) {
+            err.println("ERROR: admin listener failed to bind or start: " + e.getMessage());
+            adminState = "failed";
+            if (adminAt.getPort() > 0) {
+                adminBound = adminAt;
+            }
+        }
         events.add("ready");
     }
 
@@ -161,7 +178,32 @@ public final class CpHost implements CpReloadable {
         });
     }
 
-    private static InetSocketAddress loopback(InetSocketAddress address, String key) throws IOException {
+    @Override
+    public String adminListen() {
+        return formatListen(this.adminBound);
+    }
+
+    @Override
+    public String adminState() {
+        var state = this.adminState;
+        return state == null ? "" : state;
+    }
+
+    static String formatListen(java.net.InetSocketAddress address) {
+        if (address == null || address.getPort() <= 0) {
+            return "";
+        }
+        var host = address.getAddress() != null ? address.getAddress().getHostAddress() : address.getHostString();
+        if (host == null || host.isBlank()) {
+            return "";
+        }
+        if (host.indexOf(':') >= 0 && !host.startsWith("[")) {
+            host = "[" + host + "]";
+        }
+        return host + ":" + address.getPort();
+    }
+
+        private static InetSocketAddress loopback(InetSocketAddress address, String key) throws IOException {
         if (address.getAddress() == null || !address.getAddress().isLoopbackAddress()) {
             throw new IOException(key + ": a listener without TLS must be loopback, not " + address);
         }

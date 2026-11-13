@@ -18,13 +18,29 @@ In scope:
   quiche natives load.
 - The harness `tests/sjws_nettask/e2e/FileServingEndToEndTest.java`: a real
   `SjwsServer` on port 0, a temporary document root, and `java.net.http.HttpClient`.
+- Real external clients in `tests/sjws_nettask/e2e/ExternalClientEndToEndTest.java`
+  (tags `e2e` and `e2e-clients`) and `tools/e2e-external-clients.sh`. The suite starts
+  a real server (HTTP/1.1, h2c, and HTTP/3 when the natives load) and drives it with
+  curl: HTTP/1.1 200, 404 and a byte range; curl `--http2-prior-knowledge` against
+  h2c and curl `--http3-only` against the QUIC listener when curl was built with those
+  features; `h2load` and a quiche or ngtcp2 client when those binaries are on `PATH`.
+  curl is required for the HTTP/1.1 smoke: a missing curl fails that case. A missing
+  optional client (`h2load`, HTTP/3 curl, quiche or ngtcp2) skips that case. A failed
+  curl HTTP/1.1 check fails the run. HTTPS on the main TCP port is still out of scope.
+- Composed proxy + routing + middleware in
+  `tests/sjws_nettask/e2e/ProxyRoutingMiddlewareEndToEndTest.java` (tag `e2e`): a
+  real listener, a YAML route table (proxy `/api` plus static `/`), and at least two
+  gateway filters (`request-size`, `cors`, `header-rewrite`). It asserts filter
+  order and scoping, short-circuit (414 / CORS preflight) before the upstream,
+  upstream failure (502/504) without taking the process down, and a streamed body
+  plus a cancelled mid-response read.
 
-Out of scope for the harness (it is HTTP/1.1 only; `h2/*` and `h3/*` cover the other
-listeners):
+Out of scope for the FileServing JDK-client harness (it is HTTP/1.1 only; `h2/*` and
+`h3/*` cover the in-process listeners, and `ExternalClientEndToEndTest` covers curl /
+h2load / quiche):
 
-- HTTP/2 (`--h2`, its own TCP port).
-- HTTPS. The main TCP port is cleartext; TLS exists on the HTTP/2 port and as QUIC for
-  HTTP/3.
+- HTTP/2 through `HttpClient` inside `FileServingEndToEndTest` itself.
+- HTTPS on the main TCP port. TLS exists on the HTTP/2 port and as QUIC for HTTP/3.
 
 `mvn test` runs every test except those tagged `jar`. `mvn verify` also packages
 the jar, runs the `jar` tests, and enforces the JaCoCo package gates in `pom.xml`.
@@ -171,7 +187,8 @@ The rest of the suite:
   agent), and the coverage gate. `FileServingEndToEndTest` is part of that
   default Surefire run (it is not in the `jar` exclude).
 - The following step runs the harness on its own and fails if the `e2e` group
-  matches nothing:
+  matches nothing (FileServing plus the external-client suite; curl is required
+  for HTTP/1.1, and optional clients skip when the binary is missing):
 
   `mvn -B -Dgroups=e2e -Dsurefire.failIfNoSpecifiedTests=true test`
 
@@ -180,10 +197,13 @@ The rest of the suite:
 
   `mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test`
 
-- `tools/gateway-bench.sh` then runs a short wrk comparison (warm-up 1 s, measure 3 s)
-  of standalone vs gateway-off on Linux, after `apt-get install wrk`. It fails if either mode
-  reports request errors or zero throughput. The 30 s comparison is local; see
-  `bench/README.md`. macOS CI (manual dispatch only) skips that step.
+- `tools/gateway-bench.sh` then runs a short wrk comparison (warm-up 1 s, measure 3 s,
+  `GATEWAY_BENCH_WRK2=0`) of standalone vs gateway-off on Linux, after `apt-get install wrk`.
+  It fails if either mode reports request errors, zero throughput, or a missing RSS reading.
+  The req/s ratio and the RSS kB are printed; they are not failed on magnitude (no measured
+  absolute floor is configured). The 30 s comparison, with wrk2, is the heavy set; see
+  `bench/README.md` and [perf-gate.md](perf-gate.md) (“Fast PR set vs heavy nightly/manual set”).
+  macOS CI (manual dispatch only) skips that step.
 
 - Job `mutation` (cron or `workflow_dispatch` only): `ubuntu-latest`, timeout
   120 minutes, PIT via `mvn -B -P pitest test-compile org.pitest:pitest-maven:mutationCoverage`.
@@ -207,6 +227,14 @@ flowchart TB
         m1["PIT mutation coverage<br/>never on a pull request"] --> m2["Upload target/pit-reports/"]
     end
 ```
+
+Which jobs are the fast PR set versus the heavy nightly/manual set, and which thresholds
+actually fail a run, is documented in [perf-gate.md](perf-gate.md). In short: every Linux PR
+runs the short wrk gateway-bench (RSS recorded, wrk2 off). PRs that touch `src/**` also run
+the A/B perf-gate with wrk2 p99 (relative-to-base thresholds only) and recorded RSS. The
+nightly / labelled `cluster-tests.yml` job runs the full-length wrk+wrk2 gateway-bench and
+records p99 and RSS without an absolute floor. Absolute wrk2 p99 and RSS budgets stay
+measurement-pending until a quiet-box or CI artifact run supplies the numbers.
 
 `.github/workflows/release.yml` is a tag workflow. It is not the test matrix.
 
@@ -267,6 +295,19 @@ starts `CpStoreControlPlane`. `PendingControlPlane` is the null object for a sce
 no control nodes: `available()` is false and every other call throws
 `ControlPlanePendingException`.
 
+`WatchRelayTest` covers the relay in isolation: pause vs resume, clock delay
+on the control-to-data direction only (data-to-control is not delayed), a
+clamped negative delay, drop of a dead upstream, a client closed when no
+upstream is live, and fallback to the next live voter port. `CpStoreControlPlaneGuardsTest`
+covers start-count and already-started rejection, `appliedVersion` / `contentHash` /
+`delay` / `rollback` on missing ids or versions, and a successful hash after a
+push. Residual risk still covered only indirectly (or in the named scenario
+tests): `join` cleanup when the first watch answer never arrives, `propose` /
+`activate` failure in `push`, `awaitConverged` and `dispatched` timeouts,
+`interTickGap` mid-round advances (`ClusterTickGapStressTest`), and composed
+partition / delay / kill / heal through data nodes (`ClusterScenariosTest`,
+`CpVoterRestartTest`). Those scenario assertions are unchanged.
+
 `NodeFixtures.pending(dir, "data")` writes the bootstrap files under that temp directory
 (`state` is `dir/state`, not the working directory). A process started from that file
 reports `connection=pending`. That replaces the copy
@@ -311,9 +352,10 @@ No test under `tests/` is `@Disabled`.
 
 Not implemented. Nothing above depends on these.
 
-- HTTP/2 inside `FileServingEndToEndTest`. The harness stays HTTP/1.1;
+- HTTP/2 inside `FileServingEndToEndTest`. The JDK-client harness stays HTTP/1.1;
   `h2/Http2ServerTest` already drives the real `Http2Server` (ALPN, h2c) with the JDK
-  `HttpClient`.
+  `HttpClient`. The external-client suite covers curl `--http2-prior-knowledge` and
+  optional `h2load` against h2c.
 - HTTPS on the main TCP port. The main listener stays cleartext; HTTPS exists only on
   the HTTP/2 listener's own port (`--h2-port`). A TLS accept path on the main port
   would be a new server path.
@@ -321,7 +363,9 @@ Not implemented. Nothing above depends on these.
   parsers keep `0` as ephemeral; startup prints `HTTP/1.1 on tcp/<bound>`. YAML
   `server.port: 0` already worked.
 - HTTP/3 inside `FileServingEndToEndTest`. The same temporary root and ephemeral
-  port are already covered by `h3/Http3ServerTest` and `h3/JarLaunchTest`.
+  port are already covered by `h3/Http3ServerTest` and `h3/JarLaunchTest`. The
+  external-client suite covers curl `--http3-only` (when curl was built with HTTP/3)
+  and a quiche or ngtcp2 client when one is on `PATH`.
 - Dropping fixed `Thread.sleep` calls that only poll for a condition, in favour
   of the deadline loops the transport tests already use. Sleeps that exist to
   outlast a deadline stay.

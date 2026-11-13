@@ -94,6 +94,19 @@ and `tryAcquireAddress` for an address, and neither may block or do I/O.
 each `rate-limit` entry, so a cluster remainder can refill a local balance on another thread
 and answer from it here. The default factory is the striped table.
 
+That factory is also the hook for a **cluster quota share** (rate-limit v2). A later, CP-fed
+implementation resizes the local GCRA refill from a share snapshot (`share_rate` /
+`share_burst` = configured totals divided across the ready gateway set, remainders assigned
+stably so the shares sum to the configured totals). Membership changes are HA's; computing and
+publishing the share is the control plane's; this filter must not gossip. The wire type is not
+defined here. Default remains the local table (v2 unset, zero cost).
+
+Failure mode, once v2 is enabled: **keep the last share** if a later snapshot is missing or
+stale; **fail closed** (the existing 429 + `Retry-After`) if this node has never received a
+share, if a CP TTL expires, or if this node is not in the ready set. Do not fall back to the
+full local rate — that would admit up to *N* times the global budget. Design §13 in
+`docs/design/proxy-routing.md` is the contract. Implementation waits on the CP/HA share API.
+
 ## cors
 
 `origins` is `*` or a comma-separated list of exact origins. `credentials` `true` cannot be
