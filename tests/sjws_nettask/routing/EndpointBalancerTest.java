@@ -805,4 +805,43 @@ class EndpointBalancerTest {
         assertEquals("a", body(b.handle(new Request("GET", "/"))));
     }
 
+
+    @Test
+    void pickWarmIdleDoesNotReserveAHalfOpenProbeOnAColdRecoveringEndpoint() throws Exception {
+        var admission = Admission.of(0, 1);
+        var o = new EndpointBalancer.Outlier(1, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(1), 100);
+        var src = new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1)));
+        var b = balancer(src, null, o, Duration.ZERO, admission);
+        this.failing.add("a");
+        var failed = b.handle(new Request("GET", "/"));
+        assertEquals(503, failed.status());
+        body(failed);
+        var poolA = b.poolOf(ep(0, 1).authority());
+        assertTrue(poolA.health.ejected());
+        if (admission.connections() > 0) {
+            assertTrue(admission.reclaimIdle(null, Duration.ofSeconds(1)),
+                    "the 503 keep-alive on A must be closed so B can take the cap");
+        }
+        for (int i = 0; i < 50 && admission.connections() > 0; i++) {
+            Thread.sleep(20);
+        }
+        assertEquals(0, admission.connections());
+        assertEquals(0, poolA.proxy.idleConnections());
+        assertTrue(src.update(set(2, LbPolicy.ROUND_ROBIN, ep(0, 1), ep(1, 1))));
+        var fromB = b.handle(new Request("GET", "/"));
+        assertEquals(200, fromB.status());
+        assertEquals("b", body(fromB));
+        assertEquals(1, admission.connections());
+        this.now.addAndGet(1_100_000_000L);
+        assertTrue(poolA.health.ejected());
+        assertEquals(0, poolA.proxy.idleConnections());
+        for (int i = 0; i < 20; i++) {
+            var again = b.handle(new Request("GET", "/"));
+            assertEquals(200, again.status());
+            assertEquals("b", body(again));
+        }
+        assertTrue(poolA.health.available(this.now.get()),
+                "scanning a cold recovering endpoint at the cap must not leak its half-open reservation");
+        poolA.health.release();
+    }
 }

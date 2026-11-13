@@ -244,6 +244,10 @@ public final class ProxyHandler implements Handler, AutoCloseable {
      * Idle keep-alive reuse is unchanged: if the socket was returned to the pool, this does not wait.
      */
     static void discardForRetry(Response response, Duration timeout) {
+        discardForRetry(response, timeout, null);
+    }
+
+    static void discardForRetry(Response response, Duration timeout, Admission admission) {
         if (response == null) {
             return;
         }
@@ -262,6 +266,9 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         }
         if (closing == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
             return;
+        }
+        if (admission == null || !admission.limitsConnections()) {
+            return; // no slot to reclaim: do not wait on close
         }
         try {
             closing.closeFuture().await(Math.max(1, timeout.toMillis()), TimeUnit.MILLISECONDS);
@@ -544,7 +551,7 @@ public final class ProxyHandler implements Handler, AutoCloseable {
                     return withPending(outResponse, hold);
                 }
                 if (response != null) {
-                    discardForRetry(response, this.settings.connectTimeout());
+                    discardForRetry(response, this.settings.connectTimeout(), this.admission);
                 }
                 tries++;
             }

@@ -442,7 +442,7 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                     return ProxyHandler.withPending(out, hold);
                 }
                 if (response != null) {
-                    ProxyHandler.discardForRetry(response, pool.proxy.settings().connectTimeout());
+                    ProxyHandler.discardForRetry(response, pool.proxy.settings().connectTimeout(), this.admission);
                 }
                 tried[tries++] = i;
             }
@@ -508,8 +508,8 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         for (int k = 0; k < n; k++) {
             int i = (start + k) % n;
             boolean weighted = v.set.endpointAt(i).effectiveWeight() > 0 || v.positive.length == n;
-            if (weighted && !contains(tried, nTried, i) && clientMayUse(v.pools[i], now, panic)
-                    && v.pools[i].proxy.idleConnections() > 0) {
+            if (weighted && !contains(tried, nTried, i) && v.pools[i].proxy.idleConnections() > 0
+                    && clientMayUse(v.pools[i], now, panic)) {
                 return i;
             }
         }

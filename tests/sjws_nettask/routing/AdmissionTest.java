@@ -505,4 +505,54 @@ class AdmissionTest {
         }
         assertEquals(0, admission.connections());
     }
+
+    @Test
+    void retryAfterADiscarded5xxDoesNotWaitWhenConnectionLimitingIsDisabled() throws Exception {
+        assertDoesNotWaitOnDiscardedClose(null);
+        if (this.proxy != null) {
+            this.proxy.close();
+            this.proxy = null;
+        }
+        if (this.upstream != null) {
+            this.upstream.stop(0);
+            this.upstream = null;
+        }
+        assertDoesNotWaitOnDiscardedClose(Admission.of(1, 0));
+    }
+
+    private void assertDoesNotWaitOnDiscardedClose(Admission admission) throws Exception {
+        var hits = new AtomicInteger();
+        var enteredSecond = new CountDownLatch(1);
+        var releaseFirst = new CountDownLatch(1);
+        start(ex -> {
+            int n = hits.incrementAndGet();
+            if (n == 1) {
+                var failBody = "f".repeat(8192).getBytes();
+                ex.sendResponseHeaders(503, failBody.length);
+                ex.getResponseBody().write(failBody);
+                if (!releaseFirst.await(8, TimeUnit.SECONDS)) {
+                    throw new RuntimeException("release timed out");
+                }
+            } else {
+                enteredSecond.countDown();
+                var body = "ok".getBytes();
+                ex.sendResponseHeaders(200, body.length);
+                ex.getResponseBody().write(body);
+            }
+            ex.close();
+        });
+        var retry = new Resilience.Retry(1, EnumSet.of(Resilience.On.STATUS_503), 100);
+        this.proxy = new ProxyHandler(new ProxyHandler.Settings(base(), Duration.ofSeconds(5), Duration.ofSeconds(2),
+                1024, "http", null), ByteBudget.shared(), new Resilience(retry, null), admission);
+        long t0 = System.nanoTime();
+        var response = this.proxy.handle(new Request("GET", "/"));
+        long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+        assertEquals(200, response.status());
+        assertEquals("ok", ProxyHandlerTest.text(response));
+        assertEquals(2, hits.get());
+        assertTrue(enteredSecond.await(0, TimeUnit.MILLISECONDS),
+                "the retry must start before the discarded 5xx connection closes");
+        assertTrue(ms < 1500, "must not await the discarded close when uncapped: " + ms);
+        releaseFirst.countDown();
+    }
 }
