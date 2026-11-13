@@ -222,6 +222,43 @@ class AdmissionTest {
         assertEquals(1, hits.get());
     }
 
+    /** An unknown-length body that grows past max_body mid-forward is a local 413 that frees its pending slot. */
+    @Test
+    void oversizedStreamedBodyIs413AndReleasesThePendingSlot() throws Exception {
+        start(ex -> {
+            ex.getRequestBody().transferTo(java.io.OutputStream.nullOutputStream());
+            ex.sendResponseHeaders(200, -1);
+            ex.close();
+        });
+        sjws_nettask.core.RequestBody oversized = new sjws_nettask.core.RequestBody() {
+            @Override
+            public long length() {
+                return -1;
+            }
+
+            @Override
+            public int read(byte[] into, int off, int len) {
+                return Math.min(len, 8192);
+            }
+        };
+        this.proxy = proxy(Admission.of(1, 0));
+        assertEquals(413, this.proxy.handle(new Request("POST", "/").withBody(oversized)).status());
+        assertEquals(0, this.proxy.admission().pending());
+        // the balancer's one-shot path answers the same local 413 instead of throwing
+        assertEquals(413, this.proxy.attempt(new Request("POST", "/").withBody(oversized)).status());
+        var resilience = new Resilience(null, new Resilience.Circuit(1, Duration.ofSeconds(30)));
+        try (var gated = new ProxyHandler(new ProxyHandler.Settings(this.base(), Duration.ofSeconds(2),
+                Duration.ofSeconds(2), 1024, "http", null), ByteBudget.shared(), resilience, Admission.of(1, 0))) {
+            assertEquals(413, gated.handle(new Request("POST", "/").withBody(oversized)).status());
+            assertEquals(0, gated.admission().pending());
+            assertEquals("CLOSED", gated.circuitState(), "a local 413 must not trip the circuit");
+            var ok = gated.handle(new Request("GET", "/"));
+            assertEquals(200, ok.status());
+            ProxyHandlerTest.text(ok); // the slot is held until the body is consumed
+            assertEquals(0, gated.admission().pending());
+        }
+    }
+
     @Test
     void maxConnectionsRefusesASecondSocketAndReusesIdle() throws Exception {
         var entered = new CountDownLatch(1);
