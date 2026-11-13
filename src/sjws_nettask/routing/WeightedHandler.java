@@ -117,13 +117,13 @@ public final class WeightedHandler implements Handler {
 
     /**
      * Per-request history of route-level retries: which backends were tried, and for each
-     * {@link EndpointBalancer} backend its own tried-endpoint indices (indices are private to one
-     * balancer's view, so they are never shared across backends).
+     * {@link EndpointBalancer} backend its own tried-endpoint identities (authorities, private to
+     * one balancer, so they are never shared across backends and survive a discovery reorder).
      */
     final class Attempts {
         private final int cap;
         private final boolean[] backends = new boolean[WeightedHandler.this.handlers.length];
-        private final int[][] endpoints = new int[WeightedHandler.this.handlers.length][];
+        private final String[][] endpoints = new String[WeightedHandler.this.handlers.length][];
         private final int[][] counts = new int[WeightedHandler.this.handlers.length][];
 
         private Attempts(int cap) {
@@ -153,14 +153,14 @@ public final class WeightedHandler implements Handler {
             state.backends[i] = true;
         }
         if (handler instanceof ProxyHandler proxy) {
-            return proxy.attempt(request);
+            return proxy.attemptWithPending(request);
         }
         if (handler instanceof EndpointBalancer balancer) {
             if (state == null) {
                 return balancer.oneShot(request);
             }
             if (state.endpoints[i] == null) {
-                state.endpoints[i] = new int[state.cap];
+                state.endpoints[i] = new String[state.cap];
                 state.counts[i] = new int[1];
             }
             return balancer.oneShot(request, state.endpoints[i], state.counts[i]);

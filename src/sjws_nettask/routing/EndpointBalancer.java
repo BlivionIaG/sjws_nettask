@@ -375,14 +375,15 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
     }
 
     /**
-     * One try that records the chosen endpoint in {@code tried} so a route-level retry can
-     * exclude it. Transport failures are thrown so the caller can classify {@code connect}/
-     * {@code reset}/{@code timeout} instead of a synthetic 502/504.
+     * One try that records the chosen endpoint's authority in {@code tried} so a route-level
+     * retry can exclude it even if discovery reorders the view between attempts. Transport
+     * failures are thrown so the caller can classify {@code connect}/{@code reset}/{@code timeout}
+     * instead of a synthetic 502/504.
      *
      * @param nTried {@code nTried[0]} is the number of valid entries already in {@code tried};
      *        updated after this attempt when both arrays are non-null
      */
-    Response oneShot(Request request, int[] tried, int[] nTried) throws IOException, InterruptedException {
+    Response oneShot(Request request, String[] tried, int[] nTried) throws IOException, InterruptedException {
         return dispatch(request, null, tried, nTried, true);
     }
 
@@ -397,7 +398,7 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         }
     }
 
-    private Response dispatch(Request request, Resilience.Retry retry, int[] tried, int[] nTried, boolean rethrow)
+    private Response dispatch(Request request, Resilience.Retry retry, String[] tried, int[] nTried, boolean rethrow)
             throws IOException, InterruptedException {
         var v = this.view;
         boolean head = request.headOnly();
@@ -418,7 +419,7 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
             }
             int tries = nTried != null && tried != null ? nTried[0] : 0;
             if (tried == null) {
-                tried = mayRetry ? new int[retry.attempts()] : null;
+                tried = mayRetry ? new String[retry.attempts()] : null;
                 tries = 0;
             }
             while (true) {
@@ -474,7 +475,7 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                 }
                 pool.health.failure(this.clock.getAsLong());
                 if (tried != null && tries < tried.length) {
-                    tried[tries] = i;
+                    tried[tries] = pool.key;
                 }
                 boolean again = mayRetry && tries < retry.attempts() && retry.on().contains(failed) && this.budget.withdraw();
                 if (tried != null && tries < tried.length) {
@@ -507,13 +508,13 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
      * An endpoint that is not ejected (unless the balancer panics) and, for a retry, not tried yet.
      * Falls back to a tried endpoint, then to any endpoint, so a request always gets one.
      */
-    int pick(View v, int[] tried, int nTried, long now) {
+    int pick(View v, String[] tried, int nTried, long now) {
         int n = v.pools.length;
         boolean panic = (long) this.ejected.get() * 100 > (long) this.outlier.maxEjectionPercent() * n;
         int draws = Math.min(n, 4);
         for (int d = 0; d < draws; d++) {
             int i = policyPick(v);
-            if (!contains(tried, nTried, i) && clientMayUse(v.pools[i], now, panic)) {
+            if (!contains(tried, nTried, v.pools[i].key) && clientMayUse(v.pools[i], now, panic)) {
                 return i;
             }
         }
@@ -522,7 +523,7 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
             for (int k = 0; k < n; k++) {
                 int i = (start + k) % n;
                 boolean weighted = v.set.endpointAt(i).effectiveWeight() > 0 || v.positive.length == n;
-                if (weighted == (pass == 0) && !contains(tried, nTried, i)
+                if (weighted == (pass == 0) && !contains(tried, nTried, v.pools[i].key)
                         && clientMayUse(v.pools[i], now, panic)) {
                     return i;
                 }
@@ -690,9 +691,12 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         };
     }
 
-    private static boolean contains(int[] tried, int n, int i) {
-        for (int k = 0; k < n; k++) {
-            if (tried[k] == i) {
+    private static boolean contains(String[] tried, int n, String key) {
+        if (tried == null || key == null) {
+            return false;
+        }
+        for (int k = 0; k < n && k < tried.length; k++) {
+            if (key.equals(tried[k])) {
                 return true;
             }
         }

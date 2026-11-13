@@ -487,4 +487,128 @@ class RouteResilienceTest {
             balancer.close();
         }
     }
+
+    @Test
+    void oneShotOnAPlainProxyTakesAndReleasesASharedPendingSlot() {
+        var admission = Admission.of(1, 0);
+        var proxied = new ProxyHandler(new ProxyHandler.Settings(this.base, Duration.ofSeconds(1), Duration.ofSeconds(2),
+                1024, "http", null), ByteBudget.shared(), null, admission);
+        try {
+            var wrap = new RouteResilience(proxied, new Resilience(retry503(1), null));
+            var ok = wrap.handle(new Request("GET", "/"));
+            assertEquals(200, ok.status());
+            Body.discard(ok.body());
+            assertEquals(0, admission.pending());
+            var stolen = admission.tryPending();
+            assertNotNull(stolen);
+            var refused = wrap.handle(new Request("GET", "/"));
+            assertEquals(503, refused.status());
+            assertTrue(ProxyHandler.isLocalRefusal(refused));
+            stolen.release();
+            var again = wrap.handle(new Request("GET", "/"));
+            assertEquals(200, again.status());
+            Body.discard(again.body());
+            assertEquals(0, admission.pending());
+
+            var weighted = new WeightedHandler(List.of(new WeightedHandler.Backend(proxied, 1, null)), null);
+            var wwrap = new RouteResilience(weighted, new Resilience(retry503(1), null));
+            stolen = admission.tryPending();
+            var wrefused = wwrap.handle(new Request("GET", "/"));
+            assertEquals(503, wrefused.status());
+            assertTrue(ProxyHandler.isLocalRefusal(wrefused));
+            stolen.release();
+            var wok = wwrap.handle(new Request("GET", "/"));
+            assertEquals(200, wok.status());
+            Body.discard(wok.body());
+            assertEquals(0, admission.pending());
+        } finally {
+            proxied.close();
+        }
+    }
+
+    @Test
+    void oneShotOnAPlainProxyHoldsThePendingSlotWhileTheExchangeIsInFlight() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var heldUp = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        heldUp.createContext("/", ex -> {
+            entered.countDown();
+            try {
+                if (!release.await(8, TimeUnit.SECONDS)) {
+                    throw new RuntimeException("release timed out");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                ex.close();
+                return;
+            }
+            var body = "ok".getBytes();
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        heldUp.start();
+        var admission = Admission.of(1, 0);
+        var proxied = new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://127.0.0.1:" + heldUp.getAddress().getPort()), Duration.ofSeconds(5),
+                Duration.ofSeconds(5), 1024, "http", null), ByteBudget.shared(), null, admission);
+        try {
+            var wrap = new RouteResilience(proxied, new Resilience(retry503(1), null));
+            var held = new AtomicReference<sjws_nettask.core.Response>();
+            var err = new AtomicReference<Throwable>();
+            var t = Thread.ofPlatform().start(() -> {
+                try {
+                    held.set(wrap.handle(new Request("GET", "/")));
+                } catch (Throwable e) {
+                    err.set(e);
+                }
+            });
+            assertTrue(entered.await(8, TimeUnit.SECONDS));
+            assertEquals(1, admission.pending());
+            var refused = wrap.handle(new Request("GET", "/"));
+            assertEquals(503, refused.status());
+            assertTrue(ProxyHandler.isLocalRefusal(refused));
+            release.countDown();
+            t.join(8000);
+            assertNull(err.get());
+            assertEquals(200, held.get().status());
+            Body.discard(held.get().body());
+            assertEquals(0, admission.pending());
+        } finally {
+            proxied.close();
+            heldUp.stop(0);
+        }
+    }
+
+    @Test
+    void routeRetryExcludesATriedEndpointAfterDiscoveryReordersTheView() throws Exception {
+        this.failFirst = Integer.MAX_VALUE;
+        var okHits = new AtomicInteger();
+        var ok = okServer(okHits);
+        var failEp = Endpoint.of("127.0.0.1", this.upstream.getAddress().getPort());
+        var okEp = Endpoint.of("127.0.0.1", ok.getAddress().getPort());
+        var src = new StaticUpstreamSource(new UpstreamSet("api", 1, new Endpoint[] {failEp}, LbPolicy.ROUND_ROBIN));
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofSeconds(1), Duration.ofSeconds(2), 1024, "http",
+                null), ByteBudget.shared(), null);
+        var balancer = new EndpointBalancer(src, pools, null, null);
+        try {
+            String[] tried = new String[2];
+            int[] nTried = new int[1];
+            var first = balancer.oneShot(new Request("GET", "/"), tried, nTried);
+            assertEquals(503, first.status());
+            Body.discard(first.body());
+            assertEquals(1, nTried[0]);
+            assertEquals(failEp.authority(), tried[0]);
+            assertTrue(src.update(new UpstreamSet("api", 2, new Endpoint[] {okEp, failEp}, LbPolicy.ROUND_ROBIN)));
+            var second = balancer.oneShot(new Request("GET", "/"), tried, nTried);
+            assertEquals(200, second.status(),
+                    "must not treat the new index-0 healthy endpoint as already tried");
+            Body.discard(second.body());
+            assertEquals(1, okHits.get());
+        } finally {
+            balancer.close();
+            ok.stop(0);
+        }
+    }
 }

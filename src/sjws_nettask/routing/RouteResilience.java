@@ -61,7 +61,7 @@ public final class RouteResilience implements Handler {
         int cap = Math.max(1, (retry == null ? 0 : retry.attempts()) + 1);
         // A backends: route keeps per-backend history; a single balancer keeps one endpoint list.
         var weightedState = this.inner instanceof WeightedHandler weighted ? weighted.attempts(cap) : null;
-        int[] tried = weightedState == null ? new int[cap] : null;
+        String[] tried = weightedState == null ? new String[cap] : null;
         int[] nTried = weightedState == null ? new int[1] : null;
         int tries = 0;
         while (true) {
@@ -114,10 +114,10 @@ public final class RouteResilience implements Handler {
         return this.breaker == null ? "NONE" : this.breaker.state().name();
     }
 
-    private Response oneShot(Request request, int[] tried, int[] nTried, WeightedHandler.Attempts weightedState)
+    private Response oneShot(Request request, String[] tried, int[] nTried, WeightedHandler.Attempts weightedState)
             throws IOException, InterruptedException {
         if (this.inner instanceof ProxyHandler proxy) {
-            return proxy.attempt(request);
+            return proxy.attemptWithPending(request);
         }
         if (this.inner instanceof EndpointBalancer balancer) {
             return balancer.oneShot(request, tried, nTried);

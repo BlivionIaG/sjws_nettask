@@ -325,6 +325,19 @@ public final class ProxyHandler implements Handler, AutoCloseable {
      * exception (classify it with {@link #kind(IOException)}, answer it with {@link #status}).
      */
     Response attempt(Request request) throws IOException, InterruptedException {
+        return attempt(request, false);
+    }
+
+    /**
+     * Like {@link #attempt}, but takes this handler's pending slot when {@code max_pending} is
+     * set. Used by a per-route one-shot so a plain-URL upstream still shares the cap; a balancer
+     * holds the slot itself and must keep calling {@link #attempt()}.
+     */
+    Response attemptWithPending(Request request) throws IOException, InterruptedException {
+        return attempt(request, true);
+    }
+
+    private Response attempt(Request request, boolean takePending) throws IOException, InterruptedException {
         boolean head = request.headOnly();
         long length = request.body().length();
         if (request.body() == sjws_nettask.core.RequestBody.EMPTY && hasDeclaredBody(request)) {
@@ -343,12 +356,28 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         } catch (IllegalArgumentException e) {
             return localRefusal(StaticFileHandler.error(400, head));
         }
+        Admission.Hold pending = null;
+        if (takePending && this.admission != null && this.admission.limitsPending()) {
+            pending = this.admission.tryPending();
+            if (pending == null) {
+                return overloaded(head);
+            }
+        }
         try {
-            return exchange(request, out, length, true);
+            var response = exchange(request, out, length, true);
+            var hold = pending;
+            pending = null;
+            return withPending(response, hold);
         } catch (UpstreamPool.ConnectionLimit e) {
-            return overloaded(head);
+            var hold = pending;
+            pending = null;
+            return withPending(overloaded(head), hold);
         } catch (RequestBodyTooLarge e) {
             return localRefusal(StaticFileHandler.error(413, head)); // local, not an upstream verdict
+        } finally {
+            if (pending != null) {
+                pending.release();
+            }
         }
     }
 
