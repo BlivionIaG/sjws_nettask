@@ -27,8 +27,10 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Response;
@@ -186,6 +188,18 @@ class Http1RequestBodyTest {
         assertTrue(text.startsWith("HTTP/1.1 502 "), text);
         assertTrue(text.contains("chunk size"), text);
         assertTrue(text.contains("no longer readable"), text);
+    }
+
+    @Test
+    @Timeout(value = 3, unit = TimeUnit.SECONDS)
+    void anAnnouncedChunkSizeOverTheDecoderCapFailsTheRead() throws Exception {
+        // 0x4000000000000000 exceeds Long.MAX_VALUE/2, so the decoder is overLimit
+        // before any payload is copied and would otherwise spin on the leftover "x".
+        var text = exchange(echo(),
+                "POST /a HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n4000000000000000\r\nx",
+                true);
+        assertTrue(text.startsWith("HTTP/1.1 502 "), text);
+        assertTrue(text.contains("exceeded the decoder limit"), text);
     }
 
     @Test
