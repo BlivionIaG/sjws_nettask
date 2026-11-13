@@ -89,32 +89,34 @@ class UpstreamPoolConnectTest {
     @Timeout(30)
     void interruptedConnectHoldsTheSlotUntilTheChannelCloses() throws Exception {
         var admission = Admission.of(0, 1);
-        try (var server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
-                var pool = new UpstreamPool(URI.create("http://127.0.0.1:" + server.getLocalPort() + "/"),
+        // Gate connect completion before starting the worker (Codex P2 on #475): a
+        // listening ServerSocket can finish the handshake into its backlog, and
+        // acquire() can succeed, before the main thread reaches parkEventLoops().
+        // TEST-NET-1 is unroutable so the connect stays in flight; parking the
+        // event loops first also keeps close (and the slot release) queued.
+        try (var pool = new UpstreamPool(URI.create("http://192.0.2.1:9/"),
                         Duration.ofSeconds(5), 4, new ByteBudget(1 << 20), admission)) {
             var started = new CountDownLatch(1);
             var interrupted = new CompletableFuture<Void>();
-            var first = Thread.ofPlatform().start(() -> {
-                try {
-                    started.countDown();
-                    pool.acquire();
-                    interrupted.completeExceptionally(new AssertionError("acquire should have been interrupted"));
-                } catch (InterruptedException e) {
-                    interrupted.complete(null);
-                } catch (Throwable e) {
-                    interrupted.completeExceptionally(e);
-                }
-            });
-            assertTrue(started.await(5, TimeUnit.SECONDS));
-            for (int i = 0; i < 50 && admission.connections() == 0; i++) {
-                Thread.sleep(10);
-            }
-            assertEquals(1, admission.connections());
-
-            // Park every event loop so Channel.close() cannot complete (and cannot release the
-            // slot) until we say so. Without the fix the slot is released on this thread anyway.
             var resume = parkEventLoops();
             try {
+                var first = Thread.ofPlatform().start(() -> {
+                    try {
+                        started.countDown();
+                        pool.acquire();
+                        interrupted.completeExceptionally(new AssertionError("acquire should have been interrupted"));
+                    } catch (InterruptedException e) {
+                        interrupted.complete(null);
+                    } catch (Throwable e) {
+                        interrupted.completeExceptionally(e);
+                    }
+                });
+                assertTrue(started.await(5, TimeUnit.SECONDS));
+                for (int i = 0; i < 50 && admission.connections() == 0; i++) {
+                    Thread.sleep(10);
+                }
+                assertEquals(1, admission.connections());
+
                 first.interrupt();
                 interrupted.get(5, TimeUnit.SECONDS);
                 assertEquals(1, admission.connections());

@@ -595,6 +595,14 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                 if (e instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
                 }
+                // ConnectionLimit is a local cap refusal: the probe never reached the
+                // upstream, so it is neither a success nor a failure (Codex P2 on #475).
+                if (e instanceof UpstreamPool.ConnectionLimit) {
+                    if (heldHalfOpen) {
+                        pool.health.release();
+                    }
+                    return;
+                }
                 if (!this.closed && !pool.abandoned) {
                     pool.health.failure(this.clock.getAsLong());
                 } else if (heldHalfOpen) {

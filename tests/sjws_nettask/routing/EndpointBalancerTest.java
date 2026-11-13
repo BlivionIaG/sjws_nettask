@@ -680,6 +680,86 @@ class EndpointBalancerTest {
         body(again);
     }
 
+    /**
+     * Codex P2 on #475: when a probe is refused by the proxy's own max_connections
+     * cap, the refusal never reached the upstream and must count as neither a
+     * health success nor a failure. Otherwise a healthy endpoint can be ejected,
+     * or an ejected endpoint's half-open reservation can stick, solely because
+     * the proxy is at its own cap.
+     */
+    @Test
+    void connectionLimitProbesDoNotCountAsHealthFailures() throws Exception {
+        var admission = Admission.of(0, 1);
+        var stolen = admission.tryConnection();
+        assertNotNull(stolen);
+        try {
+            var o = new EndpointBalancer.Outlier(3, 100, 1_000_000, Duration.ofSeconds(10),
+                    Duration.ofSeconds(1), 100);
+            var src = new StaticUpstreamSource(set(1, null, ep(0, 1)));
+            var b = balancerWith(src, null, o, Duration.ZERO, admission, testHealth());
+            var pool = b.poolOf(ep(0, 1).authority());
+            int hitsBefore = this.hits[0].get();
+            this.now.addAndGet(20_000_000_000L);
+            b.probeTick(); // first tick only staggers the first in-rotation probe
+            this.now.addAndGet(20_000_000_000L);
+            int sent = b.probesSent();
+            for (int i = 0; i < 5; i++) {
+                b.probeTick();
+                this.now.addAndGet(20_000_000_000L);
+            }
+            assertTrue(b.probesSent() >= sent + 3, "probes must have been attempted at the cap");
+            assertEquals(hitsBefore, this.hits[0].get(), "a cap refusal must not contact the upstream");
+            assertFalse(pool.health.ejected(), "local connection-limit refusals must not eject a healthy endpoint");
+            assertEquals(0, b.ejectedCount());
+
+            // Eject with real upstream probe failures (probes close their socket), then a
+            // cap-refused half-open probe must release the reservation so a later probe
+            // can recover.
+            stolen.release();
+            stolen = null;
+            this.failing.add("a");
+            int sentFail = b.probesSent();
+            int hitsBeforeFail = this.hits[0].get();
+            // Close is async; wait for the slot or the next probe is a local cap refusal.
+            for (int i = 0; i < 3; i++) {
+                this.now.addAndGet(20_000_000_000L);
+                b.probeTick();
+                for (int j = 0; j < 50 && admission.connections() > 0; j++) {
+                    Thread.sleep(20);
+                }
+                assertEquals(0, admission.connections(), "failed probe must have released its socket");
+            }
+            assertTrue(b.probesSent() >= sentFail + 3);
+            assertEquals(hitsBeforeFail + 3, this.hits[0].get(), "ejecting probes must have reached the upstream");
+            assertTrue(pool.health.ejected(), "real upstream probe failures must still eject");
+            for (int i = 0; i < 50 && admission.connections() > 0; i++) {
+                Thread.sleep(20);
+            }
+            assertEquals(0, admission.connections());
+            stolen = admission.tryConnection();
+            assertNotNull(stolen);
+            this.now.addAndGet(1_100_000_000L);
+            int hitsBeforeHalfOpen = this.hits[0].get();
+            int sentHalfOpen = b.probesSent();
+            b.probeTick();
+            assertTrue(b.probesSent() > sentHalfOpen);
+            assertEquals(hitsBeforeHalfOpen, this.hits[0].get(), "half-open cap refusal must not contact the upstream");
+            assertTrue(pool.health.ejected(), "local cap refusal must not count as success");
+            stolen.release();
+            stolen = null;
+            this.failing.clear();
+            this.now.addAndGet(1_100_000_000L);
+            b.probeTick();
+            assertFalse(pool.health.ejected(),
+                    "endpoint must recover after the cap refusal released the half-open slot");
+            assertEquals(0, b.ejectedCount());
+        } finally {
+            if (stolen != null) {
+                stolen.release();
+            }
+        }
+    }
+
     @Test
     void publicConstructorHasNoAdmission() {
         EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
