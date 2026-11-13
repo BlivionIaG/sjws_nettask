@@ -13,6 +13,26 @@ WARMUP=${WARMUP:-5}
 NAGENTS=${NAGENTS:-20}
 export JAVA_HOME=${JAVA_HOME:-$HOME/jdk25/jdk-25.0.4.1+1}
 export PATH=$JAVA_HOME/bin:${PATH:-}
+# Thin jar: maven-jar-plugin writes Class-Path: lib/... relative to the jar,
+# and maven-dependency-plugin copies runtime deps to target/lib at package.
+# Launching a copied jar without that sibling lib/ fails in ConfigLoader
+# (NoClassDefFoundError: org/yaml/snakeyaml/... after master c9d8ae16).
+if [ ! -f "$JAR" ]; then
+  echo "one.sh: jar not found: $JAR" >&2
+  exit 3
+fi
+JAR="$(cd "$(dirname "$JAR")" && pwd)/$(basename "$JAR")"
+LIB_DIR="${SJWS_LIB_DIR:-$(dirname "$JAR")/lib}"
+if [ ! -d "$LIB_DIR" ] || ! compgen -G "$LIB_DIR/*.jar" >/dev/null; then
+  echo "one.sh: runtime classpath missing: expected dependency jars in $LIB_DIR" >&2
+  echo "one.sh: mvn package writes them via maven-dependency-plugin (copy-dependencies). Copy target/lib next to the jar, or set SJWS_LIB_DIR." >&2
+  exit 3
+fi
+if [ "$LIB_DIR" != "$(dirname "$JAR")/lib" ]; then
+  # Manifest Class-Path is relative to the jar. Symlink so `java -jar` keeps
+  # manifest Add-Opens / Enable-Native-Access.
+  ln -sfn "$LIB_DIR" "$(dirname "$JAR")/lib"
+fi
 mkdir -p "$WD/site" "$WD/swarm"
 echo hi > "$WD/site/hello.txt"
 # A1 fallback (Architecture 2026-10-30 13:12): HttpClient has no local-bind API, so raise
