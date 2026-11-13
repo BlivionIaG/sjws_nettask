@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -23,6 +24,7 @@ import sjws_nettask.core.RequestFilters;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
+import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.core.Validator;
 
 class CompressFilterTest {
@@ -467,5 +469,62 @@ class CompressFilterTest {
         @Override
         public void close() {
         }
+    }
+
+    @Test
+    void emitsGzipWhenIdentityIsRefusedEvenIfLarger() throws Exception {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of("min_size", "1")));
+        byte[] plain = null;
+        byte[] compressed = null;
+        for (int seed = 1; seed <= 50; seed++) {
+            var candidate = new byte[300];
+            new java.util.Random(seed).nextBytes(candidate);
+            var out = CompressFilter.gzipBytes(candidate);
+            if (out.length >= candidate.length) {
+                plain = candidate;
+                compressed = out;
+                break;
+            }
+        }
+        if (plain == null) {
+            fail("need an incompressible 300-byte payload");
+        }
+        var inner = new Response(200, ResponseHeaders.of().add("content-type", "text/plain"), Body.Bytes.of(plain));
+        var refused = call(filter, request("gzip, identity;q=0"), inner);
+        assertEquals("gzip", refused.headers().get("content-encoding"));
+        assertEquals(compressed.length, ((Body.Bytes) refused.body()).length());
+        assertFalse(CompressFilter.acceptsIdentity("gzip, identity;q=0"));
+        assertFalse(CompressFilter.acceptsIdentity("gzip, *;q=0"));
+        assertTrue(CompressFilter.acceptsIdentity("gzip"));
+        assertTrue(CompressFilter.acceptsIdentity("gzip, identity;q=0.1"));
+        var fallback = call(filter, request("gzip"), inner);
+        assertNull(fallback.headers().get("content-encoding"), "identity is still allowed when not refused");
+        assertEquals(plain.length, ((Body.Bytes) fallback.body()).length());
+        // *;q=0 without identity also forbids the identity fallback
+        var star = call(filter, request("gzip, *;q=0"), inner);
+        assertEquals("gzip", star.headers().get("content-encoding"));
+    }
+
+    @Test
+    void preservesGeneratedMarkerWhenCopyingResponses() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of("min_size", "1")));
+        var generated = StaticFileHandler.error(404, false);
+        assertTrue(generated.generated());
+        var identity = call(filter, request(null), generated);
+        assertTrue(identity.generated(), "adding Vary must keep the generated marker");
+        assertEquals("Accept-Encoding", identity.headers().get("vary"));
+        assertEquals(404, identity.status());
+        var gzipped = call(filter, request("gzip"), generated);
+        assertTrue(gzipped.generated(), "compressing a generated error must keep the marker");
+        assertEquals("gzip", gzipped.headers().get("content-encoding"));
+        assertEquals(404, gzipped.status());
+        var page = new Response(200, ResponseHeaders.of().add("content-type", "text/html; charset=UTF-8")
+                .add("etag", "\"err\""), Body.Bytes.of("not found".repeat(4).getBytes(StandardCharsets.UTF_8)),
+                false, false, true);
+        var notModified = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-none-match", List.of(CompressFilter.withCoding("\"err\"", "gzip"))))), page);
+        assertEquals(304, notModified.status());
+        assertTrue(notModified.generated(), "a gzip 304 must keep the generated marker");
     }
 }

@@ -98,7 +98,7 @@ public final class CompressFilter implements RequestFilter {
             if (compressedValidatorHits(request, response)) {
                 return notModifiedGzip(response);
             }
-            return gzip(response);
+            return gzip(response, acceptsIdentity(request.headers().acceptEncoding()));
         }
         if (compressible(response)) {
             // Identity is still negotiated: caches must not reuse it for a gzip request.
@@ -135,13 +135,13 @@ public final class CompressFilter implements RequestFilter {
         };
     }
 
-    private Response gzip(Response response) {
+    private Response gzip(Response response, boolean identityOk) {
         try {
             return switch (response.body()) {
-                case Body.Bytes bytes -> buffered(response, read(bytes.data().duplicate()), false);
-                case Body.FileBody file when file.length() <= this.maxBuffer -> buffered(response, read(file), false);
+                case Body.Bytes bytes -> buffered(response, read(bytes.data().duplicate()), false, identityOk);
+                case Body.FileBody file when file.length() <= this.maxBuffer -> buffered(response, read(file), false, identityOk);
                 case Body.FileBody file -> streamFile(response, file);
-                case Body.Stream stream -> buffered(response, read(stream), true);
+                case Body.Stream stream -> buffered(response, read(stream), true, identityOk);
                 default -> response;
             };
         } catch (IOException e) {
@@ -152,25 +152,28 @@ public final class CompressFilter implements RequestFilter {
         }
     }
 
-    private static Response buffered(Response original, byte[] plain, boolean consumed) throws IOException {
+    private static Response buffered(Response original, byte[] plain, boolean consumed, boolean identityOk)
+            throws IOException {
         var compressed = gzipBytes(plain);
-        if (compressed.length >= plain.length) {
+        if (compressed.length >= plain.length && identityOk) {
             // A consumed stream cannot be re-read; return the bytes we already own.
             var identity = consumed
-                    ? new Response(original.status(), original.headers(), Body.Bytes.of(plain),
-                            original.headOnly(), original.localAdmission())
+                    ? copy(original, original.headers(), Body.Bytes.of(plain))
                     : original;
             return withAcceptEncodingVary(identity);
         }
-        return new Response(original.status(), encodedHeaders(original.headers()),
-                Body.Bytes.of(compressed), original.headOnly(), original.localAdmission());
+        return copy(original, encodedHeaders(original.headers()), Body.Bytes.of(compressed));
     }
 
     private static Response streamFile(Response original, Body.FileBody file) throws IOException {
         var channel = SafeOpen.open(file);
-        return new Response(original.status(), encodedHeaders(original.headers()),
-                new Body.Stream(-1, new GzipFileSource(channel, file)), original.headOnly(),
-                original.localAdmission());
+        return copy(original, encodedHeaders(original.headers()),
+                new Body.Stream(-1, new GzipFileSource(channel, file)));
+    }
+
+    private static Response copy(Response original, ResponseHeaders headers, Body body) {
+        return new Response(original.status(), headers, body, original.headOnly(),
+                original.localAdmission(), original.generated());
     }
 
     static byte[] gzipBytes(byte[] plain) throws IOException {
@@ -242,15 +245,14 @@ public final class CompressFilter implements RequestFilter {
 
     static Response notModifiedGzip(Response original) {
         return new Response(304, encodedHeaders(original.headers()), Body.Empty.INSTANCE,
-                original.headOnly(), original.localAdmission());
+                original.headOnly(), original.localAdmission(), original.generated());
     }
 
     static Response withAcceptEncodingVary(Response response) {
         var headers = response.headers().copy();
         var vary = mergeVary(headers);
         headers.set("vary", vary == null ? "Accept-Encoding" : vary);
-        return new Response(response.status(), headers, response.body(), response.headOnly(),
-                response.localAdmission());
+        return copy(response, headers, response.body());
     }
 
     /** True if any request Cache-Control field carries {@code directive} (RFC 9111). */
@@ -325,6 +327,48 @@ public final class CompressFilter implements RequestFilter {
         }
         double effective = gzipQ != null ? gzipQ : (starQ != null ? starQ : 0);
         return effective > 0;
+    }
+
+    /**
+     * Identity is acceptable unless the request refuses it with {@code identity;q=0} or
+     * {@code *;q=0} and no more specific identity entry (RFC 9110 12.5.3).
+     */
+    static boolean acceptsIdentity(String acceptEncoding) {
+        if (acceptEncoding == null || acceptEncoding.isBlank()) {
+            return true;
+        }
+        Double identityQ = null;
+        Double starQ = null;
+        for (var part : acceptEncoding.split(",")) {
+            var item = part.trim();
+            if (item.isEmpty()) {
+                continue;
+            }
+            int semi = item.indexOf(';');
+            var token = (semi < 0 ? item : item.substring(0, semi)).trim().toLowerCase(Locale.ROOT);
+            double q = 1;
+            if (semi >= 0) {
+                q = quality(item.substring(semi + 1));
+            }
+            if (q < 0) {
+                q = 0;
+            } else if (q > 1) {
+                q = 1;
+            }
+            switch (token) {
+                case "identity" -> identityQ = q;
+                case "*" -> starQ = q;
+                default -> {
+                }
+            }
+        }
+        if (identityQ != null) {
+            return identityQ > 0;
+        }
+        if (starQ != null) {
+            return starQ > 0;
+        }
+        return true;
     }
 
     private static double quality(String params) {
