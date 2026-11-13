@@ -137,8 +137,9 @@ class UpstreamPoolConnectTest {
     @Timeout(30)
     void timedOutConnectHoldsTheSlotUntilTheChannelCloses() throws Exception {
         var admission = Admission.of(0, 1);
-        try (var server = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
-                var pool = new UpstreamPool(URI.create("http://127.0.0.1:" + server.getLocalPort() + "/"),
+        // A listening ServerSocket would complete the TCP handshake into its backlog and
+        // acquire() would succeed; TEST-NET-1 is unroutable so the connect stays in flight.
+        try (var pool = new UpstreamPool(URI.create("http://192.0.2.1:9/"),
                         Duration.ofSeconds(5), 4, new ByteBudget(1 << 20), admission)) {
             var started = new CountDownLatch(1);
             var finished = new CompletableFuture<Throwable>();
