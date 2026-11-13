@@ -17,9 +17,9 @@
 package sjws_nettask.http1;
 
 /**
- * Incremental decoder of a chunked request body (RFC 9112 §7.1) that only measures and discards
- * the content: the static server has no use for request bodies, but must consume them exactly to
- * keep a persistent connection in sync.
+ * Incremental decoder of a chunked request body (RFC 9112 §7.1). The static file path discards
+ * the content (it must still consume framing to keep a persistent connection in sync). A proxy
+ * can also copy chunk data into a caller buffer via {@link #feed(byte[], int, int, byte[], int, int)}.
  * <p>
  * Strict, like {@link Http1Parser}: chunk sizes are 1-16 hex digits; chunk extensions and trailer
  * fields are skipped (each line bounded by {@code maxLineLength}); the CRLF after chunk data is
@@ -44,6 +44,7 @@ public final class ChunkedDecoder {
     private int lineLength;
     private int trailers;
     private boolean lastChunk;
+    private int copied; // data bytes written to the destination of the last copying feed
 
     public ChunkedDecoder(int maxLineLength, int maxTrailers, long maxBody) {
         this.maxLineLength = maxLineLength;
@@ -61,6 +62,7 @@ public final class ChunkedDecoder {
         this.lineLength = 0;
         this.trailers = 0;
         this.lastChunk = false;
+        this.copied = 0;
     }
 
     /** @return true once the last chunk and the trailer section have been consumed */
@@ -86,11 +88,26 @@ public final class ChunkedDecoder {
      * @throws ParseError (400) on malformed framing
      */
     public int feed(byte[] buf, int off, int len) throws ParseError {
+        return feed(buf, off, len, null, 0, 0);
+    }
+
+    /**
+     * Consumes from {@code buf} and copies chunk-data bytes into {@code dst}. Returns bytes
+     * consumed from {@code buf}. {@link #copied()} is how many data bytes were written to {@code dst}
+     * (0 when {@code dst} is null, i.e. discard). Stops early when {@code dst} is full, leaving the
+     * decoder mid-chunk so the next call can continue.
+     */
+    public int feed(byte[] buf, int off, int len, byte[] dst, int dstOff, int dstLen) throws ParseError {
+        this.copied = 0;
         int i = off;
         int end = off + len;
         while (i < end && this.state != State.DONE && !overLimit()) {
             if (this.state == State.DATA) {
-                i += data(end - i);
+                int cap = dst == null ? Integer.MAX_VALUE : dstLen - this.copied;
+                if (cap == 0) {
+                    break;
+                }
+                i += data(buf, i, end - i, dst, dst == null ? 0 : dstOff + this.copied, cap);
                 continue;
             }
             step(buf[i++]);
@@ -100,11 +117,21 @@ public final class ChunkedDecoder {
 
     /** As {@link #feed(byte[], int, int)}, reading {@code buf} (heap or direct) with absolute gets from {@code off}. */
     public int feed(java.nio.ByteBuffer buf, int off, int len) throws ParseError {
+        return feed(buf, off, len, null, 0, 0);
+    }
+
+    /** As {@link #feed(byte[], int, int, byte[], int, int)} over a heap or direct buffer. */
+    public int feed(java.nio.ByteBuffer buf, int off, int len, byte[] dst, int dstOff, int dstLen) throws ParseError {
+        this.copied = 0;
         int i = off;
         int end = off + len;
         while (i < end && this.state != State.DONE && !overLimit()) {
             if (this.state == State.DATA) {
-                i += data(end - i);
+                int cap = dst == null ? Integer.MAX_VALUE : dstLen - this.copied;
+                if (cap == 0) {
+                    break;
+                }
+                i += data(buf, i, end - i, dst, dst == null ? 0 : dstOff + this.copied, cap);
                 continue;
             }
             step(buf.get(i++));
@@ -112,8 +139,34 @@ public final class ChunkedDecoder {
         return i - off;
     }
 
-    private int data(int available) {
+    /** Data bytes written to the destination of the last copying {@code feed}. */
+    public int copied() {
+        return this.copied;
+    }
+
+    private int data(byte[] src, int srcOff, int available, byte[] dst, int dstOff, int cap) {
+        int n = take(available, cap, dst != null);
+        if (dst != null) {
+            System.arraycopy(src, srcOff, dst, dstOff, n);
+            this.copied += n;
+        }
+        return n;
+    }
+
+    private int data(java.nio.ByteBuffer src, int srcOff, int available, byte[] dst, int dstOff, int cap) {
+        int n = take(available, cap, dst != null);
+        if (dst != null) {
+            src.get(srcOff, dst, dstOff, n);
+            this.copied += n;
+        }
+        return n;
+    }
+
+    private int take(int available, int cap, boolean limited) {
         int n = (int) Math.min(this.remaining, available);
+        if (limited) {
+            n = Math.min(n, cap);
+        }
         this.remaining -= n;
         if (this.remaining == 0) {
             this.state = State.DATA_CR;

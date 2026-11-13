@@ -30,6 +30,7 @@ import java.util.function.Supplier;
 
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
+import sjws_nettask.core.RequestBody;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.StaticFileHandler;
@@ -349,15 +350,20 @@ final class Http1Connection implements Runnable {
             // body is offered to the handler as a pull-style RequestBody and never read just to
             // reject it: the connection is kept only if the handler consumed the body whole.
             boolean keepAlive = keep(request.keepAlive() && !request.hasBody());
-            BodyReader body = null;
-            if (!request.chunked() && request.contentLength() > 0) {
+            RequestBody body = null;
+            if (request.chunked()) {
+                body = new ChunkedBodyReader(request.expectContinue(), out, timer);
+                core = core.withBody(body);
+            } else if (request.contentLength() > 0) {
                 body = new BodyReader(request.contentLength(), request.expectContinue(), out, timer);
                 core = core.withBody(body);
             }
             timer.processing();
             var response = apply(core);
-            if (body != null) {
-                keepAlive = keep(request.keepAlive() && body.complete());
+            if (body instanceof BodyReader fixed) {
+                keepAlive = keep(request.keepAlive() && fixed.complete());
+            } else if (body instanceof ChunkedBodyReader chunked) {
+                keepAlive = keep(request.keepAlive() && chunked.complete());
             }
             keepAlive = framing(response, request, keepAlive);
             send(out, response, keepAlive);
@@ -467,6 +473,93 @@ final class Http1Connection implements Runnable {
             Http1Connection.this.in.get(into, off, n);
             this.remaining -= n;
             return n;
+        }
+    }
+
+
+    /**
+     * A chunked request body pulled by the handler. Length is unknown ({@code -1}); each wait is
+     * bounded by the write timeout, and 100 Continue is sent before the first read. The decoder
+     * has no tight content cap so a route can enforce {@code max_body} itself (413). Unread
+     * remainder, a malformed frame, or a client reset closes the connection.
+     */
+    private final class ChunkedBodyReader implements sjws_nettask.core.RequestBody {
+        private final ChannelOutput out;
+        private final ConnectionReaper.Timer timer;
+        private final ChunkedDecoder decoder = new ChunkedDecoder(CONSTANTS.MAX_LINE_LENGTH, CONSTANTS.MAX_HEADERS,
+                Long.MAX_VALUE / 2);
+        private boolean continueDue;
+        private boolean done;
+        private boolean failed;
+
+        ChunkedBodyReader(boolean expectContinue, ChannelOutput out, ConnectionReaper.Timer timer) {
+            this.continueDue = expectContinue;
+            this.out = out;
+            this.timer = timer;
+        }
+
+        boolean complete() {
+            return this.done && !this.failed;
+        }
+
+        @Override
+        public long length() {
+            return -1;
+        }
+
+        @Override
+        public int read(byte[] into, int off, int len) throws IOException {
+            if (this.done || this.failed) {
+                return this.failed ? throwFailed() : -1;
+            }
+            if (len == 0) {
+                return 0;
+            }
+            if (this.continueDue) {
+                this.continueDue = false;
+                this.out.write(CONTINUE);
+            }
+            int copied = 0;
+            try {
+                while (copied == 0 && !this.decoder.isComplete()) {
+                    if (hasInput()) {
+                        int used = Http1Connection.this.in.hasArray()
+                                ? this.decoder.feed(Http1Connection.this.in.array(),
+                                        Http1Connection.this.in.arrayOffset() + Http1Connection.this.in.position(),
+                                        Http1Connection.this.in.remaining(), into, off, len)
+                                : this.decoder.feed(Http1Connection.this.in, Http1Connection.this.in.position(),
+                                        Http1Connection.this.in.remaining(), into, off, len);
+                        Http1Connection.this.in.position(Http1Connection.this.in.position() + used);
+                        copied = this.decoder.copied();
+                        if (copied > 0) {
+                            return copied;
+                        }
+                        if (this.decoder.overLimit()) {
+                            this.failed = true;
+                            throw new IOException("chunked request body exceeded the decoder limit");
+                        }
+                        continue;
+                    }
+                    this.timer.writing();
+                    try {
+                        if (fill() < 0) {
+                            this.failed = true;
+                            throw new IOException("client closed the connection mid-chunked body");
+                        }
+                    } finally {
+                        this.timer.processing();
+                    }
+                }
+            } catch (sjws_nettask.http1.ParseError e) {
+                this.failed = true;
+                throw new IOException(e.getMessage(), e);
+            }
+            this.done = true;
+            return -1;
+        }
+
+        private int throwFailed() throws IOException {
+            throw new IOException("chunked request body is no longer readable");
         }
     }
 

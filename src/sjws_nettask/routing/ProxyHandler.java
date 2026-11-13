@@ -64,7 +64,8 @@ import sjws_nettask.core.StaticFileHandler;
  * {@code X-Forwarded-Host} carries the client's Host. {@code Host} is the upstream's authority, or
  * the client's with {@code preserveHost}.
  * <p>
- * Errors: a chunked request body is 501 (not supported yet); a body over {@code maxBody} 413;
+ * Errors: a declared body the transport did not attach is 501; a body over {@code maxBody} 413
+ * (for a known length, before any upstream write; for an unknown length, as the body is read);
  * connect/IO failures before the response head 502 (one retry on a fresh connection when a
  * pooled one turned out stale and the request had no body); connect or response-head timeouts
  * 504; a non-origin-form target or an unusable method 400. After the head, a failure aborts the
@@ -223,11 +224,8 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     @Override
     public Response handle(Request request) {
         boolean head = request.headOnly();
-        if (!request.headers().values("transfer-encoding").isEmpty()) {
-            return StaticFileHandler.error(501, head);
-        }
         long length = request.body().length();
-        if (length < 0 || request.body() == sjws_nettask.core.RequestBody.EMPTY && hasDeclaredBody(request)) {
+        if (request.body() == sjws_nettask.core.RequestBody.EMPTY && hasDeclaredBody(request)) {
             return StaticFileHandler.error(501, head); // a body the transport could not attach
         }
         if (length > this.settings.maxBody()) {
@@ -246,6 +244,8 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         if (this.retry == null && this.breaker == null) {
             try {
                 return exchange(request, out, length, true);
+            } catch (RequestBodyTooLarge e) {
+                return StaticFileHandler.error(413, head);
             } catch (IOException e) {
                 return StaticFileHandler.error(status(e), head);
             } catch (InterruptedException e) {
@@ -263,12 +263,9 @@ public final class ProxyHandler implements Handler, AutoCloseable {
      */
     Response attempt(Request request) throws IOException, InterruptedException {
         boolean head = request.headOnly();
-        if (!request.headers().values("transfer-encoding").isEmpty()) {
-            return StaticFileHandler.error(501, head);
-        }
         long length = request.body().length();
-        if (length < 0 || request.body() == sjws_nettask.core.RequestBody.EMPTY && hasDeclaredBody(request)) {
-            return StaticFileHandler.error(501, head);
+        if (request.body() == sjws_nettask.core.RequestBody.EMPTY && hasDeclaredBody(request)) {
+            return StaticFileHandler.error(501, head); // a body the transport could not attach
         }
         if (length > this.settings.maxBody()) {
             return StaticFileHandler.error(413, head);
@@ -283,7 +280,11 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         } catch (IllegalArgumentException e) {
             return StaticFileHandler.error(400, head);
         }
-        return exchange(request, out, length, true);
+        try {
+            return exchange(request, out, length, true);
+        } catch (RequestBodyTooLarge e) {
+            return StaticFileHandler.error(413, head);
+        }
     }
 
     /**
@@ -388,6 +389,11 @@ public final class ProxyHandler implements Handler, AutoCloseable {
             try {
                 response = exchange(request, tries == 0 ? out : rebuild(out), length, true);
                 failed = kind(response);
+            } catch (RequestBodyTooLarge e) {
+                if (this.breaker != null) {
+                    this.breaker.release(); // local 413, not an upstream verdict
+                }
+                return StaticFileHandler.error(413, head);
             } catch (IOException e) {
                 failed = kind(e);
                 errorStatus = status(e);
@@ -434,6 +440,9 @@ public final class ProxyHandler implements Handler, AutoCloseable {
 
     /** A body announced by Content-Length that the transport did not attach (HTTP/2 today). */
     private static boolean hasDeclaredBody(Request request) {
+        if (!request.headers().values("transfer-encoding").isEmpty()) {
+            return true;
+        }
         for (var v : request.headers().values("content-length")) {
             if (!v.equals("0")) {
                 return true;
@@ -451,7 +460,7 @@ public final class ProxyHandler implements Handler, AutoCloseable {
                 budget.peerStripe(request.peer()));
         HttpResponse response;
         try {
-            if (length > 0) {
+            if (length != 0) {
                 ex.start();
                 await(ch.writeAndFlush(out), this.settings.responseTimeout());
                 sendBody(request, ch, length);
@@ -488,17 +497,35 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     private void sendBody(Request request, io.netty.channel.Channel ch, long length) throws IOException, InterruptedException {
         var body = request.body();
         long sent = 0;
-        byte[] chunk = new byte[(int) Math.min(BODY_CHUNK, length)];
-        while (sent < length) {
-            int n = body.read(chunk, 0, (int) Math.min(chunk.length, length - sent));
+        long cap = length >= 0 ? length : Long.MAX_VALUE;
+        byte[] chunk = new byte[length >= 0 ? (int) Math.min(BODY_CHUNK, length) : BODY_CHUNK];
+        if (chunk.length == 0) {
+            chunk = new byte[1];
+        }
+        while (sent < cap) {
+            int want = length >= 0 ? (int) Math.min(chunk.length, length - sent) : chunk.length;
+            int n = body.read(chunk, 0, want);
             if (n < 0) {
-                throw new IOException("request body ended early");
+                if (length >= 0) {
+                    throw new IOException("request body ended early");
+                }
+                break;
+            }
+            if (sent + n > this.settings.maxBody()) {
+                throw new RequestBodyTooLarge();
             }
             sent += n;
             await(ch.writeAndFlush(new DefaultHttpContent(Unpooled.copiedBuffer(chunk, 0, n))),
                     this.settings.responseTimeout());
         }
         await(ch.writeAndFlush(LastHttpContent.EMPTY_LAST_CONTENT), this.settings.responseTimeout());
+    }
+
+    /** An unknown-length request body grew past {@code max_body} while it was being forwarded. */
+    static final class RequestBodyTooLarge extends IOException {
+        RequestBodyTooLarge() {
+            super("request body exceeded max_body");
+        }
     }
 
     /**
@@ -527,7 +554,7 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         }
         var method = HttpMethod.valueOf(request.method()); // validates the token
         var uri = this.basePath + request.target();
-        HttpRequest out = length > 0 ? new DefaultHttpRequest(HttpVersion.HTTP_1_1, method, uri)
+        HttpRequest out = length != 0 ? new DefaultHttpRequest(HttpVersion.HTTP_1_1, method, uri)
                 : new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, method, uri, Unpooled.EMPTY_BUFFER);
         var b = out.headers();
         var h = request.headers();
@@ -552,6 +579,8 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         }
         if (length > 0) {
             b.set("Content-Length", Long.toString(length));
+        } else if (length < 0) {
+            HttpUtil.setTransferEncodingChunked(out, true);
         }
         var proto = this.settings.proto() != null ? this.settings.proto() : request.secure() ? "https" : "http";
         boolean trusted = trusted(request);

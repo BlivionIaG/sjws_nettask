@@ -146,24 +146,23 @@ The client's own deadlines also stay in force, such as the write timeout via `Co
 | connect or response-head timeout | 504 |
 | failure after the head was sent (mid-body) | abort the connection/stream (never a short 200) |
 | request body over `max_body` | 413 |
-| `Transfer-Encoding` request, or a body the transport could not attach | 501 |
+| a declared body the transport could not attach | 501 |
 | target not origin-form, invalid method | 400 (normally caught earlier by the parser) |
 
 The proxy does not log upstream failures itself: they surface as 502/504 responses, in the access log and in the metrics.
 
-The order in which `ProxyHandler` decides. Each of the first five steps answers with the status shown
-when its condition holds, and otherwise passes the request on. Step 5 exists only when `circuit` is set
+The order in which `ProxyHandler` decides. Each of the first four steps answers with the status shown
+when its condition holds, and otherwise passes the request on. Step 4 exists only when `circuit` is set
 on the upstream. An upstream with `endpoints` goes through an `EndpointBalancer` first, which picks an
-endpoint and then runs steps 1 to 4 on that endpoint's pool, with no step 5 (it skips ejected endpoints
+endpoint and then runs steps 1 to 3 on that endpoint's pool, with no step 4 (it skips ejected endpoints
 instead, see [endpoint discovery](../ha/discovery.md)):
 
 ```mermaid
 flowchart TD
-    c1["1. Any Transfer-Encoding<br/>header: 501"] --> c2["2. A body of unknown<br/>length, or one the<br/>transport did not attach:<br/>501"]
-    c2 --> c3["3. Body over max_body: 413"]
-    c3 --> c4["4. Target not<br/>origin-form, bad method<br/>or bad header value: 400"]
-    c4 --> c5["5. Circuit open, only<br/>with circuit set: 503<br/>with Retry-After, the<br/>upstream is not contacted"]
-    c5 --> x["Send over a pooled<br/>keep-alive connection, or<br/>open one. The body goes<br/>upstream in 64 KiB chunks"]
+    c1["1. A declared body the<br/>transport did not attach:<br/>501"] --> c2["2. Known length over<br/>max_body: 413"]
+    c2 --> c3["3. Target not<br/>origin-form, bad method<br/>or bad header value: 400"]
+    c3 --> c4["4. Circuit open, only<br/>with circuit set: 503<br/>with Retry-After, the<br/>upstream is not contacted"]
+    c4 --> x["Send over a pooled<br/>keep-alive connection, or<br/>open one. The body goes<br/>upstream in 64 KiB chunks<br/>Unknown length uses chunked;<br/>max_body 413 if it grows too far"]
     x --> o{"Outcome"}
     o -->|"connect, write or<br/>head timeout"| e504["504"]
     o -->|"refused, reset, I/O error<br/>or a malformed response"| e502["502"]
@@ -258,7 +257,7 @@ Before phase 2, `Request(method, target, RequestHeaders)` carried only the stati
 
 | Gap | Change |
 |---|---|
-| Request body | `Request.body(): RequestBody` with `RequestBody.EMPTY` default. It is a pull-style `InputStream`-like source with known/unknown length. Only HTTP/1.1 attaches one today, for a `Content-Length` request (`Http1Connection.BodyReader`). The static handler ignores it, and the transport closes the connection if the handler leaves any of it unread. |
+| Request body | `Request.body(): RequestBody` with `RequestBody.EMPTY` default. It is a pull-style `InputStream`-like source with known/unknown length. HTTP/1.1 attaches a `Content-Length` or chunked body (`Http1Connection.BodyReader` / `ChunkedBodyReader`). HTTP/2 (when `attachBodies` is on) and HTTP/3 attach one as well, with length -1 when no `content-length` was sent. The static handler ignores it, and the transport closes the connection if the handler leaves any of it unread. |
 | Client address | `Request.peer(): InetSocketAddress` (nullable in tests), plus `secure(): boolean` for proto and `protocol()`. |
 | Arbitrary headers | `RequestHeaders.fields()` (a lower-cased map) and `all(): List<Map.Entry<String,String>>`. The existing typed fields stay as they are. HTTP/1.1 always fills the map, HTTP/3 only when a filter chain or a non-static terminal is installed at startup, and HTTP/2 (h2/h2c streams and the HTTP/1.1 ALPN fallback) when `attachBodies` is on (empty on the static-only path). |
 | Streaming response body | A new `Body.Stream(long lengthOrMinus1, Source)` variant. Writers use chunked encoding (HTTP/1.1, or close-delimited for 1.0) or DATA frames (HTTP/2 and HTTP/3) when the length is unknown. An abort on source error is never a short response. |
@@ -347,7 +346,7 @@ Phases 1 and 2 shipped (§12), and phase 3 as the gateway features B.1-B.4 (§13
   - h2 waits for writability before each chunk, and ends with an empty DATA frame carrying END_STREAM.
   - h3 shuts down the stream output at the end.
   - The h2 → HTTP/1.1 fallback sets chunked for an unknown length.
-- Request bodies: HTTP/1.1 requests with Content-Length are streamed through `Http1Connection.BodyReader`. The reader sends `100 Continue` on its first read, and each read is bounded by the write deadline. A body the handler does not read in full closes the connection. A chunked request body is not attached, and the proxy answers it with 501, as it did in phase 1; so does a declared body that the transport did not attach. HTTP/1.1 and HTTP/3 (#281) attach request bodies; HTTP/2 does not yet (§8).
+- Request bodies: HTTP/1.1 streams Content-Length bodies through `Http1Connection.BodyReader` and chunked bodies through `Http1Connection.ChunkedBodyReader`. The reader sends `100 Continue` on its first read, and each read is bounded by the write deadline. A body the handler does not read in full closes the connection. HTTP/2 (when `attachBodies` is on; #296 / #301) and HTTP/3 (#281) attach request bodies the same way, with length -1 when no `content-length` was sent. The proxy forwards an attached body of unknown length with `Transfer-Encoding: chunked` and enforces `max_body` as the body is read (413). A declared body that the transport did not attach is still 501.
 
 **Client (`routing.UpstreamPool` + `ProxyHandler`).**
 - The pipeline is `HttpClientCodec` + `Relay`, with autoRead off.
