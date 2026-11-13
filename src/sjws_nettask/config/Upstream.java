@@ -27,18 +27,19 @@ import java.time.Duration;
  * {@code Settings} record does not carry them yet.
  *
  * @param maxBody request body cap, bytes (fits in a positive {@code int})
+ * @param maxPending concurrent outstanding exchanges to this upstream, or 0 if unset
+ * @param maxConnections concurrent sockets to this upstream (in use, connecting, or idle), or 0 if unset
  * @param activeHealth optional active probes for a multi-endpoint upstream, or null when unset
  */
 public record Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout,
         Duration idleReadTimeout, int maxBody, boolean preserveHost, sjws_nettask.routing.Resilience resilience,
-        Upstream.Discovery discovery, sjws_nettask.routing.ActiveHealth activeHealth) {
+        int maxPending, int maxConnections, Upstream.Discovery discovery,
+        sjws_nettask.routing.ActiveHealth activeHealth) {
 
-    /** No active health probes. */
-    public Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout, Duration idleReadTimeout,
-            int maxBody, boolean preserveHost, sjws_nettask.routing.Resilience resilience,
-            Upstream.Discovery discovery) {
-        this(name, url, connectTimeout, responseTimeout, idleReadTimeout, maxBody, preserveHost, resilience, discovery,
-                null);
+    public Upstream {
+        if (maxPending < 0 || maxConnections < 0) {
+            throw new IllegalArgumentException("max_pending and max_connections must be >= 0");
+        }
     }
 
     /**
@@ -54,6 +55,30 @@ public record Upstream(String name, URI url, Duration connectTimeout, Duration r
             java.util.Objects.requireNonNull(lb, "lb");
             java.util.Objects.requireNonNull(outlier, "outlier");
         }
+    }
+
+    /** Limits unset, no active health probes (the usual constructor). */
+    public Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout, Duration idleReadTimeout,
+            int maxBody, boolean preserveHost, sjws_nettask.routing.Resilience resilience,
+            Upstream.Discovery discovery) {
+        this(name, url, connectTimeout, responseTimeout, idleReadTimeout, maxBody, preserveHost, resilience, 0, 0,
+                discovery, null);
+    }
+
+    /** No active health probes. */
+    public Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout, Duration idleReadTimeout,
+            int maxBody, boolean preserveHost, sjws_nettask.routing.Resilience resilience,
+            int maxPending, int maxConnections, Upstream.Discovery discovery) {
+        this(name, url, connectTimeout, responseTimeout, idleReadTimeout, maxBody, preserveHost, resilience,
+                maxPending, maxConnections, discovery, null);
+    }
+
+    /** Limits unset, optional active health. */
+    public Upstream(String name, URI url, Duration connectTimeout, Duration responseTimeout, Duration idleReadTimeout,
+            int maxBody, boolean preserveHost, sjws_nettask.routing.Resilience resilience,
+            Upstream.Discovery discovery, sjws_nettask.routing.ActiveHealth activeHealth) {
+        this(name, url, connectTimeout, responseTimeout, idleReadTimeout, maxBody, preserveHost, resilience, 0, 0,
+                discovery, activeHealth);
     }
 
     /** A single URL. */

@@ -114,6 +114,7 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
     private final AtomicInteger ejected = new AtomicInteger();
     private final AtomicInteger cursor = new AtomicInteger();
     private final AutoCloseable subscription;
+    private final Admission admission;
     private final ActiveHealth activeHealth;
     private final ScheduledExecutorService probes; // null when active health is unset
     private final ExecutorService probeWorkers; // null when unset
@@ -127,23 +128,35 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
     private volatile boolean closed; // set true before executors are shut down
 
     public EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier) {
-        this(source, pools, retry, outlier, Duration.ofSeconds(10), System::nanoTime, null);
+        this(source, pools, retry, outlier, Duration.ofSeconds(10), System::nanoTime, null, null);
+    }
+
+    /** @param admission shared pending/connection caps for the whole upstream, or null if unset */
+    public EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier,
+            Admission admission) {
+        this(source, pools, retry, outlier, Duration.ofSeconds(10), System::nanoTime, admission, null);
     }
 
     /** @param activeHealth optional probes, or null for none (no threads or timers) */
     public EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier,
             ActiveHealth activeHealth) {
-        this(source, pools, retry, outlier, Duration.ofSeconds(10), System::nanoTime, activeHealth);
+        this(source, pools, retry, outlier, Duration.ofSeconds(10), System::nanoTime, null, activeHealth);
+    }
+
+    /** @param admission shared caps, or null if unset; @param activeHealth optional probes, or null */
+    public EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier,
+            Admission admission, ActiveHealth activeHealth) {
+        this(source, pools, retry, outlier, Duration.ofSeconds(10), System::nanoTime, admission, activeHealth);
     }
 
     EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier, Duration grace,
             LongSupplier clock) {
-        this(source, pools, retry, outlier, grace, clock, null);
+        this(source, pools, retry, outlier, grace, clock, null, null);
     }
 
     EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier, Duration grace,
-            LongSupplier clock, ActiveHealth activeHealth) {
-        this(source, pools, retry, outlier, grace, clock, activeHealth, activeHealth != null);
+            LongSupplier clock, Admission admission, ActiveHealth activeHealth) {
+        this(source, pools, retry, outlier, grace, clock, admission, activeHealth, activeHealth != null);
     }
 
     /**
@@ -152,6 +165,11 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
      */
     EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier, Duration grace,
             LongSupplier clock, ActiveHealth activeHealth, boolean startScheduler) {
+        this(source, pools, retry, outlier, grace, clock, null, activeHealth, startScheduler);
+    }
+
+    EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier, Duration grace,
+            LongSupplier clock, Admission admission, ActiveHealth activeHealth, boolean startScheduler) {
         this.source = Objects.requireNonNull(source, "source");
         this.factory = Objects.requireNonNull(pools, "pools");
         this.retry = retry;
@@ -159,6 +177,7 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         this.outlier = outlier == null ? Outlier.DEFAULT : outlier;
         this.grace = grace;
         this.clock = clock;
+        this.admission = admission;
         this.activeHealth = activeHealth;
         this.subscription = source.subscribe(this::swap);
         var initial = source.current();
@@ -385,75 +404,101 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         if (v == null) {
             return StaticFileHandler.error(503, head); // never populated
         }
-        boolean mayRetry = retry != null && request.body().length() == 0 && ProxyHandler.idempotent(request.method());
-        if (retry != null) {
-            this.budget.deposit();
+        Admission.Hold pending = null;
+        if (this.admission != null && this.admission.limitsPending()) {
+            pending = this.admission.tryPending();
+            if (pending == null) {
+                return ProxyHandler.overloaded(head);
+            }
         }
-        int tries = nTried != null && tried != null ? nTried[0] : 0;
-        if (tried == null) {
-            tried = mayRetry ? new int[retry.attempts()] : null;
-            tries = 0;
-        }
-        while (true) {
-            long now = this.clock.getAsLong();
-            int i = pick(v, tried, tries, now);
-            if (i < 0) {
-                var refused = StaticFileHandler.error(503, head);
-                refused.headers().add("retry-after", Long.toString(retryAfterSeconds(v, now)));
-                return refused;
+        try {
+            boolean mayRetry = retry != null && request.body().length() == 0 && ProxyHandler.idempotent(request.method());
+            if (retry != null) {
+                this.budget.deposit();
             }
-            var pool = v.pools[i];
-            Resilience.On failed;
-            Response response = null;
-            int errorStatus = 0;
-            IOException transport = null;
-            pool.inflight.incrementAndGet();
-            try {
-                response = pool.proxy.attempt(request);
-                failed = ProxyHandler.kind(response);
-            } catch (IOException e) {
-                transport = e;
-                failed = ProxyHandler.kind(e);
-                errorStatus = ProxyHandler.status(e);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                pool.health.release();
-                if (rethrow) {
-                    throw e;
+            int tries = nTried != null && tried != null ? nTried[0] : 0;
+            if (tried == null) {
+                tried = mayRetry ? new int[retry.attempts()] : null;
+                tries = 0;
+            }
+            while (true) {
+                long now = this.clock.getAsLong();
+                int i = pick(v, tried, tries, now);
+                if (i < 0) {
+                    var refused = StaticFileHandler.error(503, head);
+                    refused.headers().add("retry-after", Long.toString(retryAfterSeconds(v, now)));
+                    var hold = pending;
+                    pending = null;
+                    return ProxyHandler.withPending(refused, hold);
                 }
-                return StaticFileHandler.error(502, head);
-            } finally {
-                pool.inflight.decrementAndGet();
-            }
-            if (ProxyHandler.isLocalRefusal(response)) {
-                // Peer-budget (or other local) admission: never contacted the endpoint.
-                // Release any half-open probe reservation taken in pick() (Codex P2 on #298).
-                pool.health.release();
-                return response;
-            }
-            if (failed == null) {
-                pool.health.success(this.clock.getAsLong());
-                return response;
-            }
-            pool.health.failure(this.clock.getAsLong());
-            if (tried != null && tries < tried.length) {
-                tried[tries] = i;
-            }
-            boolean again = mayRetry && tries < retry.attempts() && retry.on().contains(failed) && this.budget.withdraw();
-            if (tried != null && tries < tried.length) {
-                tries++;
-                if (nTried != null) {
-                    nTried[0] = tries;
+                var pool = v.pools[i];
+                Resilience.On failed;
+                Response response = null;
+                int errorStatus = 0;
+                IOException transport = null;
+                pool.inflight.incrementAndGet();
+                try {
+                    response = pool.proxy.attempt(request);
+                    failed = ProxyHandler.kind(response);
+                } catch (IOException e) {
+                    transport = e;
+                    failed = ProxyHandler.kind(e);
+                    errorStatus = ProxyHandler.status(e);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    pool.health.release();
+                    if (pending != null) {
+                        pending.release();
+                        pending = null;
+                    }
+                    if (rethrow) {
+                        throw e;
+                    }
+                    return StaticFileHandler.error(502, head);
+                } finally {
+                    pool.inflight.decrementAndGet();
+                }
+                if (ProxyHandler.isLocalRefusal(response)) {
+                    // Peer-budget (or other local) admission: never contacted the endpoint.
+                    // Release any half-open probe reservation taken in pick() (Codex P2 on #298).
+                    pool.health.release();
+                    var hold = pending;
+                    pending = null;
+                    return ProxyHandler.withPending(response, hold);
+                }
+                if (failed == null) {
+                    pool.health.success(this.clock.getAsLong());
+                    var hold = pending;
+                    pending = null;
+                    return ProxyHandler.withPending(response, hold);
+                }
+                pool.health.failure(this.clock.getAsLong());
+                if (tried != null && tries < tried.length) {
+                    tried[tries] = i;
+                }
+                boolean again = mayRetry && tries < retry.attempts() && retry.on().contains(failed) && this.budget.withdraw();
+                if (tried != null && tries < tried.length) {
+                    tries++;
+                    if (nTried != null) {
+                        nTried[0] = tries;
+                    }
+                }
+                if (!again) {
+                    if (rethrow && transport != null) {
+                        throw transport;
+                    }
+                    var out = response != null ? response : StaticFileHandler.error(errorStatus, head);
+                    var hold = pending;
+                    pending = null;
+                    return ProxyHandler.withPending(out, hold);
+                }
+                if (response != null) {
+                    Body.discard(response.body());
                 }
             }
-            if (!again) {
-                if (rethrow && transport != null) {
-                    throw transport;
-                }
-                return response != null ? response : StaticFileHandler.error(errorStatus, head);
-            }
-            if (response != null) {
-                Body.discard(response.body());
+        } finally {
+            if (pending != null) {
+                pending.release();
             }
         }
     }
@@ -600,6 +645,14 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                 if (e instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
                 }
+                // ConnectionLimit is a local cap refusal: the probe never reached the
+                // upstream, so it is neither a success nor a failure (Codex P2 on #475).
+                if (e instanceof UpstreamPool.ConnectionLimit) {
+                    if (heldHalfOpen) {
+                        pool.health.release();
+                    }
+                    return;
+                }
                 if (!this.closed && !pool.abandoned) {
                     pool.health.failure(this.clock.getAsLong());
                 } else if (heldHalfOpen) {
@@ -655,6 +708,10 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
     /** Ejected endpoints of the pools in use. */
     int ejectedCount() {
         return this.ejected.get();
+    }
+
+    public Admission admission() {
+        return this.admission;
     }
 
     public ActiveHealth activeHealth() {

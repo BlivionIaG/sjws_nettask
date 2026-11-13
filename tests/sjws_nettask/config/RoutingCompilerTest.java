@@ -98,6 +98,66 @@ class RoutingCompilerTest {
     }
 
     @Test
+    void admissionLimitsAreWiredOntoTheSharedProxy() throws IOException {
+        var unset = load("""
+                routing:
+                  enabled: true
+                  upstreams:
+                    api: { url: "http://127.0.0.1:9" }
+                  routes:
+                    - { prefix: /a, proxy: api }
+                """);
+        var unsetRouter = assertInstanceOf(Router.class,
+                ConfigSnapshot.compile(unset.document(), new sjws_nettask.acme.ChallengeBoard(), 1).handler());
+        var unsetProxy = assertInstanceOf(sjws_nettask.routing.ProxyHandler.class, unsetRouter.routes().get(0).handler());
+        assertNull(unsetProxy.admission());
+
+        var loaded = load("""
+                routing:
+                  enabled: true
+                  upstreams:
+                    api: { url: "http://127.0.0.1:9", max_pending: 3, max_connections: 2 }
+                  routes:
+                    - { prefix: /a, proxy: api }
+                    - { prefix: /b, proxy: api }
+                """);
+        var router = assertInstanceOf(Router.class,
+                ConfigSnapshot.compile(loaded.document(), new sjws_nettask.acme.ChallengeBoard(), 1).handler());
+        var proxy = assertInstanceOf(sjws_nettask.routing.ProxyHandler.class, router.routes().get(0).handler());
+        assertSame(proxy, router.routes().get(1).handler());
+        var admission = proxy.admission();
+        assertNotNull(admission);
+        assertTrue(admission.limitsPending());
+        assertTrue(admission.limitsConnections());
+        assertNotNull(admission.tryPending());
+        assertNotNull(admission.tryPending());
+        assertNotNull(admission.tryPending());
+        assertNull(admission.tryPending());
+        router.close();
+        unsetRouter.close();
+
+        var multi = load("""
+                routing:
+                  enabled: true
+                  upstreams:
+                    api:
+                      endpoints: ["http://127.0.0.1:9"]
+                      max_pending: 1
+                      max_connections: 1
+                  routes:
+                    - { prefix: /, proxy: api }
+                """);
+        var multiRouter = assertInstanceOf(Router.class,
+                ConfigSnapshot.compile(multi.document(), new sjws_nettask.acme.ChallengeBoard(), 1).handler());
+        var balancer = assertInstanceOf(sjws_nettask.routing.EndpointBalancer.class,
+                multiRouter.routes().get(0).handler());
+        assertNotNull(balancer.admission());
+        assertTrue(balancer.admission().limitsPending());
+        assertTrue(balancer.admission().limitsConnections());
+        multiRouter.close();
+    }
+
+    @Test
     void bracketedIpv6RouteHosts() throws IOException {
         var loaded = load("""
                 routing:
