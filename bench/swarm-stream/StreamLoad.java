@@ -129,6 +129,8 @@ public class StreamLoad {
   static final LatBag LAT_CO = new LatBag();
   /** #415 schedule lag (slot -> send start, µs) for in-window paced slots (Architecture item 5). */
   static final LatBag LAG = new LatBag();
+  /** Smoke e: first measure second vs the rest, so a start-of-window catch-up burst is visible. */
+  static final LatBag LAG_FIRST = new LatBag(), LAG_REST = new LatBag();
   /** #415 pacing: in-window slot sends, sends started > 1 ms after their slot, worst lag. */
   static final LongAdder SCHED_SENDS = new LongAdder(), SCHED_LATE = new LongAdder();
   static final LongAccumulator SCHED_LAG_MAX_NS = new LongAccumulator(Long::max, 0L);
@@ -308,6 +310,10 @@ public class StreamLoad {
     long claimDelayMs = 0;
     /** Test-only (#415 smoke): every Nth consumer opens the session then does not read until cutoff. 0 = off. */
     int hangEvery = 0;
+    /** #415 (B): first group id this process owns; pools are label+(groupOffset+i%gCount). */
+    int groupOffset = 0;
+    /** Seconds to wait for claims/:stream to finish before the measure window opens. */
+    double admitTimeoutS = 30;
   }
 
   public static void main(String[] a) throws Exception {
@@ -373,6 +379,11 @@ public class StreamLoad {
     fail += selfCheck("phantom streams", SCHED_PHANTOM_STREAMS.sum() == 1);
     fail += selfCheck("phantom expected", SCHED_EXPECTED.sum() == exp + per);
     fail += selfCheck("phantom unreceived", SCHED_UNRECEIVED.sum() == per);
+    fail += selfCheck("retry-after default", retryAfterMs(null, 1000) == 1000);
+    fail += selfCheck("retry-after 1s", retryAfterMs("1", 1000) == 1000);
+    fail += selfCheck("retry-after 0.2s min 50", retryAfterMs("0.02", 1000) == 50);
+    fail += selfCheck("retry-after cap 5s", retryAfterMs("30", 1000) == 5000);
+    fail += selfCheck("retry-after junk", retryAfterMs("Fri, 01 Jan", 1000) == 1000);
     return fail;
   }
 
@@ -405,7 +416,7 @@ public class StreamLoad {
     wave(http, args, tokens, Math.min(32, args.streams), args.warmup, "w", false,
         inTeardown, bytesRx, creditWaits,
         measureErr, teardownErr, requests, credit429, producerTransportRetries, consumerConnectRetries, groupOpenRefusals);
-    bytesRx.reset(); LAT.clearAll(); LAT_CO.clearAll(); LAG.clearAll(); creditWaits.clear();
+    bytesRx.reset(); LAT.clearAll(); LAT_CO.clearAll(); LAG.clearAll(); LAG_FIRST.clearAll(); LAG_REST.clearAll(); creditWaits.clear();
     SCHED_SENDS.reset(); SCHED_LATE.reset(); SCHED_LAG_MAX_NS.reset(); measureErr.clear(); teardownErr.clear();
     for (LongAdder c : List.of(SCHED_EXPECTED, SCHED_SENT, SCHED_RECEIVED, SCHED_UNRECEIVED,
         SCHED_PHANTOM_STREAMS, SCHED_STAMP_FALLBACK, SCHED_INFLIGHT_AT_END, SCHED_STREAMS_SHORT,
@@ -487,7 +498,10 @@ public class StreamLoad {
     r.p50Sched = LAT_CO.pctFromBuckets(0.50); r.p90Sched = LAT_CO.pctFromBuckets(0.90); r.p99Sched = LAT_CO.pctFromBuckets(0.99);
     r.latHistSend = LAT.sparseJson(); r.latHistSched = LAT_CO.sparseJson();
     if (paced && LAG.count() > 0) { r.lagP50 = LAG.pctFromBuckets(0.50); r.lagP99 = LAG.pctFromBuckets(0.99); }
-    LAT.clearAll(); LAT_CO.clearAll(); LAG.clearAll();
+    if (paced && LAG_FIRST.count() > 0) r.lagFirstP99 = LAG_FIRST.pctFromBuckets(0.99);
+    if (paced && LAG_REST.count() > 0) r.lagRestP99 = LAG_REST.pctFromBuckets(0.99);
+    r.lagHist = LAG.sparseJson(); r.lagFirstHist = LAG_FIRST.sparseJson(); r.lagRestHist = LAG_REST.sparseJson();
+    LAT.clearAll(); LAT_CO.clearAll(); LAG.clearAll(); LAG_FIRST.clearAll(); LAG_REST.clearAll();
     r.schedExpected = SCHED_EXPECTED.sum(); r.schedSent = SCHED_SENT.sum();
     r.schedReceived = SCHED_RECEIVED.sum(); r.schedUnreceived = SCHED_UNRECEIVED.sum();
     r.schedPhantomStreams = SCHED_PHANTOM_STREAMS.sum(); r.schedStampFallback = SCHED_STAMP_FALLBACK.sum();
@@ -552,8 +566,12 @@ public class StreamLoad {
     int gCount = Math.max(1, Math.min(args.groups > 0 ? args.groups : n, n));
     int[] mapping = new int[n];
     List<Thread> consumers = new ArrayList<>(n), producers = new ArrayList<>(n);
+    // Wait for every claim/:stream to finish (or fail) BEFORE publishing startNs. Opening the
+    // window while 503 retries or late claims are still in flight caused a start-of-window
+    // catch-up burst (wrk2 send-as-fast-as-possible) and late_reg phantoms.
+    CountDownLatch admit = new CountDownLatch(2 * n);
     for (int i = 0; i < n; i++) {
-      int gid = i % gCount;
+      int gid = args.groupOffset + (i % gCount);
       mapping[i] = gid;
       String pool = label + gid; // Architecture 2026-10-30 15:13: G groups, streams round-robin
       String tok = tokens.get(i % tokens.size());
@@ -561,14 +579,20 @@ public class StreamLoad {
       consumers.add(Thread.startVirtualThread(() -> {
         try { consumer(http, args, tok, pool, w, idx, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "consumer " + pool, e); }
+        finally { admit.countDown(); }
       }));
       if (i % 8 == 0) Thread.sleep(20); // slower admit ramp at 1k (was 10ms/32)
       producers.add(Thread.startVirtualThread(() -> {
         try { producer(http, args, tok, pool, w, idx, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries, groupOpenRefusals); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "producer " + pool, e); }
+        finally { admit.countDown(); }
       }));
     }
-    // The window opens after the admit ramp. Chunks count by slot time in [start, end). startNs is
+    long admitDl = System.nanoTime() + (long) (Math.max(5.0, args.admitTimeoutS) * 1e9);
+    while (admit.getCount() > 0 && System.nanoTime() < admitDl) {
+      admit.await(50, TimeUnit.MILLISECONDS);
+    }
+    // The window opens after admit completes. Chunks count by slot time in [start, end). startNs is
     // published 50 ms BEFORE the window opens, so a producer that reads it after reading the clock
     // sees it whenever its clock reading is inside the window (producer: catch up from start).
     long start = System.nanoTime() + 50_000_000L;
@@ -576,8 +600,13 @@ public class StreamLoad {
     w.startNs = start;
     Thread.sleep(Math.max(0L, (w.endNs - System.nanoTime()) / 1_000_000L));
     // Producers finish their in-window slots (a late stream catches up) and send LAST; consumers
-    // read until LAST. Nothing is cut at the window end: the hard cutoff is end + drain timeout.
-    long cutoff = w.endNs + (long) (Math.max(args.drainTimeout, (GRACE_MS + DRAIN_SLACK_MS) / 1000.0) * 1e9);
+    // read until LAST. Nothing is cut at the window end: the hard cutoff is end + drain timeout
+    // on a measure wave. Warmup does not need that 75 s drain: 5 s of slack is enough, and
+    // hangEvery is measure-only, so a hung warmup can no longer add 75 s to the wall.
+    long drainNs = account
+        ? (long) (Math.max(args.drainTimeout, (GRACE_MS + DRAIN_SLACK_MS) / 1000.0) * 1e9)
+        : 5_000_000_000L;
+    long cutoff = w.endNs + drainNs;
     if (account) SCHED_INFLIGHT_AT_END.add(Math.max(0L, SCHED_SENT.sum() - SCHED_RECEIVED.sum()));
     // Optional (re-review): generator CPU over the catch-up period (window end -> producers done) is
     // reported separately; cpuMon only samples inside the window.
@@ -595,9 +624,13 @@ public class StreamLoad {
       inTeardown.set(true);
       w.hardStop.set(true);
       for (LeanHttp h : w.consumerSockets) h.close(); // unblock readers stuck in read()
-      for (InputStream in : w.consumerStreams) { // LEAN_CONSUMER=0: HttpClient body streams too
-        try { in.close(); } catch (IOException ignored) {}
+      // Close HttpClient bodies in parallel: a blocking close() on the main thread (up to the
+      // 200 s request timeout) is what made the LEAN_CONSUMER=0 hung leg run to 251 s.
+      List<Thread> closers = new ArrayList<>();
+      for (InputStream in : w.consumerStreams) {
+        closers.add(Thread.startVirtualThread(() -> { try { in.close(); } catch (IOException ignored) {} }));
       }
+      joinUntil(closers, System.nanoTime() + 2_000_000_000L);
       joinUntil(producers, System.nanoTime() + 5_000_000_000L);
       joinUntil(consumers, System.nanoTime() + 5_000_000_000L);
     }
@@ -622,14 +655,22 @@ public class StreamLoad {
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong requests, AtomicLong credit429, AtomicLong producerTransportRetries,
       AtomicLong groupOpenRefusals) throws Exception {
-    HttpResponse<byte[]> claim = post(http, args.base + "/swarm/v1/tasks/" + enc(pool) + ":claim?visibilityMs=60000&waitMs=30000&max=1",
-        token, new byte[0]);
-    int claimSc = claim.statusCode();
-    // #335 ledger budget: HTTP 503 on group open — group_open_refusals, never transport_retry.
-    if (claimSc == 503) {
-      groupOpenRefusals.incrementAndGet();
-      note(inTeardown, measureErr, teardownErr, "producer-claim-refused " + pool, new IOException("claim 503"));
-      return;
+    HttpResponse<byte[]> claim = null;
+    int claimSc = 0;
+    // #335 / smoke2 floor: 503 on claim is often "ledger writer budget exhausted" (Retry-After: 1),
+    // a transient. Treating it as fatal left phantom streams; their cutoff-slot ages then became
+    // the 28.6 s scheduled p99 at 10 MiB/s, where delivered p50 was 142 µs and lag p99 1.5 ms.
+    for (int attempt = 0; ; attempt++) {
+      claim = post(http, args.base + "/swarm/v1/tasks/" + enc(pool) + ":claim?visibilityMs=60000&waitMs=30000&max=1",
+          token, new byte[0]);
+      claimSc = claim.statusCode();
+      if (claimSc != 503) break;
+      if (!sleep503(w.hardStop, header(claim, "retry-after"), attempt, 15)) {
+        groupOpenRefusals.incrementAndGet();
+        note(inTeardown, measureErr, teardownErr, "producer-claim-refused " + pool,
+            new IOException("claim 503" + bodyDetail(claim.body())));
+        return;
+      }
     }
     if (claimSc != 200) throw new IOException("claim " + claimSc);
     // Test-only smoke: delay every 11th claim so it returns mid-window or after the window.
@@ -710,6 +751,8 @@ public class StreamLoad {
             if (lag > LATE_NS) SCHED_LATE.increment();
             SCHED_LAG_MAX_NS.accumulate(lag);
             LAG.add(lag / 1e3);
+            if (slotNs < w.startNs + 1_000_000_000L) LAG_FIRST.add(lag / 1e3);
+            else LAG_REST.add(lag / 1e3);
           }
         } else {
           slotNs = System.nanoTime();
@@ -892,7 +935,7 @@ public class StreamLoad {
     AtomicBoolean stop = w.hardStop;
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
     Exception last = null;
-    for (int attempt = 0; attempt < 3 && !stop.get(); attempt++) {
+    for (int attempt = 0, n503 = 0; attempt < 3 && !stop.get(); ) {
       try {
         HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(args.base + "/swarm/v1/tasks/" + enc(pool) + ":stream?deadlineMs=180000"))
             .timeout(Duration.ofSeconds(200))
@@ -906,8 +949,10 @@ public class StreamLoad {
         HttpResponse<byte[]> resp = http.send(b.build(), HttpResponse.BodyHandlers.ofByteArray());
         int streamSc = resp.statusCode();
         if (streamSc == 503) {
+          if (sleep503(stop, header(resp, "retry-after"), n503++, 15)) continue;
           groupOpenRefusals.incrementAndGet();
-          note(inTeardown, measureErr, teardownErr, "consumer-stream-refused " + pool, new IOException("stream 503"));
+          note(inTeardown, measureErr, teardownErr, "consumer-stream-refused " + pool,
+              new IOException("stream 503" + bodyDetail(resp.body())));
           return;
         }
         if (streamSc != 201 && streamSc != 200)
@@ -929,7 +974,7 @@ public class StreamLoad {
         try (InputStream in = get.body()) {
           w.consumerStreams.add(in); // closed at the drain cutoff (re-review optional)
           if (w.hardStop.get()) return;
-          if (args.hangEvery > 0 && idx % args.hangEvery == 0) { // test-only: hung stream
+          if (w.account && args.hangEvery > 0 && idx % args.hangEvery == 0) { // test-only, measure wave only
             while (!w.hardStop.get()) LockSupport.parkNanos(100_000_000L);
             return;
           }
@@ -942,12 +987,14 @@ public class StreamLoad {
         last = e;
         // Count every failed connect/setup attempt (not only the final throw into error_count).
         if (!inTeardown.get()) consumerConnectRetries.incrementAndGet();
-        if (attempt < 2 && !stop.get()) {
-          try { Thread.sleep(20L << attempt); } catch (InterruptedException ie) {
+        attempt++;
+        if (attempt < 3 && !stop.get()) {
+          try { Thread.sleep(20L << Math.min(attempt - 1, 6)); } catch (InterruptedException ie) {
             Thread.currentThread().interrupt(); throw ie;
           }
           continue;
         }
+        break;
       }
     }
     if (last != null) throw last;
@@ -987,9 +1034,19 @@ public class StreamLoad {
       }
       if (sr == null) throw last != null ? last : new IOException("stream not opened");
       if (sr.status == 503) {
-        groupOpenRefusals.incrementAndGet();
-        note(inTeardown, measureErr, teardownErr, "consumer-stream-refused " + pool, new IOException("stream 503"));
-        return;
+        boolean retried = false;
+        for (int n503 = 0; n503 < 15 && !w.hardStop.get(); n503++) {
+          if (!sleep503(w.hardStop, sr.retryAfter, n503, 15)) break;
+          // A 503 means no session was created; it is safe to POST :stream again.
+          sr = lh.postOnce(lh.head("POST", spath, token, CT, CT, task.length), task);
+          if (sr.status != 503) { retried = true; break; }
+        }
+        if (sr.status == 503) {
+          groupOpenRefusals.incrementAndGet();
+          note(inTeardown, measureErr, teardownErr, "consumer-stream-refused " + pool,
+              new IOException("stream 503" + bodyDetail(sr.body)));
+          return;
+        }
       }
       if (sr.status != 201 && sr.status != 200) throw new IOException("stream " + sr.status);
       String loc = sr.location;
@@ -1004,7 +1061,7 @@ public class StreamLoad {
       w.consumerSockets.add(lh);
       int gsc = lh.startGet(lh.head("GET", loc, token, null, CT, -1));
       if (gsc != 200) throw new IOException("replies " + gsc);
-      if (args.hangEvery > 0 && idx % args.hangEvery == 0) { // test-only: hung stream
+      if (w.account && args.hangEvery > 0 && idx % args.hangEvery == 0) { // test-only, measure wave only
         while (!w.hardStop.get()) LockSupport.parkNanos(100_000_000L);
         return;
       }
@@ -1165,6 +1222,35 @@ public class StreamLoad {
     return new Lease(id, hi, lo, attempt);
   }
 
+  /** Retry-After in ms: numeric seconds, default {@code dflt}, floor 50 ms, cap 5 s. HTTP-dates use {@code dflt}. */
+  static long retryAfterMs(String hdr, long dflt) {
+    if (hdr == null || hdr.isBlank()) return dflt;
+    try {
+      double s = Double.parseDouble(hdr.trim());
+      long ms = (long) (s * 1000.0);
+      return Math.min(5_000L, Math.max(50L, ms));
+    } catch (NumberFormatException e) {
+      return dflt;
+    }
+  }
+
+  /** Sleep for a 503 Retry-After. False if attempts are exhausted or {@code stop} is set. */
+  static boolean sleep503(AtomicBoolean stop, String retryAfter, int attempt, int max) throws InterruptedException {
+    if (attempt >= max || (stop != null && stop.get())) return false;
+    Thread.sleep(retryAfterMs(retryAfter, 1000));
+    return stop == null || !stop.get();
+  }
+
+  static String header(HttpResponse<?> r, String name) {
+    return r.headers().firstValue(name).orElse(null);
+  }
+
+  static String bodyDetail(byte[] body) {
+    if (body == null || body.length == 0) return "";
+    String s = new String(body, 0, Math.min(body.length, 200), StandardCharsets.UTF_8).replaceAll("\\s+", " ").trim();
+    return s.isEmpty() ? "" : ": " + s;
+  }
+
   static HttpResponse<byte[]> post(HttpClient http, String url, String token, byte[] body) throws Exception {
     HttpRequest req = HttpRequest.newBuilder(URI.create(url))
         .timeout(Duration.ofSeconds(60))
@@ -1181,6 +1267,9 @@ public class StreamLoad {
    */
   static DrainOutcome waitDrained(HttpClient http, String metricsUrl, double timeoutS) throws Exception {
     long timeoutMs = Math.max((long)(timeoutS * 1000), GRACE_MS + DRAIN_SLACK_MS);
+    // Hung-stream smoke: sockets are already closed at the measure cutoff. Don't wait another
+    // 75 s for open_sessions==0 (they stay up for hung readers). End by cutoff+5 s.
+    if (CUTOFF_HIT.get()) timeoutMs = Math.min(timeoutMs, 5_000L);
     long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
     Map<String, Double> last = Map.of();
     while (System.nanoTime() < deadline) {
@@ -1619,6 +1708,8 @@ public class StreamLoad {
         case "--harness-commit" -> args.harnessCommit = a[++i];
         case "--claim-delay-ms" -> args.claimDelayMs = Long.parseLong(a[++i]);
         case "--hang-every" -> args.hangEvery = Integer.parseInt(a[++i]);
+        case "--group-offset" -> args.groupOffset = Integer.parseInt(a[++i]);
+        case "--admit-timeout" -> args.admitTimeoutS = Double.parseDouble(a[++i]);
         default -> throw new IllegalArgumentException(a[i]);
       }
     }
@@ -1658,7 +1749,8 @@ public class StreamLoad {
     Double p50Send, p90Send, p99Send, p50Sched, p90Sched, p99Sched;
     String latHistSend = "[]", latHistSched = "[]";
     double rateMibS, schedLatePct, schedLagMaxUs, offeredActualMibS;
-    Double lagP50, lagP99;
+    Double lagP50, lagP99, lagFirstP99, lagRestP99;
+    String lagHist = "[]", lagFirstHist = "[]", lagRestHist = "[]";
     long schedSends, schedExpected, schedSent, schedReceived, schedUnreceived, schedPhantomStreams,
         schedStampFallback, schedInflightAtEnd, schedStreamsShort, schedLateRegistered;
     boolean cutoffHit;
@@ -1723,6 +1815,8 @@ public class StreamLoad {
       field(sb, "sched_lag_p99_us", lagP99, true);
       field(sb, "sched_late_pct", schedLatePct, true);
       field(sb, "sched_lag_max_us", schedLagMaxUs, true);
+      field(sb, "sched_lag_first_s_p99_us", lagFirstP99, true);
+      field(sb, "sched_lag_rest_p99_us", lagRestP99, true);
       field(sb, "lean_consumer", leanConsumer, true);
       field(sb, "latency_basis", quote(latencyBasis), true);
       field(sb, "p99_send_us", p99Send, true);
@@ -1776,6 +1870,15 @@ public class StreamLoad {
         .append(",\"p90_us\":").append(p90Sched)
         .append(",\"p99_us\":").append(p99Sched)
         .append(",\"hist\":").append(latHistSched)
+        .append("},\n");
+      sb.append("  \"sched_lag\":{")
+        .append("\"p50_us\":").append(lagP50)
+        .append(",\"p99_us\":").append(lagP99)
+        .append(",\"first_s_p99_us\":").append(lagFirstP99)
+        .append(",\"rest_p99_us\":").append(lagRestP99)
+        .append(",\"hist\":").append(lagHist)
+        .append(",\"first_s_hist\":").append(lagFirstHist)
+        .append(",\"rest_hist\":").append(lagRestHist)
         .append("},\n");
       sb.append("  \"hard_zeros\":").append(mapJson(hardZeros)).append(",\n");
       sb.append("  \"counters\":").append(mapJson(counters)).append(",\n");
