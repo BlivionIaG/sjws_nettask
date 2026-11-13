@@ -12,10 +12,10 @@ Goals
   timeouts, and maps upstream failures to 502/504.
 - One design that serves every transport (HTTP/1.1, HTTP/2 and HTTP/3) through `core.Handler`.
 - Zero cost when disabled. When enabled, no per-request allocation spikes and a bounded memory footprint.
+- Optional active health probes on multi-endpoint upstreams, off unless configured (see §13).
+  Load balancing across `endpoints`, passive ejection, retries and circuit breaking also shipped in §13.
 
 Non-goals (for now)
-- Active health checks. (Load balancing across `endpoints`, passive ejection, retries and circuit
-  breaking were non-goals at first and shipped later, see §13.)
 - Regex or glob path matching, header- or method-based routing, and response rewriting.
 - WebSocket / `Upgrade` tunnelling, HTTP/2 or HTTP/3 to upstreams, and caching proxy responses.
 - TLS client certificates to upstreams.
@@ -146,24 +146,23 @@ The client's own deadlines also stay in force, such as the write timeout via `Co
 | connect or response-head timeout | 504 |
 | failure after the head was sent (mid-body) | abort the connection/stream (never a short 200) |
 | request body over `max_body` | 413 |
-| `Transfer-Encoding` request, or a body the transport could not attach | 501 |
+| a declared body the transport could not attach | 501 |
 | target not origin-form, invalid method | 400 (normally caught earlier by the parser) |
 
 The proxy does not log upstream failures itself: they surface as 502/504 responses, in the access log and in the metrics.
 
-The order in which `ProxyHandler` decides. Each of the first five steps answers with the status shown
-when its condition holds, and otherwise passes the request on. Step 5 exists only when `circuit` is set
+The order in which `ProxyHandler` decides. Each of the first four steps answers with the status shown
+when its condition holds, and otherwise passes the request on. Step 4 exists only when `circuit` is set
 on the upstream. An upstream with `endpoints` goes through an `EndpointBalancer` first, which picks an
-endpoint and then runs steps 1 to 4 on that endpoint's pool, with no step 5 (it skips ejected endpoints
+endpoint and then runs steps 1 to 3 on that endpoint's pool, with no step 4 (it skips ejected endpoints
 instead, see [endpoint discovery](../ha/discovery.md)):
 
 ```mermaid
 flowchart TD
-    c1["1. Any Transfer-Encoding<br/>header: 501"] --> c2["2. A body of unknown<br/>length, or one the<br/>transport did not attach:<br/>501"]
-    c2 --> c3["3. Body over max_body: 413"]
-    c3 --> c4["4. Target not<br/>origin-form, bad method<br/>or bad header value: 400"]
-    c4 --> c5["5. Circuit open, only<br/>with circuit set: 503<br/>with Retry-After, the<br/>upstream is not contacted"]
-    c5 --> x["Send over a pooled<br/>keep-alive connection, or<br/>open one. The body goes<br/>upstream in 64 KiB chunks"]
+    c1["1. A declared body the<br/>transport did not attach:<br/>501"] --> c2["2. Known length over<br/>max_body: 413"]
+    c2 --> c3["3. Target not<br/>origin-form, bad method<br/>or bad header value: 400"]
+    c3 --> c4["4. Circuit open, only<br/>with circuit set: 503<br/>with Retry-After, the<br/>upstream is not contacted"]
+    c4 --> x["Send over a pooled<br/>keep-alive connection, or<br/>open one. The body goes<br/>upstream in 64 KiB chunks<br/>Unknown length uses chunked;<br/>max_body 413 if it grows too far"]
     x --> o{"Outcome"}
     o -->|"connect, write or<br/>head timeout"| e504["504"]
     o -->|"refused, reset, I/O error<br/>or a malformed response"| e502["502"]
@@ -258,7 +257,7 @@ Before phase 2, `Request(method, target, RequestHeaders)` carried only the stati
 
 | Gap | Change |
 |---|---|
-| Request body | `Request.body(): RequestBody` with `RequestBody.EMPTY` default. It is a pull-style `InputStream`-like source with known/unknown length. Only HTTP/1.1 attaches one today, for a `Content-Length` request (`Http1Connection.BodyReader`). The static handler ignores it, and the transport closes the connection if the handler leaves any of it unread. |
+| Request body | `Request.body(): RequestBody` with `RequestBody.EMPTY` default. It is a pull-style `InputStream`-like source with known/unknown length. HTTP/1.1 attaches a `Content-Length` or chunked body (`Http1Connection.BodyReader` / `ChunkedBodyReader`). HTTP/2 (when `attachBodies` is on) and HTTP/3 attach one as well, with length -1 when no `content-length` was sent. The static handler ignores it, and the transport closes the connection if the handler leaves any of it unread. |
 | Client address | `Request.peer(): InetSocketAddress` (nullable in tests), plus `secure(): boolean` for proto and `protocol()`. |
 | Arbitrary headers | `RequestHeaders.fields()` (a lower-cased map) and `all(): List<Map.Entry<String,String>>`. The existing typed fields stay as they are. HTTP/1.1 always fills the map, HTTP/3 only when a filter chain or a non-static terminal is installed at startup, and HTTP/2 (h2/h2c streams and the HTTP/1.1 ALPN fallback) when `attachBodies` is on (empty on the static-only path). |
 | Streaming response body | A new `Body.Stream(long lengthOrMinus1, Source)` variant. Writers use chunked encoding (HTTP/1.1, or close-delimited for 1.0) or DATA frames (HTTP/2 and HTTP/3) when the length is unknown. An abort on source error is never a short response. |
@@ -347,7 +346,7 @@ Phases 1 and 2 shipped (§12), and phase 3 as the gateway features B.1-B.4 (§13
   - h2 waits for writability before each chunk, and ends with an empty DATA frame carrying END_STREAM.
   - h3 shuts down the stream output at the end.
   - The h2 → HTTP/1.1 fallback sets chunked for an unknown length.
-- Request bodies: HTTP/1.1 requests with Content-Length are streamed through `Http1Connection.BodyReader`. The reader sends `100 Continue` on its first read, and each read is bounded by the write deadline. A body the handler does not read in full closes the connection. A chunked request body is not attached, and the proxy answers it with 501, as it did in phase 1; so does a declared body that the transport did not attach. HTTP/1.1 and HTTP/3 (#281) attach request bodies; HTTP/2 does not yet (§8).
+- Request bodies: HTTP/1.1 streams Content-Length bodies through `Http1Connection.BodyReader` and chunked bodies through `Http1Connection.ChunkedBodyReader`. The reader sends `100 Continue` on its first read, and each read is bounded by the write deadline. A body the handler does not read in full closes the connection. HTTP/2 (when `attachBodies` is on; #296 / #301) and HTTP/3 (#281) attach request bodies the same way, with length -1 when no `content-length` was sent. The proxy forwards an attached body of unknown length with `Transfer-Encoding: chunked` and enforces `max_body` as the body is read (413). A declared body that the transport did not attach is still 501.
 
 **Client (`routing.UpstreamPool` + `ProxyHandler`).**
 - The pipeline is `HttpClientCodec` + `Relay`, with autoRead off.
@@ -382,5 +381,58 @@ These build on the control-plane review on PR #38 (`UpstreamSet` snapshots swapp
 | **Discovery** (implemented in B.4: `routing.discovery` types, `routing.EndpointBalancer`, static `endpoints` lists; the CP watch client feeds `UpstreamRegistry.lookup(service).update(set)`, see `docs/ha/discovery.md`. Differences: an empty update keeps the last non-empty set, a never-populated source gives 503; upstreams are named, not `{service, selector}`) | Routes target `upstream: {service, selector}`. An `UpstreamSource.current()` volatile read gives an immutable `UpstreamSet{endpointsVersion, Endpoint[]}`. There is one `UpstreamPool` per endpoint, reference-counted across sets, so a membership change does not drop warm connections. An empty set gives 503. | An `Endpoints` watch frame per service (signed, its own monotonic `endpointsVersion`, debounced), and `Register` carrying the services. Persisted beside last-good. | Nothing. This lives below the filter chain, in `ProxyHandler`. |
 | **Weighted / canary routes** (implemented in B.2: `backends` with `pin` for the match and route-level `sticky`; retry/circuit stay per upstream) | `route.backends: [{upstream, weight}]`, plus optional `match: {header, cookie}` to pin canaries. Selection uses a precomputed alias table (O(1), no allocation); the sticky choice uses a hash of a header or cookie. Weights are part of the compiled snapshot, so a change is a config version. | Shipping the weights as config. A staged rollout (§9 of #38) can push weight steps as versions. | A per-route filter list (open question 1) to run the canary-only filters. |
 | **Retries** (implemented in B.1, per upstream: see `docs/user/config-file.md`) | Per-route `retry: {attempts, on: [connect, 502, 503, reset], budget: 10%}`. Only idempotent methods, or bodyless requests, are retried, and only before any response byte has been relayed. The next attempt picks a different endpoint. A token-bucket retry budget per upstream prevents storms. Phase 2 already retries stale keep-alive connections. | Nothing beyond the endpoint sets. | A way for filters to see the attempt count (a request attribute), so that logging and metrics are per try. |
-| **Circuit breaking** (B.1: consecutive failures per upstream; B.4: per endpoint with error-rate window and panic mode on multi-endpoint upstreams; `max_pending` is not done) | Per endpoint, a lock-free consecutive-failure / error-rate window (an `AtomicLong` packed state). States are closed, open (eject for `eject_for` with exponential backoff), and half-open (one probe). Ejected endpoints are skipped by load balancing. If more than `max_ejection` would be ejected, fall back to "panic" (use all). A per-upstream `max_pending` / `max_connections` limit gives 503 quickly. | Coarse health only (SUSPECT/DEAD). Local outlier state stays local and is never pushed back. | Nothing. Optionally an observer hook for state changes. |
-| **Rate limits** (implemented in B.3: `routing.RateLimitFilter`, GCRA in a fixed `AtomicLongArray`, per route through `RequestFilters.wrapping` plus `routing.rate_limit`; local only) | A filter, not a router feature: `RateLimitFilter{key: peer|header|route, rate, burst}`. It uses a sharded token bucket (striped `AtomicLong`s keyed by a hash, with a fixed table size, so there is no `computeIfAbsent` growth) and answers 429 with `Retry-After`. Local limits only in v1. A global limit would split the quota per node, with the share received from the CP (rate / ready gateway count). | v2 only: the per-node quota share, recomputed when gateway membership changes. | The chain's ordering (run before auth/proxy), per-route attachment, and a short-circuit response API, which `RequestFilters` already has. |
+| **Circuit breaking** (B.1: consecutive failures per upstream; B.4: per endpoint with error-rate window and panic mode on multi-endpoint upstreams; `max_pending` is not done) | Per endpoint, a lock-free consecutive-failure / error-rate window (an `AtomicLong` packed state). States are closed, open (eject for `eject_for` with exponential backoff), and half-open (one probe). Ejected endpoints are skipped by load balancing. If more than `max_ejection` would be ejected, fall back to "panic" (use all). Optional `active_health` (off unless configured, no threads or timers when unset) sends a synthetic GET or HEAD and feeds the same circuit, sharing the half-open slot; with it on, a client request is not used as a probe, and if every endpoint is ejected without panic the request is 503. Local outlier and probe state is never pushed to the control plane. A per-upstream `max_pending` / `max_connections` limit gives 503 quickly. | Coarse health only (SUSPECT/DEAD). Local outlier state stays local and is never pushed back. | Nothing. Optionally an observer hook for state changes. |
+| **Rate limits** (implemented in B.3: `routing.RateLimitFilter`, GCRA in a fixed `AtomicLongArray`, per route through `RequestFilters.wrapping` plus `routing.rate_limit`; local only. v2 cluster share is design-only until the CP/HA share API exists — see below) | A filter, not a router feature: `RateLimitFilter{key: peer|header|route, rate, burst}`. It uses a sharded token bucket (striped `AtomicLong`s keyed by a hash, with a fixed table size, so there is no `computeIfAbsent` growth) and answers 429 with `Retry-After`. Local limits only unless a CP share is applied. A global (v2) limit splits the configured rate and burst per ready gateway; the data plane applies a share it is given, it does not compute membership or gossip. | v2 only: a per-node quota-share snapshot for each named global limit, recomputed when ready-gateway membership changes. The wire type is owned by CP/HA; routing does not invent one. | The chain's ordering (run before auth/proxy), per-route attachment, and a short-circuit response API, which `RequestFilters` already has. The gateway `Quota` / `Quota.Factory` seam is the hook (`GatewayFilters.install`). |
+
+### Rate-limit v2: cluster quota share (design only)
+
+Local GCRA is done and remains the default. A cluster-wide (v2) limit is a **global** rate that
+is split across ready gateways: `share = configured_rate / ready_gateway_count` (and the same
+integer split for `burst`). Remainders from integer division are assigned by a stable hash of
+the node id so the shares sum to the configured totals. The share is recomputed when
+ready-gateway membership changes. **This is not implemented.** Implementation is blocked on a
+CP/HA API that publishes the share; the data plane must not invent gossip in `routing`.
+
+**Burst when there are more ready gateways than the configured burst.** The shares must sum to
+the configured burst. The earlier "at least 1 per node" floor is rejected here: with burst 1 and
+two ready gateways it would admit two requests at once and exceed the global burst. Some nodes
+therefore receive a burst share of 0. A zero-burst share means that node never admits a new
+request for that key. Today's `GcraTable` constructor rejects `burst < 1`, so the
+implementation must either accept a zero burst (treat it as "admit nothing") or apply a
+zero-admission share without constructing a GCRA table that forbids it. Rate shares may also
+be 0 when the ready count exceeds the configured rate; the same "admit nothing" rule applies.
+
+**Owners.** HA owns ready-gateway membership. The control plane owns computing the per-node
+share from that set and publishing it. The HTTP data plane (`routing.RateLimitFilter` /
+`GcraTable`, and the gateway `Quota` used by `gateway.RateLimitFilter`) only applies a share it
+is given. `docs/ha/discovery.md` is the membership interface (`UpstreamSet` is a different
+object: that snapshot is the *upstream* set, not the gateway set used for a quota split).
+
+**Hook.** The request path already calls `Quota.tryAcquire` / `tryAcquireAddress` and must stay
+non-blocking and free of I/O. `GatewayFilters.install(registry, factory)` is the seam: a later
+factory can install a share-aware `Quota` that resizes the existing GCRA refill from a share
+updated on another thread. Routing `rate_limit` should use the same applied-share rule once the
+API exists. When v2 is unset, the factory stays the local striped table — zero cost, identical
+to today.
+
+**Failure modes (chosen).** The alternative — falling back to the full local configured rate when
+a share is missing — is rejected: if every node did that, the cluster would admit up to *N* times
+the global budget.
+
+1. **v2 unset** (the default): local full rate, same as today.
+2. **Share applied at least once, later missing or stale** (CP unreachable, delayed snapshot):
+   **keep the last share.** The last value may be briefly too strict (a peer left, the share has
+   not yet been raised) or briefly too loose (a peer joined, the old share has not yet been
+   lowered). Both are preferred to a sudden opening of the full local rate.
+3. **v2 enabled on this node, but no share has ever arrived:** **fail closed** for that named
+   global key (429 with `Retry-After`). A joining node must not admit the full global rate alone
+   while it waits for the first snapshot.
+4. **Optional TTL.** If the CP snapshot carries a `valid_until` or generation bound, keep the
+   last share until that bound, then fail closed — do not open the full local rate. If the
+   snapshot has no TTL, keep the last share until a new snapshot arrives or v2 is unset.
+5. **Ready count is 0, or this node is not in the ready set:** fail closed.
+
+**When the CP API exists, acceptance is:** a two-node test (or fakes) where a membership change
+updates shares and the aggregate admit rate tracks the configured global rate within tolerance;
+feature off is identical to master (wrk with v2 off must stay in the master band); the failure
+modes above are tested.

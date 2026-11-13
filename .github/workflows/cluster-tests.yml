@@ -2,8 +2,9 @@ name: Cluster tests
 
 # Multi-node cluster harness (tests/sjws_nettask/clusterharness, tag `cluster`, including the
 # multi-process HA messaging scenario MsgReplClusterTest, gate G3) plus the
-# standalone vs gateway-off wrk comparison, at full length. Nightly, on demand, and on PRs
-# carrying the `cluster-tests` label. The short versions already run in CI on every PR.
+# standalone vs gateway-off wrk (and wrk2) comparison, at full length. Nightly, on demand,
+# and on PRs carrying the `cluster-tests` label. The short versions already run in CI on
+# every PR. wrk2 p99 and RSS are recorded; they do not fail on an absolute floor.
 on:
   schedule:
     - cron: '30 2 * * *'
@@ -34,6 +35,13 @@ jobs:
         run: mvn -B -q -DskipTests package
       - name: Cluster harness scenarios
         run: mvn -B -Dgroups=cluster -Dsurefire.failIfNoSpecifiedTests=true test
+      - name: Install optional external clients
+        run: |
+          tools/ci/apt-get.sh update -q
+          tools/ci/apt-get.sh install -y -q nghttp2-client \
+            || echo "h2load not installed; ExternalClientEndToEndTest will skip that case"
+      - name: External-client e2e (curl; h2load / HTTP/3 skip if missing)
+        run: mvn -B -Dgroups=e2e-clients -Dsurefire.failIfNoSpecifiedTests=true test
       - name: wrk cache key
         id: wrk-cache
         run: |
@@ -47,8 +55,12 @@ jobs:
         env:
           WRK_CACHE: ${{ runner.temp }}/wrk-cache
         run: tools/ci/install-wrk.sh
-      - name: wrk standalone vs gateway-off (full length)
-        run: tools/gateway-bench.sh
+      - name: Install wrk2
+        run: |
+          tools/perf-gate/install-wrk2.sh "$HOME/.local/bin/wrk2"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: wrk / wrk2 standalone vs gateway-off (full length)
+        run: GATEWAY_BENCH_WRK2=1 tools/gateway-bench.sh
       - uses: actions/upload-artifact@v7
         if: always()
         with:

@@ -61,7 +61,20 @@ public final class ConfigLoader {
                 ServerConfig::readPasswordFile, null);
     }
 
+    /**
+     * Like {@link #load(String[], Map)}. {@code recoveryPin} is the bootstrap pin the caller already
+     * resolved; missing-config recovery needs it to boot from a signed last-good.
+     */
+    public static Loaded load(String[] args, Map<String, String> env, Path recoveryPin) {
+        return load(args, env, ServerConfig::readPasswordFile, recoveryPin);
+    }
+
     public static Loaded load(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords) {
+        return load(args, env, passwords, null);
+    }
+
+    private static Loaded load(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+            Path recoveryPin) {
         var arguments = args.clone();
         var environment = Map.copyOf(env);
         for (var arg : arguments) {
@@ -70,14 +83,14 @@ public final class ConfigLoader {
             }
         }
         try {
-            return loadFile(arguments, environment, passwords);
+            return loadFile(arguments, environment, passwords, recoveryPin);
         } catch (ConfigException e) {
             return new Loaded(null, List.of(), List.of(e.getMessage()), false, arguments, environment, passwords, null);
         }
     }
 
-    private static Loaded loadFile(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords)
-            throws ConfigException {
+    private static Loaded loadFile(String[] args, Map<String, String> env, ServerConfig.PasswordFileReader passwords,
+            Path recoveryPin) throws ConfigException {
         var warnings = new ArrayList<String>();
         String fromArgs = null;
         for (var arg : args) {
@@ -114,6 +127,7 @@ public final class ConfigLoader {
         byte[] haPrevious = null;
         byte[] bootSignature = null;
         String recoveredHash = null;
+        boolean pinnedRecovery = false;
         Path yamlState = null;
         Map<String, Object> yamlCp = null;
         String text;
@@ -124,11 +138,12 @@ public final class ConfigLoader {
             if (!Files.isRegularFile(requested)) {
                 var state = stateDir(args, env, null, requested.toAbsolutePath().getParent());
                 var json = LastGoodStore.file(state);
-                var recovered = LastGoodStore.dataPlaneYaml(json);
+                var recovered = recoverLastGoodYaml(json, state, recoveryPin);
+                pinnedRecovery = recovered != null && LastGoodStore.signature(json) != null;
                 var source = json;
                 if (recovered == null) {
                     var legacy = LastGoodStore.beside(requested);
-                    recovered = LastGoodStore.dataPlaneYaml(legacy);
+                    recovered = unsignedLastGoodYaml(legacy, recoveryPin);
                     source = legacy;
                 }
                 if (recovered == null) {
@@ -157,6 +172,11 @@ public final class ConfigLoader {
             schemaVersion = schemaOf(root);
             bundleVersion = versionOf(root);
             node = nodeSection(root);
+            if (pinnedRecovery && node.mode() != NodeSettings.Mode.DATA) {
+                // A pinned last-good belongs to this data node. Keep the data role, as live apply
+                // does when it clamps node.mode, so a recovered snapshot does not select another role.
+                node = new NodeSettings(NodeSettings.Mode.DATA, node.labels(), node.maxStaleness());
+            }
             var base = configFile.toAbsolutePath().getParent();
             var bindHolder = new Boolean[1];
             yamlState = stateDirKey(root, base);
@@ -261,12 +281,19 @@ public final class ConfigLoader {
             return NodeSettings.STANDALONE;
         }
         var map = YamlValues.mapping(node, "node");
-        YamlValues.knownKeys(map, List.of("mode", "labels", "state_dir"), "node");
+        YamlValues.knownKeys(map, List.of("mode", "labels", "state_dir", "max_staleness"), "node");
         var mode = map.containsKey("mode")
                 ? NodeSettings.Mode.parse(text(map.get("mode"), "node.mode"))
                 : NodeSettings.Mode.STANDALONE;
         var labels = map.containsKey("labels") ? labels(map.get("labels")) : Map.<String, String>of();
-        return new NodeSettings(mode, labels);
+        Duration maxStaleness = null;
+        if (map.containsKey("max_staleness")) {
+            maxStaleness = Durations.parse(text(map.get("max_staleness"), "node.max_staleness"), "node.max_staleness");
+            if (maxStaleness.compareTo(NodeSettings.MAX_STALENESS) > 0) {
+                throw new ConfigException("node.max_staleness: must be at most 7d");
+            }
+        }
+        return new NodeSettings(mode, labels, maxStaleness);
     }
 
     private static Path stateDirKey(Map<String, Object> root, Path base) {
@@ -282,6 +309,16 @@ public final class ConfigLoader {
             path = base.resolve(path);
         }
         return path;
+    }
+
+    /** Missing-config recovery from the state dir. The file checks and refusals are in {@link LastGoodStore}. */
+    private static String recoverLastGoodYaml(Path json, Path state, Path pin) {
+        return LastGoodStore.recoveryYaml(json, state, pin);
+    }
+
+    /** The legacy file beside the config: unsigned, and only when no bootstrap pin is set. */
+    private static String unsignedLastGoodYaml(Path legacy, Path pin) {
+        return LastGoodStore.legacyRecoveryYaml(legacy, pin);
     }
 
     /**
@@ -622,13 +659,17 @@ public final class ConfigLoader {
             }
             var body = YamlValues.mapping(entry.getValue(), "routing.upstreams." + name);
             YamlValues.knownKeys(body, List.of("url", "connect_timeout", "response_timeout", "idle_read_timeout",
-                    "max_body", "preserve_host", "retry", "circuit", "endpoints", "lb"), "routing.upstreams." + name);
+                    "max_body", "preserve_host", "retry", "circuit", "endpoints", "lb", "active_health"),
+                    "routing.upstreams." + name);
             boolean multi = body.containsKey("endpoints");
             if (multi == body.containsKey("url")) {
                 throw new ConfigException("routing.upstreams." + name + ": exactly one of url or endpoints is required");
             }
             if (body.containsKey("lb") && !multi) {
                 throw new ConfigException("routing.upstreams." + name + ".lb is only valid with endpoints");
+            }
+            if (body.containsKey("active_health") && !multi) {
+                throw new ConfigException("routing.upstreams." + name + ".active_health is only valid with endpoints");
             }
             var endpointUrls = new ArrayList<URI>();
             var endpoints = multi ? endpoints(body.get("endpoints"), name, endpointUrls) : null;
@@ -671,7 +712,11 @@ public final class ConfigLoader {
                 circuit = circuit(body.get("circuit"), "routing.upstreams." + name + ".circuit");
             }
             var resilience = retry == null && circuit == null ? null : new sjws_nettask.routing.Resilience(retry, circuit);
-            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience, discovery));
+            var activeHealth = body.containsKey("active_health")
+                    ? activeHealth(body.get("active_health"), "routing.upstreams." + name + ".active_health")
+                    : null;
+            out.put(name, new Upstream(name, url, connect, response, idle, maxBody, preserve, resilience, discovery,
+                    activeHealth));
         }
         return Map.copyOf(out);
     }
@@ -778,6 +823,30 @@ public final class ConfigLoader {
         int max = map.containsKey("max_ejection") ? percent(map.get("max_ejection"), path + ".max_ejection", 0)
                 : d.maxEjectionPercent();
         return new sjws_nettask.routing.EndpointBalancer.Outlier(failures, rate, min, window, ejectFor, max);
+    }
+
+    /**
+     * {@code active_health: {path: /health, method: HEAD, interval: 10s, eject_interval: 2s, timeout: 1s}}
+     * on a multi-endpoint upstream. Off unless the block is present.
+     */
+    private static sjws_nettask.routing.ActiveHealth activeHealth(Object value, String path) {
+        var map = YamlValues.mapping(value, path);
+        YamlValues.knownKeys(map, List.of("path", "method", "interval", "eject_interval", "timeout"), path);
+        var d = sjws_nettask.routing.ActiveHealth.DEFAULT;
+        var probePath = map.containsKey("path") ? text(map.get("path"), path + ".path") : d.path();
+        var method = map.containsKey("method") ? text(map.get("method"), path + ".method") : d.method();
+        var interval = map.containsKey("interval")
+                ? timeout(text(map.get("interval"), path + ".interval"), path + ".interval") : d.interval();
+        var eject = map.containsKey("eject_interval")
+                ? timeout(text(map.get("eject_interval"), path + ".eject_interval"), path + ".eject_interval")
+                : d.ejectInterval();
+        var probeTimeout = map.containsKey("timeout")
+                ? timeout(text(map.get("timeout"), path + ".timeout"), path + ".timeout") : d.timeout();
+        try {
+            return new sjws_nettask.routing.ActiveHealth(probePath, method, interval, eject, probeTimeout);
+        } catch (IllegalArgumentException e) {
+            throw new ConfigException(path + ": " + e.getMessage());
+        }
     }
 
     /** {@code 50%} or {@code 50}: an integer percentage, {@code min}..100. */
@@ -1107,8 +1176,8 @@ public final class ConfigLoader {
                 throw new ConfigException(path + ": " + e.getMessage());
             }
             if (MiddlewareSecrets.hasInline(options)) {
-                warnings.add(path + ": inline keys/hmac-keys sit in the file in clear; prefer keys-file / "
-                        + "hmac-keys-file (required for control-plane proposals)");
+                warnings.add(path + ": inline secret options sit in the file in clear; prefer keys-file / "
+                        + "hmac-keys-file / users-file (required for control-plane proposals)");
             }
         }
         if (!specs.isEmpty()) {

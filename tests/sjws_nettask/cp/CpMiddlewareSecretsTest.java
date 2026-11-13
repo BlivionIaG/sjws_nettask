@@ -90,6 +90,17 @@ class CpMiddlewareSecretsTest {
             assertTrue(jwt.body().contains("hmac-keys-file"), jwt.body());
             assertFalse(jwt.body().contains(CANARY), jwt.body());
 
+            var basic = store.propose(baseYaml(root) + """
+                    middleware:
+                      - name: basic-auth
+                        order: 10
+                        options:
+                          users: "alice:%s"
+                    """.formatted(CANARY));
+            assertEquals(400, basic.status(), basic.body());
+            assertTrue(basic.body().contains("users-file"), basic.body());
+            assertFalse(basic.body().contains(CANARY), basic.body());
+
             var validated = store.validate(yaml);
             assertTrue(validated.body().contains("\"ok\":false"), validated.body());
             assertFalse(validated.body().contains(CANARY), validated.body());
@@ -165,6 +176,21 @@ class CpMiddlewareSecretsTest {
         assertTrue(masked.contains(MiddlewareSecrets.MASK), masked);
         assertTrue(masked.contains("header"), masked);
 
+        var basicLeaked = """
+                schema: 1
+                version: 1
+                middleware:
+                  - name: basic-auth
+                    order: 10
+                    options:
+                      users: "alice:%s"
+                      realm: "sjws"
+                """.formatted(CANARY);
+        var basicMasked = MiddlewareSecrets.maskYaml(basicLeaked);
+        assertFalse(basicMasked.contains(CANARY), basicMasked);
+        assertTrue(basicMasked.contains(MiddlewareSecrets.MASK), basicMasked);
+        assertTrue(basicMasked.contains("realm"), basicMasked);
+
         var spec = MiddlewareSpec.of("api-key", 10, null, Map.of("keys", CANARY, "header", "x-api-key"));
         var document = ConfigDocument.of(ServerConfig.builder(dir).port(0).build(), AcmeSettings.disabled(),
                 Routing.disabled(), List.of(spec), AccessSettings.DEFAULT, NodeSettings.STANDALONE, 1, 1, null, null);
@@ -175,6 +201,14 @@ class CpMiddlewareSecretsTest {
         var viewer = ConfigCodec.viewerText(document);
         assertFalse(viewer.contains(CANARY), viewer);
         assertTrue(viewer.contains(MiddlewareSecrets.MASK), viewer);
+
+        var basicSpec = MiddlewareSpec.of("basic-auth", 10, null, Map.of("users", "alice:" + CANARY, "realm", "sjws"));
+        var basicDoc = ConfigDocument.of(ServerConfig.builder(dir).port(0).build(), AcmeSettings.disabled(),
+                Routing.disabled(), List.of(basicSpec), AccessSettings.DEFAULT, NodeSettings.STANDALONE, 1, 1, null, null);
+        assertTrue(ConfigCodec.text(basicDoc).contains(CANARY));
+        assertFalse(ConfigCodec.viewerText(basicDoc).contains(CANARY));
+        assertEquals(MiddlewareSecrets.MASK, MiddlewareSecrets.maskOptions(basicSpec.options()).get("users"));
+        assertEquals("sjws", MiddlewareSecrets.maskOptions(basicSpec.options()).get("realm"));
     }
 
     @Test

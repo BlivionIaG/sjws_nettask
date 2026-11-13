@@ -17,13 +17,15 @@
 package sjws_nettask.ha;
 
 import java.nio.charset.StandardCharsets;
+import java.util.function.BooleanSupplier;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Response;
 import sjws_nettask.core.ResponseHeaders;
 
 /**
  * Liveness and readiness as eight precomputed {@link Response}s. A probe returns one of
- * them; it does not allocate and it does not touch the file handler.
+ * them; it does not allocate and it does not touch the file handler. Every response has
+ * {@code Cache-Control: no-store}. A not-ready 503 also has {@code Retry-After: 1}.
  */
 public final class HealthBoard {
 
@@ -44,19 +46,20 @@ public final class HealthBoard {
     private volatile boolean draining;
     private volatile boolean quorumOk = true;
     private volatile boolean requireQuorum;
+    private volatile BooleanSupplier dataPlaneReady = () -> true;
     private volatile Runnable onChange = () -> {
     };
 
     public HealthBoard(boolean requireQuorum) {
         this.requireQuorum = requireQuorum;
-        this.live = text(200, OK, false);
-        this.liveHead = text(200, OK, true);
-        this.dead = text(503, UNAVAILABLE, false);
-        this.deadHead = text(503, UNAVAILABLE, true);
-        this.ready = text(200, OK, false);
-        this.readyHead = text(200, OK, true);
-        this.notReady = text(503, UNAVAILABLE, false);
-        this.notReadyHead = text(503, UNAVAILABLE, true);
+        this.live = text(200, OK, false, false);
+        this.liveHead = text(200, OK, true, false);
+        this.dead = text(503, UNAVAILABLE, false, false);
+        this.deadHead = text(503, UNAVAILABLE, true, false);
+        this.ready = text(200, OK, false, false);
+        this.readyHead = text(200, OK, true, false);
+        this.notReady = text(503, UNAVAILABLE, false, true);
+        this.notReadyHead = text(503, UNAVAILABLE, true, true);
     }
 
     public void onChange(Runnable listener) {
@@ -83,7 +86,17 @@ public final class HealthBoard {
     }
 
     public boolean readyNow() {
-        return this.snapshotLoaded && !this.draining && (!this.requireQuorum || this.quorumOk);
+        return this.snapshotLoaded && !this.draining && (!this.requireQuorum || this.quorumOk)
+                && this.dataPlaneReady.getAsBoolean();
+    }
+
+    /**
+     * Data-role last-good / max-staleness gate. Null or absent means ready for this bit
+     * (standalone and HA without a data plane).
+     */
+    public void setDataPlaneReady(BooleanSupplier ready) {
+        this.dataPlaneReady = ready == null ? () -> true : ready;
+        changed();
     }
 
     public void setAlive(boolean alive) {
@@ -119,8 +132,19 @@ public final class HealthBoard {
         this.onChange.run();
     }
 
-    private static Response text(int status, byte[] body, boolean head) {
-        var headers = ResponseHeaders.of().add("content-type", "text/plain; charset=utf-8");
+    /**
+     * @param retryAfter when true, the 503 carries {@code Retry-After: 1} so a load balancer
+     *        retries a not-ready node instead of caching the failure. Used only for readiness
+     *        and for a content request served while no snapshot is installed. A liveness
+     *        failure ({@code /healthz} 503) is not given a retry hint.
+     */
+    private static Response text(int status, byte[] body, boolean head, boolean retryAfter) {
+        var headers = ResponseHeaders.of()
+                .add("content-type", "text/plain; charset=utf-8")
+                .add("cache-control", "no-store");
+        if (retryAfter) {
+            headers.add("retry-after", "1");
+        }
         return new Response(status, headers, Body.Bytes.of(body), head);
     }
 }

@@ -72,10 +72,13 @@ public final class ConfigCodec {
         out.append("  labels:\n");
         if (node.labels().isEmpty()) {
             out.append("    {}\n");
-            return;
+        } else {
+            for (var key : sorted(node.labels())) {
+                out.append("    ").append(yamlKey(key)).append(": ").append(quote(node.labels().get(key))).append('\n');
+            }
         }
-        for (var key : sorted(node.labels())) {
-            out.append("    ").append(yamlKey(key)).append(": ").append(quote(node.labels().get(key))).append('\n');
+        if (node.maxStaleness() != null) {
+            out.append("  max_staleness: ").append(duration(node.maxStaleness())).append('\n');
         }
     }
 
@@ -217,6 +220,14 @@ public final class ConfigCodec {
                             .append(", min_requests: ").append(o.minRequests())
                             .append(", window: ").append(quote(duration(o.window())))
                             .append(", max_ejection: ").append(o.maxEjectionPercent()).append(" }\n");
+                }
+                var active = upstream.activeHealth();
+                if (active != null) {
+                    out.append("      active_health: { path: ").append(quote(active.path()))
+                            .append(", method: ").append(active.method())
+                            .append(", interval: ").append(quote(duration(active.interval())))
+                            .append(", eject_interval: ").append(quote(duration(active.ejectInterval())))
+                            .append(", timeout: ").append(quote(duration(active.timeout()))).append(" }\n");
                 }
                 out.append("      connect_timeout: ").append(quote(duration(upstream.connectTimeout()))).append('\n');
                 out.append("      response_timeout: ").append(quote(duration(upstream.responseTimeout())))

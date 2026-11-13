@@ -42,6 +42,7 @@ public final class GatewayFilters {
         Objects.requireNonNull(registry, "registry");
         Objects.requireNonNull(quotas, "quotas");
         registry.factory("api-key", ApiKeyFilter::create);
+        registry.factory("basic-auth", BasicAuthFilter::create);
         registry.factory("jwt", JwtFilter::create);
         registry.factory("rate-limit", spec -> RateLimitFilter.create(spec, quotas));
         registry.factory("cors", CorsFilter::create);

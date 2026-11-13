@@ -9,8 +9,8 @@ metrics observe wrapper, or non-static terminal is armed — and leaves it empty
 path. Gateway filters therefore see headers such as `x-api-key` and `authorization` over h2/h2c
 once a chain is live. The HTTP/1.1 ALPN fallback on the HTTP/2 TLS listener uses the same
 `attachBodies` gate (#446).
-`GatewayFilters.install(registry)` binds the built-in factories (`api-key`, `jwt`, `rate-limit`,
-`cors`, `request-size`, `header-rewrite`, and `ip-acl`). `SjwsServer.chainControl` still does not
+`GatewayFilters.install(registry)` binds the built-in factories (`api-key`, `basic-auth`, `jwt`,
+`rate-limit`, `cors`, `request-size`, `header-rewrite`, and `ip-acl`). `SjwsServer.chainControl` still does not
 change the request path until the first successful `apply`.
 
 ```java
@@ -35,6 +35,25 @@ process, leaf not a symlink). A control-plane proposal must use `keys-file`; inl
 refused with 400. Local config may still use inline `keys` (a WARN points at the file form).
 `header` defaults to `x-api-key`. `query`, when set, is read only if the header is absent (the
 value is not percent-decoded). A miss is 401 with `WWW-Authenticate: ApiKey`.
+
+## basic-auth
+
+RFC 7617 `Authorization: Basic`. `users` is one `user:password` per line (or comma-separated
+when the value has no newline). `users-file` is the same format in a regular file; on POSIX
+the file must not be group- or world-readable (mode `0600` is the usual form). Exactly one of
+`users` or `users-file` is required; the file is read when the filter is built. A password may
+contain colons. Empty usernames and empty passwords are rejected. At most 1024 users, and a
+file is at most 64 KiB.
+
+Each `user:password` is hashed with SHA-256 when the filter is built; the raw password is not
+kept. A presented credential is hashed once and compared with every stored hash. `realm`
+defaults to `sjws` and is quoted in `WWW-Authenticate: Basic realm="...", charset="UTF-8"`.
+A miss, a missing header, a non-Basic scheme, or a malformed token is 401 with that
+challenge and `Cache-Control: no-store`. When more than one `Authorization` value is
+present, only the first is used. The request path does no I/O. A control-plane proposal must
+use `users-file`; inline `users` is refused with 400.
+Local config may still use inline `users` (a WARN points at the file form). Viewer reads mask
+any retained inline `users` values.
 
 ## jwt
 
@@ -64,10 +83,10 @@ The header must not carry `crit`, `jku`, `jwk`, `x5u` or `x5c`. `typ`, when pres
 must name one. The signature is checked before the claims. A bad token is 401 with
 `WWW-Authenticate: Bearer`, not a 500. There is no remote key fetch.
 
-HMAC secrets and API keys must not sit in the control-plane canonical document. Use
-`keys-file` / `hmac-keys-file` so each node reads a local `0600` file; a proposal that still
-carries inline `keys` or `hmac-keys` is refused, and viewer reads mask those fields. Public JWT
-keys can travel with the projection. Publishing a new snapshot is the rotation: in-flight
+HMAC secrets, API keys and Basic-auth credentials must not sit in the control-plane canonical
+document. Use `keys-file` / `hmac-keys-file` / `users-file` so each node reads a local `0600`
+file; a proposal that still carries inline `keys`, `hmac-keys` or `users` is refused, and viewer
+reads mask those fields. Public JWT keys can travel with the projection. Publishing a new snapshot is the rotation: in-flight
 requests keep the previous filter. For clusters that still have inline secrets in older log
 entries or snapshots, see the operator note under middleware in
 [config-file.md](../user/config-file.md) (file refs, key rotation, snapshot and compaction).
@@ -94,6 +113,19 @@ and `tryAcquireAddress` for an address, and neither may block or do I/O.
 `GatewayFilters.install(registry, factory)` uses that factory for
 each `rate-limit` entry, so a cluster remainder can refill a local balance on another thread
 and answer from it here. The default factory is the striped table.
+
+That factory is also the hook for a **cluster quota share** (rate-limit v2). A later, CP-fed
+implementation resizes the local GCRA refill from a share snapshot (`share_rate` /
+`share_burst` = configured totals divided across the ready gateway set, remainders assigned
+stably so the shares sum to the configured totals). Membership changes are HA's; computing and
+publishing the share is the control plane's; this filter must not gossip. The wire type is not
+defined here. Default remains the local table (v2 unset, zero cost).
+
+Failure mode, once v2 is enabled: **keep the last share** if a later snapshot is missing or
+stale; **fail closed** (the existing 429 + `Retry-After`) if this node has never received a
+share, if a CP TTL expires, or if this node is not in the ready set. Do not fall back to the
+full local rate — that would admit up to *N* times the global budget. Design §13 in
+`docs/design/proxy-routing.md` is the contract. Implementation waits on the CP/HA share API.
 
 ## cors
 

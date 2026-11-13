@@ -320,6 +320,27 @@ When the control plane is down, a data node that already has a verified `last-go
 
 When there is no verified last-good (first boot, a wipe, or a file that failed the signature and floor checks), the node stays not-ready. `/readyz` is 503. The watch keeps retrying. The process does not exit and does not drain itself. A later snapshot that passes `applyRemote` is what makes the node ready.
 
+That not-ready 503 is a fixed response, used both for `GET`/`HEAD /readyz` and for any
+content-port request served while no snapshot is installed (`HaHandler` falls through to
+`HealthBoard.ready`): status 503, `Content-Type: text/plain; charset=utf-8`, body
+`unavailable\n`, `Cache-Control: no-store`, and `Retry-After: 1`. It is not an HTML
+error page and not `application/problem+json`. A data node that has no last-good may
+leave the content port unbound instead (connection refused); once the port is bound,
+this is the only pre-snapshot body clients see. `/healthz` stays a liveness probe: 200
+`ok\n` or 503 `unavailable\n`, also `Cache-Control: no-store`, but no `Retry-After`.
+
+There is no per-route `errors:` setting before the first snapshot, so pre-snapshot
+responses do not honour `errors: problem`. A later node-level default in join or
+bootstrap material is optional and is not required for this contract. API clients must
+not expect problem+json until the node is ready and serving routes.
+
+Control-plane admin API errors are JSON today (validation errors; a follower write is
+503 `leader not ready` with no leader address yet, see §14). A later CP change should
+render those as RFC 9457 `application/problem+json` (`core.Problem`), with a stable
+`type` URI per error class and `instance` equal to the request path. A follower answer
+should add `Retry-After` and, when the leader is known, `Location`. That flip is not
+in this change.
+
 A wipe or restore of `stateDir` deletes `config/floor.json`, `config/trust.json`, and `config/last-good.json` together, so those files cannot stop a replay by themselves. The floor that survives the wipe is the root version floor in the pin and in the join material (§12.3, §12.4). A node with an empty `stateDir` still refuses any envelope whose `version` is below that floor, stays not-ready, and keeps retrying until a newer envelope arrives.
 
 ## 6. Leadership interface
@@ -368,7 +389,7 @@ On each transition to leader, the new leader appends a single `Noop` in the new 
 
 [PR #65](https://github.com/BlivionIaG/sjws_nettask/pull/65) starts the process. This design owns what "up" means after that.
 
-systemd `active` means the pid file exists. It is not readiness. Readiness is `GET /readyz` returning 200. A control node is ready only when `/readyz` is 200 and `leaderReady()` is true. `isLeader()` alone is not ready: the election `Noop` has to be applied first. A data node is ready when it is serving a verified snapshot that is still inside max-staleness. `/healthz` stays a liveness probe and can be 200 while `/readyz` is 503.
+systemd `active` means the pid file exists. It is not readiness. Readiness is `GET /readyz` returning 200. A control node is ready only when `/readyz` is 200 and `leaderReady()` is true. `isLeader()` alone is not ready: the election `Noop` has to be applied first. A data node is ready when it is serving a verified signed snapshot that is still inside max-staleness: the local clock is compared to the snapshot's `expiresAtMillis`, and to `issuedAtMillis + node.max_staleness` when that optional operator ceiling is set (there is no default ceiling). The content port is bound only after that signed last-good is present, unless the operator forced a bind. Past max-staleness the process keeps serving and `/readyz` is 503; max-staleness does not drain. `/healthz` stays a liveness probe and can be 200 while `/readyz` is 503.
 
 `--status` reports the control plane through `sjws_nettask.service.ControlPlaneBinding`: `connectionState()` is one of `pending`, `connecting`, `connected`, `disconnected`, `leader`, `follower`, and `configVersion()` is the applied version or `0`. `CpStore` can publish an implementation with `NodeEnrollment.attach`. `CpHost` does not call it yet, so a hosted control process still reports `connection=pending` and `config-version=0`; a data node's `DataWatch` attaches its own. `NodeEnrollment.current()` is null in a standalone process, and that class is not loaded there. Drain is still `SjwsServer.drain()`. `ControlPlaneBinding` has no stop method.
 

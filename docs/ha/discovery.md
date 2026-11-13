@@ -37,7 +37,8 @@ Rules:
 5. **The CP is authoritative once it has fed a source.** A config reload recompiles routes and
    reuses the same source; it does not overwrite a set the CP has published. Before the first CP
    update, a reload replaces the config set.
-6. Outlier state (ejection, error rate) is local and is never reported back.
+6. Outlier state (ejection, error rate, and any active-probe result that feeds it) is local and is
+   never reported back. Active health never writes `SUSPECT` or `DEAD` to a source.
 
 ## Data-plane behaviour
 
@@ -47,7 +48,13 @@ Rules:
 - A retry (per the upstream's `retry`) goes to an endpoint not yet tried while one exists.
 - Per-endpoint circuit: consecutive failures and an error-rate window, ejection with doubling
   backoff and one probe, panic mode above `max_ejection` (see `docs/user/config-file.md`).
-- An upstream with a single `url` does not go through any of this.
+- Optional active health probes, off unless `active_health` is set: a synthetic GET or HEAD at
+  `interval` while in rotation, and at `eject_interval` after `eject_for` while ejected. Results
+  feed the same circuit and share the half-open slot. With probes on, a client request is not used
+  as a probe; if every endpoint is ejected and the balancer is not in panic, the request is 503
+  with `Retry-After`.
+- An upstream with a single `url` does not go through any of this (`active_health` is rejected
+  there).
 
 One request through an upstream with `endpoints` (`routing.EndpointBalancer`). An endpoint upstream never
 runs the `ProxyHandler`'s own retry or circuit breaker: the balancer owns both, with one retry budget per
@@ -64,9 +71,10 @@ flowchart TD
     s5 -->|no| last["Relay the last result:<br/>the upstream response<br/>unchanged, or 504 or 502"]
 ```
 
-How an endpoint is picked. An endpoint is available when it is in rotation, or is the one request that wins
-the half-open probe after `eject_for`. Endpoints of weight 0, a `SUSPECT` one or a configured `weight: 0`, are
-left for last by the weighted pass:
+How an endpoint is picked. Without `active_health`, an endpoint is available when it is in rotation, or is
+the one request that wins the half-open probe after `eject_for`. With `active_health`, only endpoints in
+rotation are offered to clients; the half-open slot is taken by a synthetic probe. Endpoints of weight 0,
+a `SUSPECT` one or a configured `weight: 0`, are left for last by the weighted pass:
 
 ```mermaid
 flowchart TD
@@ -74,7 +82,7 @@ flowchart TD
     p1["1. Up to 4 draws by the<br/>lb policy:<br/>weighted_random,<br/>round_robin or<br/>least_request. Take a<br/>draw that is untried and<br/>available"]
     p2["2. Else scan from a<br/>random start, weighted<br/>endpoints first, then<br/>weight 0. Take one that<br/>is untried and available"]
     p3["3. Else any available<br/>endpoint, even one<br/>already tried"]
-    p4["4. Else a policy draw<br/>regardless: everything<br/>is ejected, still answer"]
+    p4["4. Else: with active health<br/>and not in panic, 503 with<br/>Retry-After. Otherwise a<br/>policy draw: everything is<br/>ejected, still answer"]
     p0 --> p1 --> p2 --> p3 --> p4
 ```
 
@@ -101,3 +109,20 @@ stateDiagram-v2
         long, up to 32 times eject_for
     end note
 ```
+
+## Cluster quota share (not this interface)
+
+Ready-gateway membership (how many gateways are in the ready set, and whether *this* node is
+in it) is an HA concern. A later **cluster rate-limit share** uses that set: the control plane
+computes `share = configured_rate / ready_gateway_count` for each named global limit and
+publishes a snapshot to the data plane. That snapshot is **not** an `UpstreamSet`. Upstream
+discovery and quota share stay separate objects, each a full snapshot, never a delta.
+
+The HTTP data plane applies a share it is given through the existing `Quota` factory. It does
+not watch membership itself and must not invent gossip in `routing`. Until the CP/HA share API
+exists, every rate limit stays local.
+
+Failure mode (recorded in design §13): keep the last share if a later snapshot is missing;
+fail closed if this node has never received a share, or is not in the ready set. Do not fall
+back to the full local rate.
+

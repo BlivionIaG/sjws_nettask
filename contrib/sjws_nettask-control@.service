@@ -12,7 +12,8 @@
 # Active means the main process is up, not that the content port is bound and not leaderReady.
 # This unit does not call sd_notify. Readiness is /readyz and --status.
 # A control process does not bind the content port unless --bind-content or server.bind_content
-# is set. The admin listener is not started here.
+# is set. The pid file is still written. The process starts the admin listener from
+# cp.admin.listen in the config; --status reports admin= and admin-state=.
 # Do not Requires= a data unit. Stopping this node must not stop data nodes.
 # ExecReload sends SIGHUP. The daemon child runs ReloadHook. It does not re-read the join token.
 #
