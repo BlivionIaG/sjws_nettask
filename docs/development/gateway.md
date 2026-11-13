@@ -10,7 +10,7 @@ path. Gateway filters therefore see headers such as `x-api-key` and `authorizati
 once a chain is live. The HTTP/1.1 ALPN fallback on the HTTP/2 TLS listener uses the same
 `attachBodies` gate (#446).
 `GatewayFilters.install(registry)` binds the built-in factories (`api-key`, `basic-auth`, `jwt`,
-`rate-limit`, `cors`, `request-size`, and `header-rewrite`). `SjwsServer.chainControl` still does not
+`rate-limit`, `cors`, `request-size`, `header-rewrite`, and `ip-acl`). `SjwsServer.chainControl` still does not
 change the request path until the first successful `apply`.
 
 ```java
@@ -159,3 +159,23 @@ rules cannot change `content-length`, `transfer-encoding`, `connection`, `keep-a
 `server` or `alt-svc`. Request rules build one new header map and pass `request.withHeaders`.
 Response-only rules do not. Response fields are removed and then set, so a set wins over a
 remove of the same name.
+
+
+## ip-acl
+
+Client-address allow and deny lists, compiled to `routing.Cidr` when the filter is built.
+`allow` and `deny` are addresses or CIDRs (IPv4 and IPv6), one per line, or comma-separated
+when the value has no newline. At least one list is required. A `#` line is ignored. At most
+4096 entries per list.
+
+The request path reads `request.peer()` and does not allocate for a known address. The peer
+address is normalized before matching, so an IPv4-mapped IPv6 peer is compared as IPv4. A
+missing peer is refused (fail closed). A deny match always wins. An allow list without a deny
+list admits only listed addresses. A deny list without an allow list admits everyone except
+the denied addresses. IPv4 and IPv6 lists are separate: `0.0.0.0/0` does not match IPv6
+peers, and `::/0` does not match IPv4 peers. A refusal is 403; there is no hide-as-404 mode.
+Scope (route / labels) is the same as every other gateway entry. The filter is off, with no
+cost, until a document names it.
+
+Put `ip-acl` first in the chain (lowest `order`) so a refused peer does not reach later
+filters.
