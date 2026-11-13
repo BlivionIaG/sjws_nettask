@@ -264,14 +264,14 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     Response attempt(Request request) throws IOException, InterruptedException {
         boolean head = request.headOnly();
         if (!request.headers().values("transfer-encoding").isEmpty()) {
-            return StaticFileHandler.error(501, head);
+            return localRefusal(StaticFileHandler.error(501, head));
         }
         long length = request.body().length();
         if (length < 0 || request.body() == sjws_nettask.core.RequestBody.EMPTY && hasDeclaredBody(request)) {
-            return StaticFileHandler.error(501, head);
+            return localRefusal(StaticFileHandler.error(501, head));
         }
         if (length > this.settings.maxBody()) {
-            return StaticFileHandler.error(413, head);
+            return localRefusal(StaticFileHandler.error(413, head));
         }
         var refused = peerBudgetRefused(request, head);
         if (refused != null) {
@@ -281,7 +281,7 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         try {
             out = buildRequest(request, length);
         } catch (IllegalArgumentException e) {
-            return StaticFileHandler.error(400, head);
+            return localRefusal(StaticFileHandler.error(400, head));
         }
         return exchange(request, out, length, true);
     }

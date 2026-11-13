@@ -226,4 +226,51 @@ class RouteResilienceTest {
             balancer.close();
         }
     }
+
+    @Test
+    void localValidationErrorsDoNotCountAsCircuitSuccess() {
+        this.failFirst = 100; // every upstream response is 503
+        var wrap = new RouteResilience(this.proxy,
+                new Resilience(null, new Resilience.Circuit(2, Duration.ofSeconds(30))));
+        assertEquals(503, wrap.handle(new Request("GET", "/")).status());
+        assertEquals("CLOSED", wrap.circuitState());
+        assertEquals(1, this.hits.get());
+
+        // Local 413/501/400 never contact the upstream and must not reset the failure run.
+        var huge = new sjws_nettask.core.RequestBody() {
+            @Override
+            public long length() {
+                return 10_000;
+            }
+
+            @Override
+            public int read(byte[] into, int off, int len) {
+                return -1;
+            }
+        };
+        var oversized = wrap.handle(new Request("POST", "/").withBody(huge));
+        assertEquals(413, oversized.status());
+        assertTrue(ProxyHandler.isLocalRefusal(oversized));
+        assertEquals(1, this.hits.get());
+        assertEquals("CLOSED", wrap.circuitState());
+
+        var te = new Request("POST", "/",
+                sjws_nettask.core.RequestHeaders.of(Map.of("transfer-encoding", List.of("chunked"))), null, false);
+        var notImplemented = wrap.handle(te);
+        assertEquals(501, notImplemented.status());
+        assertTrue(ProxyHandler.isLocalRefusal(notImplemented));
+        assertEquals(1, this.hits.get());
+
+        var badTarget = wrap.handle(new Request("OPTIONS", "*"));
+        assertEquals(400, badTarget.status());
+        assertTrue(ProxyHandler.isLocalRefusal(badTarget));
+        assertEquals(1, this.hits.get());
+
+        // Second real failure opens the circuit: the local refusals did not clear the first.
+        assertEquals(503, wrap.handle(new Request("GET", "/")).status());
+        assertEquals(2, this.hits.get());
+        assertEquals("OPEN", wrap.circuitState());
+        assertEquals(503, wrap.handle(new Request("GET", "/")).status());
+        assertEquals(2, this.hits.get(), "open circuit must not contact the upstream");
+    }
 }
