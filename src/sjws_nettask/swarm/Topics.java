@@ -77,12 +77,14 @@ public final class Topics implements AutoCloseable {
             p = this.open.get(topic);
             if (p == null) {
                 var pr = this.probes;
+                long seg = configuredSegmentBytes();
                 p = pr == null || !topic.startsWith(TaskService.TOPIC_PREFIX)
                         || topic.endsWith(Partition.DLQ_SUFFIX)
-                        ? Partition.open(this.dir, topic, this.policy, this.clockMs)
+                        ? Partition.open(this.dir, topic, this.policy, this.clockMs,
+                                sjws_nettask.messaging.ledger.Durability.ASYNC, seg)
                         : Partition.open(this.dir, topic, this.policy, this.clockMs,
                                 sjws_nettask.messaging.ledger.Durability.ASYNC,
-                                sjws_nettask.messaging.ledger.SegmentedLog.DEFAULT_SEGMENT_BYTES, true, pr.apply(topic));
+                                seg, true, pr.apply(topic));
                 this.open.put(topic, p);
             }
             return p;
@@ -113,7 +115,8 @@ public final class Topics implements AutoCloseable {
             // close(String) removes and closes under this lock, so a partition seen here is never closing or closed
             p = this.open.get(topic);
             if (p == null) {
-                p = Partition.openWithoutDlq(this.dir, topic, this.policy, this.clockMs);
+                p = Partition.open(this.dir, topic, this.policy, this.clockMs,
+                        sjws_nettask.messaging.ledger.Durability.ASYNC, configuredSegmentBytes(), false, null);
                 this.open.put(topic, p);
             }
             return p;
@@ -168,4 +171,27 @@ public final class Topics implements AutoCloseable {
             System.err.println("WARN: swarm: closing " + p.topic() + ": " + e);
         }
     }
+
+    /**
+     * Segment size for swarm ledgers. Honours the same knobs as {@code MessagingModule}
+     * ({@code sjws.messaging.segment.bytes} / {@code SJWS_MESSAGING_SEGMENT_BYTES}) so a bench
+     * can cap per-file size; default is {@link sjws_nettask.messaging.ledger.SegmentedLog#DEFAULT_SEGMENT_BYTES}
+     * (1 GiB) when unset. Swarm partitions have no retention trimmer, so this only controls
+     * when a file rolls — peak disk is bounded by deleting the swarm dir at the end of each leg.
+     */
+    static long configuredSegmentBytes() {
+        String v = System.getProperty("sjws.messaging.segment.bytes");
+        if (v == null || v.isBlank()) v = System.getenv("SJWS_MESSAGING_SEGMENT_BYTES");
+        if (v == null || v.isBlank()) {
+            return sjws_nettask.messaging.ledger.SegmentedLog.DEFAULT_SEGMENT_BYTES;
+        }
+        try {
+            long n = Long.parseLong(v.trim());
+            return n > 0 ? n : sjws_nettask.messaging.ledger.SegmentedLog.DEFAULT_SEGMENT_BYTES;
+        } catch (NumberFormatException e) {
+            return sjws_nettask.messaging.ledger.SegmentedLog.DEFAULT_SEGMENT_BYTES;
+        }
+    }
+
+
 }

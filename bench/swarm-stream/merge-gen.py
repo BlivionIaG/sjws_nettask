@@ -292,7 +292,12 @@ def main(argv=None):
     for pth in args.inputs:
         if not pth.is_file():
             raise SystemExit(f"merge-gen: missing {pth}")
-        parts.append(json.loads(pth.read_text()))
+        if pth.stat().st_size == 0:
+            raise SystemExit(f"merge-gen: empty {pth} (generator wrote no result; refusing to merge or reuse a leftover)")
+        try:
+            parts.append(json.loads(pth.read_text()))
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"merge-gen: {pth} is not valid JSON: {e}")
     out = merge(parts, args.gen_cores, args.secs or None)
     args.out.write_text(json.dumps(out, indent=2) + "\n")
     return 0

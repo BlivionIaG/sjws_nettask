@@ -127,5 +127,28 @@ def main():
     print("OK test_merge_gen")
 
 
+def test_merge_gen_refuses_empty(tmp_path):
+    import json as _json
+    import subprocess, sys
+    script = Path(__file__).resolve().parents[1] / "merge-gen.py"
+    empty = tmp_path / "gen-0.json"
+    empty.write_text("")
+    good = tmp_path / "gen-1.json"
+    good.write_text(_json.dumps({"bytes": 1, "requests": 1, "mib_s": 1, "elapsed_s": 20,
+                                 "client_cpu_sec": 1, "client_cpu_pct_of_wall": 10,
+                                 "server_cpu_sec": 1, "server_cpu_pct_of_wall": 10,
+                                 "p99_us": 100, "lat_hist_sched": {}, "harness_commit": "abc"}))
+    out = tmp_path / "result.json"
+    r = subprocess.run([sys.executable, str(script), str(empty), str(good), "-o", str(out)],
+                       capture_output=True, text=True)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "empty" in r.stderr.lower() or "empty" in r.stdout.lower()
+    assert not out.exists() or out.stat().st_size == 0
+    print("OK test_merge_gen_refuses_empty")
+
+
 if __name__ == "__main__":
+    import tempfile
     main()
+    with tempfile.TemporaryDirectory() as d:
+        test_merge_gen_refuses_empty(Path(d))

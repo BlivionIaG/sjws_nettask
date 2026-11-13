@@ -569,6 +569,12 @@ public class StreamLoad {
     // Wait for every claim/:stream to finish (or fail) BEFORE publishing startNs. Opening the
     // window while 503 retries or late claims are still in flight caused a start-of-window
     // catch-up burst (wrk2 send-as-fast-as-possible) and late_reg phantoms.
+    // Latch is released when claim / :stream finishes (success or give-up), BEFORE any
+    // claimDelayMs sleep and BEFORE the send/read loop. Counting down in the thread's
+    // finally (after producer()/consumer() return) waited for the whole wave, so every
+    // wave sat on admitTimeout (30 s). That is why late/mid claims had late_reg=0 and
+    // why the LEAN_CONSUMER=0 hung leg's one.sh wall was 167 s (warmup 30+3+5 + measure
+    // 30+8+75+5).
     CountDownLatch admit = new CountDownLatch(2 * n);
     for (int i = 0; i < n; i++) {
       int gid = args.groupOffset + (i % gCount);
@@ -577,15 +583,13 @@ public class StreamLoad {
       String tok = tokens.get(i % tokens.size());
       final int idx = i;
       consumers.add(Thread.startVirtualThread(() -> {
-        try { consumer(http, args, tok, pool, w, idx, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals); }
+        try { consumer(http, args, tok, pool, w, idx, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals, admit); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "consumer " + pool, e); }
-        finally { admit.countDown(); }
       }));
       if (i % 8 == 0) Thread.sleep(20); // slower admit ramp at 1k (was 10ms/32)
       producers.add(Thread.startVirtualThread(() -> {
-        try { producer(http, args, tok, pool, w, idx, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries, groupOpenRefusals); }
+        try { producer(http, args, tok, pool, w, idx, inTeardown, creditWaits, measureErr, teardownErr, requests, credit429, producerTransportRetries, groupOpenRefusals, admit); }
         catch (Exception e) { note(inTeardown, measureErr, teardownErr, "producer " + pool, e); }
-        finally { admit.countDown(); }
       }));
     }
     long admitDl = System.nanoTime() + (long) (Math.max(5.0, args.admitTimeoutS) * 1e9);
@@ -654,7 +658,9 @@ public class StreamLoad {
       ConcurrentLinkedQueue<Double> creditWaits,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
       AtomicLong requests, AtomicLong credit429, AtomicLong producerTransportRetries,
-      AtomicLong groupOpenRefusals) throws Exception {
+      AtomicLong groupOpenRefusals, CountDownLatch admit) throws Exception {
+    boolean released = false;
+    try {
     HttpResponse<byte[]> claim = null;
     int claimSc = 0;
     // #335 / smoke2 floor: 503 on claim is often "ledger writer budget exhausted" (Retry-After: 1),
@@ -673,8 +679,14 @@ public class StreamLoad {
       }
     }
     if (claimSc != 200) throw new IOException("claim " + claimSc);
-    // Test-only smoke: delay every 11th claim so it returns mid-window or after the window.
-    if (w.account && args.claimDelayMs > 0 && idx % 11 == 0) Thread.sleep(args.claimDelayMs);
+    // Admit is done: release BEFORE claimDelay so the window can open. Then wait for
+    // startNs to be published and only then sleep, so a delayed claim is actually late.
+    admit.countDown();
+    released = true;
+    if (w.account && args.claimDelayMs > 0 && idx % 11 == 0) {
+      while (w.startNs == Long.MAX_VALUE && !w.hardStop.get()) LockSupport.parkNanos(1_000_000L);
+      if (!w.hardStop.get()) Thread.sleep(args.claimDelayMs);
+    }
     Lease lease = parseLease(claim);
     String url = args.base + "/swarm/v1/leases/" + enc(lease.id) + ":chunk";
     String path = "/swarm/v1/leases/" + enc(lease.id) + ":chunk";
@@ -856,6 +868,9 @@ public class StreamLoad {
     } finally {
       if (lean != null) lean.close();
     }
+    } finally {
+      if (!released) admit.countDown();
+    }
   }
 
   static double retryAfterFrom(String v) {
@@ -927,11 +942,13 @@ public class StreamLoad {
   static void consumer(HttpClient http, Args args, String token, String pool,
       Win w, int idx, AtomicBoolean inTeardown, LongAdder bytesRx,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
-      AtomicLong consumerConnectRetries, AtomicLong groupOpenRefusals) throws Exception {
+      AtomicLong consumerConnectRetries, AtomicLong groupOpenRefusals, CountDownLatch admit) throws Exception {
     if (args.leanConsumerActive()) {
-      consumerLean(args, token, pool, w, idx, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals);
+      consumerLean(args, token, pool, w, idx, inTeardown, bytesRx, measureErr, teardownErr, consumerConnectRetries, groupOpenRefusals, admit);
       return;
     }
+    boolean released = false;
+    try {
     AtomicBoolean stop = w.hardStop;
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
     Exception last = null;
@@ -973,6 +990,7 @@ public class StreamLoad {
         if (get.statusCode() != 200) throw new IOException("replies " + get.statusCode());
         try (InputStream in = get.body()) {
           w.consumerStreams.add(in); // closed at the drain cutoff (re-review optional)
+          if (!released) { admit.countDown(); released = true; }
           if (w.hardStop.get()) return;
           if (w.account && args.hangEvery > 0 && idx % args.hangEvery == 0) { // test-only, measure wave only
             while (!w.hardStop.get()) LockSupport.parkNanos(100_000_000L);
@@ -998,6 +1016,9 @@ public class StreamLoad {
       }
     }
     if (last != null) throw last;
+    } finally {
+      if (!released) admit.countDown();
+    }
   }
 
   /**
@@ -1009,12 +1030,13 @@ public class StreamLoad {
   static void consumerLean(Args args, String token, String pool,
       Win w, int idx, AtomicBoolean inTeardown, LongAdder bytesRx,
       ConcurrentLinkedQueue<String> measureErr, ConcurrentLinkedQueue<String> teardownErr,
-      AtomicLong consumerConnectRetries, AtomicLong groupOpenRefusals) throws Exception {
+      AtomicLong consumerConnectRetries, AtomicLong groupOpenRefusals, CountDownLatch admit) throws Exception {
     byte[] task = frame(TYPE_TASK, 0, "gate".getBytes(StandardCharsets.UTF_8));
     String spath = "/swarm/v1/tasks/" + enc(pool) + ":stream?deadlineMs=180000";
     LeanHttp lh = null;
     LeanResp sr = null;
     Exception last = null;
+    boolean released = false;
     try {
       for (int attempt = 0; attempt < 3 && !w.hardStop.get(); attempt++) {
         boolean written = false;
@@ -1061,6 +1083,7 @@ public class StreamLoad {
       w.consumerSockets.add(lh);
       int gsc = lh.startGet(lh.head("GET", loc, token, null, CT, -1));
       if (gsc != 200) throw new IOException("replies " + gsc);
+      if (!released) { admit.countDown(); released = true; }
       if (w.account && args.hangEvery > 0 && idx % args.hangEvery == 0) { // test-only, measure wave only
         while (!w.hardStop.get()) LockSupport.parkNanos(100_000_000L);
         return;
@@ -1072,6 +1095,7 @@ public class StreamLoad {
       }
     } finally {
       if (lh != null) lh.close();
+      if (!released) admit.countDown();
     }
   }
 

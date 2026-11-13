@@ -65,6 +65,25 @@ agents in `one.sh` and round-robins them in `drive.py` to reach 1k concurrent st
 Metric names follow the sjws Observability review (`sjws_swarm_stream_*`, counters with `_total`,
 flag-off emits nothing). Validate a scrape with `promtool check metrics`.
 
+## Disk bounds (`one.sh`)
+
+A 1000-stream leg writes about **3.5–4 GB** of swarm segment logs (~900 ledger topic
+directories; derived from the 61 G that filled `/workspace` across 16 shared smoke2/smoke3
+leg dirs before the logs were deleted). `one.sh` therefore:
+
+- Wipes leftover `result.json` / `gen-*.json` / `$WD/swarm` **before** a leg starts, so a
+  failed generator cannot be judged from a prior run's file (and so ledgers do not append
+  onto a leftover dir).
+- Deletes `$WD/swarm` as soon as the leg ends (the EXIT trap, after `amend-result.py` and
+  `metrics.txt`). Only metrics and the result JSON are kept.
+- Refuses to start a leg if `/workspace` has less than **20 GiB** free, and aborts a running
+  leg that drops below **10 GiB**.
+- Caps the bench server's segment size at 16 MiB via `-Dsjws.messaging.segment.bytes`
+  (override with `SJWS_MESSAGING_SEGMENT_BYTES`). Swarm `Topics` honours the same property;
+  the product default is still 1 GiB. Swarm partitions have no retention trimmer, so peak
+  disk is bounded by the post-leg delete.
+- `merge-gen.py` refuses empty or non-JSON `gen-*.json` and does not write `-o` on failure.
+
 ## Validity / NOISY (inceptor 2026-11-01 07:05)
 
 - Start gate: `load1 < 3` before **every** leg (`gate.sh` / `cross-check.sh`), recorded as `load1_pre`.

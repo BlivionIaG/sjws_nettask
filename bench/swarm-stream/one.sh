@@ -86,8 +86,38 @@ if [ "$LIB_DIR" != "$(dirname "$JAR")/lib" ]; then
   # manifest Add-Opens / Enable-Native-Access.
   ln -sfn "$LIB_DIR" "$(dirname "$JAR")/lib"
 fi
+# Fresh work dir: never reuse leftover result.json / gen-*.json / prior swarm segments
+# (smoke3 judged leftover smoke2 results after ENOSPC left empty gen files).
+mkdir -p "$WD"
+rm -rf "$WD/swarm"
+rm -f "$OUT" "$WD"/gen-*.json "$WD/disk-abort"
 mkdir -p "$WD/site" "$WD/swarm"
 echo hi > "$WD/site/hello.txt"
+
+# Free-space guard (mandatory #502-smoke4): refuse to start a leg below 20G free on /workspace;
+# a watcher aborts the leg if free space drops below 10G.
+_workspace_avail() { df -B1 --output=avail /workspace | awk 'NR==2 { print $1 }'; }
+_write_disk_result() {
+  local reason=$1
+  HARNESS_COMMIT=${HARNESS_COMMIT:-} python3 -c '
+import json, os, sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({
+    "error": sys.argv[2],
+    "harness_commit": os.environ.get("HARNESS_COMMIT", ""),
+    "mib_s": 0,
+    "validity_marker": "DISK",
+}, indent=2) + "\n")
+' "$OUT" "$reason"
+}
+NEED_START=$((20 * 1024 * 1024 * 1024))
+NEED_ABORT=$((10 * 1024 * 1024 * 1024))
+_av=$(_workspace_avail)
+if [ -z "$_av" ] || [ "$_av" -lt "$NEED_START" ]; then
+  echo "one.sh: REFUSE: /workspace has ${_av:-unknown} bytes free (need 20G to start a leg)" >&2
+  _write_disk_result "REFUSE_DISK_LT_20G"
+  exit 5
+fi
 # A1 fallback (Architecture 2026-10-30 13:12): HttpClient has no local-bind API, so raise
 # max_connections_per_ip only in this bench config — never change ServerConfig defaults.
 # Preferred multi-loopback bind remains awkward with java.net.http.HttpClient.
@@ -123,13 +153,50 @@ taskset -c "$SRV_CPUS" nice -n 10 java -XX:+UseZGC $HEAP "${SERVER_JAVA_ARGS[@]}
   -Dsjws.swarm.pool.shards=4 -Dsjws.swarm.stream.shards=4 \
   -Dsjws.swarm.dir="$WD/swarm" -Dsjws.swarm.node=bench \
   -Dsjws.swarm.tokens.file="$WD/tokens" \
+  -Dsjws.messaging.segment.bytes="${SJWS_MESSAGING_SEGMENT_BYTES:-16777216}" \
   -jar "$JAR" --config="$WD/gate-server.yaml" --metrics=localhost "$PORT" "$WD/site" >"$LOG" 2>&1 &
 SPID=$!
 export SERVER_PID=$SPID
 # Own PIDs for foreign-CPU sampler (07:05 addendum): server + this one.sh shell.
 { echo "$$"; echo "$SPID"; } > "$WD/bench.pids"
-cleanup(){ kill $SPID 2>/dev/null || true; wait $SPID 2>/dev/null || true; }
+GENPIDS=()
+_SPACE_WATCH_PID=
+cleanup(){
+  if [ -n "${_SPACE_WATCH_PID:-}" ]; then
+    kill "$_SPACE_WATCH_PID" 2>/dev/null || true
+    wait "$_SPACE_WATCH_PID" 2>/dev/null || true
+  fi
+  local p
+  for p in "${GENPIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+  kill ${SPID:-} 2>/dev/null || true
+  wait ${SPID:-} 2>/dev/null || true
+  # Mandatory: delete this leg's swarm dir as soon as the leg ends. Keep metrics.txt and result JSON.
+  rm -rf "$WD/swarm"
+}
 trap cleanup EXIT
+# Abort the leg if free space on /workspace drops below 10G while it is running.
+_space_watch() {
+  while true; do
+    sleep 2
+    local av
+    av=$(_workspace_avail)
+    if [ -n "$av" ] && [ "$av" -lt "$NEED_ABORT" ]; then
+      echo "one.sh: ABORT: /workspace has ${av} bytes free (min 10G during a leg)" >&2
+      date -Iseconds > "$WD/disk-abort"
+      local p
+      for p in "${GENPIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+      if [ -f "$WD/bench.pids" ]; then
+        while read -r p; do
+          [ "$p" = "$$" ] && continue
+          kill "$p" 2>/dev/null || true
+        done < "$WD/bench.pids"
+      fi
+      return 0
+    fi
+  done
+}
+_space_watch &
+_SPACE_WATCH_PID=$!
 ok=0
 for i in $(seq 1 200); do
   curl -sf -o /dev/null "http://127.0.0.1:$PORT/hello.txt" && ok=1 && break
@@ -243,6 +310,20 @@ else
 fi
 
 # Architecture 2026-10-30 15:13: writer_count + heap_flags into result.json
+if [ -f "$WD/disk-abort" ]; then
+  echo "one.sh: leg aborted on free-space guard (<10G)" >&2
+  _write_disk_result "ABORT_DISK_LT_10G"
+  exit 6
+fi
+# Refuse to publish a leftover or a failed merge: empty gen-*.json must not leave $OUT in place.
+for _g in "$WD"/gen-*.json; do
+  [ -e "$_g" ] || continue
+  if [ ! -s "$_g" ]; then
+    echo "one.sh: empty $_g — refusing to keep a result" >&2
+    rm -f "$OUT"
+    exit 7
+  fi
+done
 if [ -f "$OUT" ]; then
   python3 "$HERE_DIR/amend-result.py" "$OUT" "$WD/swarm" "$HEAP_FLAGS" "$GATE_GROUPS" || true
 fi
@@ -253,5 +334,9 @@ if [ "${CREDIT_OFF:-0}" = 1 ]; then
     echo "FAIL: credit-off /metrics still has sjws_swarm_stream_*" >&2
     exit 4
   fi
+fi
+if [ ! -s "$OUT" ]; then
+  echo "one.sh: no result written at $OUT" >&2
+  exit 7
 fi
 echo "one.sh wrote $OUT"
