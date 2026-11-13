@@ -102,6 +102,9 @@ final class UpstreamPool implements AutoCloseable, Admission.IdleReclaim {
 
     private final ByteBudget budget;
     private final Admission admission;
+    /** The cap hold released when this channel closes; used to await that socket, not the aggregate count. */
+    static final io.netty.util.AttributeKey<Admission.Hold> SLOT =
+            io.netty.util.AttributeKey.valueOf("sjws.admission.slot");
 
     UpstreamPool(URI upstream, Duration connectTimeout, int maxIdle, ByteBudget budget) {
         this(upstream, connectTimeout, maxIdle, budget, null);
@@ -224,17 +227,15 @@ final class UpstreamPool implements AutoCloseable, Admission.IdleReclaim {
         if (slot != null) {
             var ch = future.channel();
             if (ch != null) {
-                var held = slot;
-                ch.closeFuture().addListener(f -> held.release());
-                releasedOnClose = held;
+                bindSlot(ch, slot);
+                releasedOnClose = slot;
                 slot = null;
             }
         }
         try {
             var ch = connected.get(waitMs, TimeUnit.MILLISECONDS);
             if (slot != null) {
-                var held = slot;
-                ch.closeFuture().addListener(f -> held.release());
+                bindSlot(ch, slot);
                 slot = null;
             }
             return new Lease(ch, false);
@@ -322,26 +323,30 @@ final class UpstreamPool implements AutoCloseable, Admission.IdleReclaim {
         return this.idle.size();
     }
 
+    /**
+     * Bind {@code hold} to {@code ch} so it is released exactly once when the channel closes.
+     */
+    private static void bindSlot(Channel ch, Admission.Hold hold) {
+        ch.attr(SLOT).set(hold);
+        ch.closeFuture().addListener(f -> hold.release());
+    }
+
     @Override
     public boolean closeOneIdleAndAwait(Duration timeout) throws InterruptedException {
         var ch = this.idle.pollFirst();
         if (ch == null) {
             return false;
         }
-        int before = this.admission == null ? 0 : this.admission.connections();
+        var hold = ch.attr(SLOT).get();
         ch.close();
         long waitMs = timeout == null || timeout.isZero() || timeout.isNegative()
                 ? 2000 : Math.max(1, timeout.toMillis());
-        long start = System.nanoTime();
-        ch.closeFuture().await(waitMs, TimeUnit.MILLISECONDS);
-        if (this.admission == null) {
-            return true;
+        if (hold != null) {
+            // Wait for this socket's hold, not the shared connection count: another acquire
+            // may take the freed slot before the aggregate count drops (#508 / Codex P2).
+            return hold.awaitReleased(waitMs, TimeUnit.MILLISECONDS);
         }
-        while (this.admission.connections() >= before
-                && TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start) < waitMs) {
-            Thread.sleep(1);
-        }
-        return this.admission.connections() < before;
+        return ch.closeFuture().await(waitMs, TimeUnit.MILLISECONDS) && ch.closeFuture().isDone();
     }
 
     /**

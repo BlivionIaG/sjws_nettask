@@ -844,4 +844,24 @@ class EndpointBalancerTest {
                 "scanning a cold recovering endpoint at the cap must not leak its half-open reservation");
         poolA.health.release();
     }
+
+    @Test
+    void publicConstructorsForwardAdmissionAndActiveHealth() {
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http",
+                null));
+        var src = new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1)));
+        var admission = Admission.of(0, 1);
+        var withAdmission = new EndpointBalancer(src, pools, null, null, admission);
+        this.balancers.add(withAdmission);
+        assertSame(admission, withAdmission.admission());
+        assertEquals("a", body(withAdmission.handle(new Request("GET", "/"))));
+
+        var health = testHealth();
+        var withHealth = new EndpointBalancer(src, pools, null, null, Duration.ofSeconds(10), this.now::get, health,
+                false);
+        this.balancers.add(withHealth);
+        assertNull(withHealth.admission());
+        assertEquals("a", body(withHealth.handle(new Request("GET", "/"))));
+    }
 }

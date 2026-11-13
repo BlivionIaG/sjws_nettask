@@ -243,10 +243,6 @@ public final class ProxyHandler implements Handler, AutoCloseable {
      * connection slot is released so the next acquire can succeed at {@code max_connections} (#508).
      * Idle keep-alive reuse is unchanged: if the socket was returned to the pool, this does not wait.
      */
-    static void discardForRetry(Response response, Duration timeout) {
-        discardForRetry(response, timeout, null);
-    }
-
     static void discardForRetry(Response response, Duration timeout, Admission admission) {
         if (response == null) {
             return;
@@ -285,7 +281,6 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     public int idleConnections() {
         return this.pool.idleCount();
     }
-
     /** Closes the pool; exchanges in flight finish and close their connections. */
     @Override
     public void close() {

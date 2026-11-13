@@ -20,6 +20,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.time.Duration;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Per-upstream {@code max_pending} / {@code max_connections} caps (design §13). Lock-free.
@@ -32,6 +34,7 @@ public final class Admission {
     public static final class Hold {
         private final AtomicBoolean open = new AtomicBoolean(true);
         private final AtomicInteger counter;
+        private final CountDownLatch released = new CountDownLatch(1);
 
         Hold(AtomicInteger counter) {
             this.counter = counter;
@@ -40,7 +43,13 @@ public final class Admission {
         public void release() {
             if (this.open.compareAndSet(true, false)) {
                 this.counter.decrementAndGet();
+                this.released.countDown();
             }
+        }
+
+        /** Wait until {@link #release()} has run, or until {@code timeout}. */
+        boolean awaitReleased(long timeout, TimeUnit unit) throws InterruptedException {
+            return this.released.await(timeout, unit);
         }
     }
 
@@ -56,8 +65,8 @@ public final class Admission {
      */
     interface IdleReclaim {
         /**
-         * Close one idle socket and wait until its connection slot is released, or until
-         * {@code timeout}. @return true if a slot was freed
+         * Close one idle socket and wait until that socket's connection hold is released, or until
+         * {@code timeout}. @return true if this socket's slot was released
          */
         boolean closeOneIdleAndAwait(Duration timeout) throws InterruptedException;
     }
