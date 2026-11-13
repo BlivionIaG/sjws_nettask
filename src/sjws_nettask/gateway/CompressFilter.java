@@ -115,9 +115,11 @@ public final class CompressFilter implements RequestFilter {
         if (headers.contains("content-range") || response.status() == 206) {
             return false;
         }
-        var encoding = headers.get("content-encoding");
-        if (encoding != null && !isIdentity(encoding)) {
-            return false;
+        // Every Content-Encoding field: a later "gzip" field after "identity" is still encoded.
+        for (var entry : headers.entries()) {
+            if ("content-encoding".equals(entry.getKey()) && !isIdentity(entry.getValue())) {
+                return false;
+            }
         }
         if (hasCacheDirective(headers, "no-transform")) {
             return false;
@@ -555,11 +557,22 @@ public final class CompressFilter implements RequestFilter {
         return bytes;
     }
 
-    /** Read the source to the end and leave it open: {@code FilterChain.settle} closes it. */
-    private static byte[] read(Body.Stream stream) throws IOException {
-        var out = new ByteArrayOutputStream(stream.length() > 0 ? (int) stream.length() : 4096);
+    /**
+     * Read the source to the end and leave it open: {@code FilterChain.settle} closes it. The
+     * declared length is enforced as the transport writers would: a source that ends early or
+     * yields more bytes than declared is an error, never a shorter or longer 200 (and never more
+     * than {@code max_buffer}, which eligibility checked against the declared length).
+     */
+    static byte[] read(Body.Stream stream) throws IOException {
+        long declared = stream.length();
+        var out = new ByteArrayOutputStream(declared > 0 ? (int) declared : 4096);
         var src = stream.source();
+        long total = 0;
         for (var data = src.next(); data != null; data = src.next()) {
+            if (declared >= 0 && data.remaining() > declared - total) {
+                throw new IOException("stream body longer than its declared length " + declared);
+            }
+            total += data.remaining();
             if (data.hasArray()) {
                 out.write(data.array(), data.arrayOffset() + data.position(), data.remaining());
             } else {
@@ -567,6 +580,9 @@ public final class CompressFilter implements RequestFilter {
                 data.get(copy);
                 out.write(copy);
             }
+        }
+        if (declared >= 0 && total < declared) {
+            throw new IOException("stream body ended after " + total + " of " + declared + " bytes");
         }
         return out.toByteArray();
     }

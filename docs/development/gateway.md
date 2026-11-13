@@ -176,7 +176,10 @@ compressible types are `text/*` except `text/event-stream`, common XML/JSON/Java
 `image/svg+xml`, and `+json` / `+xml` suffixes. `types` replaces that default with an allow list;
 `except` always excludes. `max_buffer` (default 1 MiB, cap 16 MiB) is the largest in-memory body
 the filter will compress: a `Body.Stream` is read only when its length is known and under that cap,
-then replaced with a new `Body.Bytes` so `FilterChain` can close the original source. A
+then replaced with a new `Body.Bytes` so `FilterChain` can close the original source. A stream
+that ends before its declared length, or yields more, is answered with 500 instead of being
+buffered. Every `Content-Encoding` field is checked: any non-`identity` coding leaves the
+response alone. A
 `Body.FileBody` larger than the cap is compressed as a new unknown-length stream (chunked on
 HTTP/1.1 keep-alive). If gzip does not shrink a buffered body, the original response is kept.
 

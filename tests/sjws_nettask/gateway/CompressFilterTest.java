@@ -607,4 +607,39 @@ class CompressFilterTest {
         assertTrue(json.startsWith("{\"type\":"), json);
         assertEquals("Accept-Encoding", response.headers().get("vary"));
     }
+
+    @Test
+    void enforcesTheDeclaredStreamLengthWhileBuffering() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of("min_size", "1")));
+        var shortBody = "hello".getBytes(StandardCharsets.UTF_8);
+        var truncated = call(filter, request("gzip"), (r) -> new Response(200,
+                ResponseHeaders.of().add("content-type", "text/plain"), new Body.Stream(32, new BytesSource(shortBody))));
+        assertEquals(500, truncated.status(), "a stream that ends early must not become a complete 200");
+        assertNull(truncated.headers().get("content-encoding"));
+        var longBody = "hello gzip ".repeat(40).getBytes(StandardCharsets.UTF_8);
+        var oversized = call(filter, request("gzip"), (r) -> new Response(200,
+                ResponseHeaders.of().add("content-type", "text/plain"), new Body.Stream(5, new BytesSource(longBody))));
+        assertEquals(500, oversized.status(), "a stream longer than declared must not be buffered");
+        assertNull(oversized.headers().get("content-encoding"));
+        var exact = call(filter, request("gzip"), (r) -> new Response(200,
+                ResponseHeaders.of().add("content-type", "text/plain"),
+                new Body.Stream(longBody.length, new BytesSource(longBody))));
+        assertEquals(200, exact.status());
+        assertEquals("gzip", exact.headers().get("content-encoding"));
+    }
+
+    @Test
+    void leavesAResponseAloneWhenAnyContentEncodingFieldIsNotIdentity() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of("min_size", "1")));
+        var body = Body.Bytes.of("hello gzip ".repeat(40).getBytes(StandardCharsets.UTF_8));
+        var upstream = new Response(200, ResponseHeaders.of().add("content-type", "text/plain")
+                .add("content-encoding", "identity").add("content-encoding", "gzip"), body);
+        var response = call(filter, request("gzip, identity;q=0"), upstream);
+        assertTrue(response == upstream, "an already encoded body must be passed through unchanged");
+        assertEquals(List.of("identity", "gzip"), response.headers().entries().stream()
+                .filter(e -> "content-encoding".equals(e.getKey())).map(Map.Entry::getValue).toList());
+        var identityOnly = new Response(200, ResponseHeaders.of().add("content-type", "text/plain")
+                .add("content-encoding", "identity").add("content-encoding", "Identity"), body);
+        assertEquals("gzip", call(filter, request("gzip"), identityOnly).headers().get("content-encoding"));
+    }
 }
