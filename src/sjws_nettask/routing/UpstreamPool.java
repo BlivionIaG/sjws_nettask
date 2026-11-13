@@ -254,15 +254,17 @@ final class UpstreamPool implements AutoCloseable {
 
     /**
      * Waits for an abandoned connect's slot to free so a retry sees an accurate cap.
-     * Releases the hold only after close is confirmed; otherwise the closeFuture
-     * listener keeps it (Codex P2 on #475). Hold.release is idempotent.
+     * No wait when there is no slot (max_connections unset): close stays asynchronous
+     * (Codex P1 on #475). Releases the hold only after close is confirmed; otherwise
+     * the closeFuture listener keeps it. Hold.release is idempotent.
      */
     private void awaitAbandonedSlot(io.netty.channel.ChannelFuture future, Admission.Hold slot) {
+        if (slot == null) {
+            return;
+        }
         var ch = future.channel();
         if (ch == null) {
-            if (slot != null) {
-                slot.release(); // no channel, so no close listener was attached
-            }
+            slot.release(); // no channel, so no close listener was attached
             return;
         }
         boolean closed = false;
@@ -272,7 +274,7 @@ final class UpstreamPool implements AutoCloseable {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        if (closed && slot != null) {
+        if (closed) {
             slot.release();
         }
     }

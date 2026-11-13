@@ -233,6 +233,28 @@ class UpstreamPoolConnectTest {
     }
 
     /**
+     * Codex P1 on #475: with no max_connections cap there is no slot to reclaim, so a
+     * timed-out acquire must return without waiting for the abandoned channel to close.
+     */
+    @Test
+    @Timeout(30)
+    void uncappedTimedOutAcquireDoesNotWaitForClose() throws Exception {
+        try (var pool = new UpstreamPool(URI.create("http://192.0.2.1:9/"),
+                        Duration.ofSeconds(5), 4, new ByteBudget(1 << 20))) {
+            var resume = parkEventLoops();
+            try {
+                long start = System.nanoTime();
+                assertThrows(UpstreamPool.ConnectTimeout.class, () -> pool.acquire(Duration.ofMillis(50)));
+                long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+                assertTrue(elapsedMs < 1000,
+                        "uncapped acquire waited on close: " + elapsedMs + " ms (connect timeout is 5 s)");
+            } finally {
+                resume.run();
+            }
+        }
+    }
+
+    /**
      * Queues a parking task on every upstream event loop so close futures cannot complete
      * until the returned runnable runs.
      */
