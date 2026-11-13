@@ -21,8 +21,10 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.zip.GZIPOutputStream;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.EntityTag;
@@ -89,15 +91,20 @@ public final class CompressFilter implements RequestFilter {
 
     @Override
     public Response filter(Request request, Chain next) {
-        var response = next.proceed(request);
         // Request-side no-transform also forbids an intermediary from changing the
         // representation, including a gzip-specific 304.
         var acceptEncoding = acceptEncoding(request.headers());
         boolean gzip = chooseGzip(acceptEncoding) && !hasCacheDirective(request.headers(), "no-transform");
+        // Translate filter-generated gzip validators to their identity form before the
+        // inner handler runs: an upstream identity ETag can collide with a previous
+        // gzip tag (e.g. "revision" then "revision-gzip"). Evaluate the client's
+        // original If-None-Match against the gzip ETag after proceed.
+        var response = next.proceed(gzip ? withIdentityValidators(request) : request);
+        if (gzip && (compressible(response) || response.status() == 304)
+                && compressedValidatorHits(request, response)) {
+            return notModifiedGzip(response);
+        }
         if (gzip && compressible(response)) {
-            if (compressedValidatorHits(request, response)) {
-                return notModifiedGzip(response);
-            }
             return gzip(response, acceptsIdentity(acceptEncoding));
         }
         if (compressible(response)) {
@@ -226,16 +233,83 @@ public final class CompressFilter implements RequestFilter {
     }
 
     /**
+     * Rewrites {@code If-None-Match} so filter-generated {@code -gzip} validators are presented
+     * to the inner handler in identity form. Leaves {@code *} and malformed fields unchanged.
+     */
+    static Request withIdentityValidators(Request request) {
+        var headers = request.headers();
+        var inm = headers.ifNoneMatch();
+        if (inm == null || inm.isBlank()) {
+            return request;
+        }
+        var translated = identityValidators(inm);
+        if (translated.equals(inm)) {
+            return request;
+        }
+        var fields = headers.fields();
+        if (fields.isEmpty()) {
+            return request.withHeaders(new RequestHeaders(translated, headers.ifModifiedSince(),
+                    headers.ifRange(), headers.range(), headers.acceptEncoding(), headers.host()));
+        }
+        var copy = new LinkedHashMap<String, List<String>>(fields);
+        copy.put("if-none-match", List.of(translated));
+        return request.withHeaders(RequestHeaders.of(Map.copyOf(copy), headers.host()));
+    }
+
+    /** Inverse of {@link #withCoding}: strip a trailing {@code -gzip} from each listed tag. */
+    static String identityValidators(String ifNoneMatch) {
+        var suffix = "-gzip";
+        var out = new StringBuilder(ifNoneMatch.length());
+        int i = 0;
+        int n = ifNoneMatch.length();
+        boolean wrote = false;
+        while (i < n) {
+            char c = ifNoneMatch.charAt(i);
+            if (c == ' ' || c == '\t' || c == ',') {
+                i++;
+                continue;
+            }
+            if (c == '*') {
+                return ifNoneMatch;
+            }
+            var weak = "";
+            if ((c == 'W' || c == 'w') && i + 1 < n && ifNoneMatch.charAt(i + 1) == '/') {
+                weak = ifNoneMatch.substring(i, i + 2);
+                i += 2;
+            }
+            if (i >= n || ifNoneMatch.charAt(i) != '"') {
+                return ifNoneMatch;
+            }
+            int end = ifNoneMatch.indexOf('"', i + 1);
+            if (end < 0) {
+                return ifNoneMatch;
+            }
+            var opaque = ifNoneMatch.substring(i + 1, end);
+            if (opaque.endsWith(suffix) && opaque.length() > suffix.length()) {
+                opaque = opaque.substring(0, opaque.length() - suffix.length());
+            }
+            if (wrote) {
+                out.append(", ");
+            }
+            out.append(weak).append('"').append(opaque).append('"');
+            wrote = true;
+            i = end + 1;
+        }
+        return wrote ? out.toString() : ifNoneMatch;
+    }
+
+    /**
      * True when If-None-Match names the gzip representation this filter would emit. Only a
-     * successful (2xx) GET or HEAD may become a 304 (RFC 9110 13.1.2, 13.2.2); an upstream error
-     * or the result of an unsafe method is passed through unchanged.
+     * successful (2xx or 304) GET or HEAD may become a 304 (RFC 9110 13.1.2, 13.2.2); an upstream
+     * error or the result of an unsafe method is passed through unchanged.
      */
     static boolean compressedValidatorHits(Request request, Response response) {
         var method = request.method();
         if (!"GET".equals(method) && !"HEAD".equals(method)) {
             return false;
         }
-        if (response.status() < 200 || response.status() > 299) {
+        int status = response.status();
+        if (status != 304 && (status < 200 || status > 299)) {
             return false;
         }
         var inm = request.headers().ifNoneMatch();

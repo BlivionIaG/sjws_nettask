@@ -393,6 +393,31 @@ class CompressFilterTest {
     }
 
     @Test
+    void identityEtagMatchingAnOldGzipValidatorDoesNot304() throws Exception {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
+        var plain = "hello gzip ".repeat(40);
+        // Version 2: the identity ETag is now "revision-gzip", equal to the previous gzip tag.
+        java.util.function.Function<Request, Response> inner = (r) -> {
+            var etag = "\"revision-gzip\"";
+            var inm = r.headers().ifNoneMatch();
+            if (inm != null && sjws_nettask.core.EntityTag.noneMatchHits(inm, etag)) {
+                return new Response(304, ResponseHeaders.of().add("etag", etag), Body.Empty.INSTANCE);
+            }
+            return new Response(200, ResponseHeaders.of()
+                    .add("content-type", "text/plain")
+                    .add("etag", etag), Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8)));
+        };
+        var response = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-none-match", List.of("\"revision-gzip\"")))), inner);
+        assertEquals(200, response.status(),
+                "a new identity ETag equal to the old gzip validator must not become a 304");
+        assertEquals("gzip", response.headers().get("content-encoding"));
+        assertEquals("\"revision-gzip-gzip\"", response.headers().get("etag"));
+        assertEquals(plain, gunzip(response));
+    }
+
+    @Test
     void negotiatesAcrossRepeatedAcceptEncodingFields() throws Exception {
         var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
         var plain = "hello gzip ".repeat(40);
