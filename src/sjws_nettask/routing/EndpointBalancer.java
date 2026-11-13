@@ -20,8 +20,11 @@ import java.io.IOException;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Objects;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -49,7 +52,10 @@ import sjws_nettask.routing.discovery.UpstreamSource;
  * <p>
  * The gateway owns passive health: each endpoint has a consecutive-failure counter, an
  * error-rate window and a circuit (eject for {@code eject_for}, doubling per failed probe up to
- * 32×, one half-open probe at a time). When more than {@code max_ejection} of the set is ejected
+ * 32×, one half-open probe at a time). Optional {@link ActiveHealth} probes, off unless
+ * configured, send a synthetic GET or HEAD and feed the same circuit; they share the half-open
+ * slot, and with them enabled a client request is not used as a probe. Local outlier state is
+ * never pushed to the control plane. When more than {@code max_ejection} of the set is ejected
  * the balancer panics and ignores ejection. Retries (the upstream's {@code retry}) go to a
  * different endpoint when one is available. Never-populated sources answer 503.
  */
@@ -108,15 +114,44 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
     private final AtomicInteger ejected = new AtomicInteger();
     private final AtomicInteger cursor = new AtomicInteger();
     private final AutoCloseable subscription;
+    private final ActiveHealth activeHealth;
+    private final ScheduledExecutorService probes; // null when active health is unset
+    private final ExecutorService probeWorkers; // null when unset
+    private final ConcurrentHashMap<String, Long> lastProbe = new ConcurrentHashMap<>();
+    private final AtomicInteger probeInFlight = new AtomicInteger();
+    private final AtomicInteger probesSent = new AtomicInteger();
+    /** Next index in the current view at which {@link #probeTick} starts scanning. */
+    private final AtomicInteger probeScan = new AtomicInteger();
+    private final boolean syncProbes; // tests: run probes on the caller of probeTick()
     private volatile View view;
-    private boolean closed; // guarded by this
+    private volatile boolean closed; // set true before executors are shut down
 
     public EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier) {
-        this(source, pools, retry, outlier, Duration.ofSeconds(10), System::nanoTime);
+        this(source, pools, retry, outlier, Duration.ofSeconds(10), System::nanoTime, null);
+    }
+
+    /** @param activeHealth optional probes, or null for none (no threads or timers) */
+    public EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier,
+            ActiveHealth activeHealth) {
+        this(source, pools, retry, outlier, Duration.ofSeconds(10), System::nanoTime, activeHealth);
     }
 
     EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier, Duration grace,
             LongSupplier clock) {
+        this(source, pools, retry, outlier, grace, clock, null);
+    }
+
+    EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier, Duration grace,
+            LongSupplier clock, ActiveHealth activeHealth) {
+        this(source, pools, retry, outlier, grace, clock, activeHealth, activeHealth != null);
+    }
+
+    /**
+     * @param startScheduler when false (tests), no probe threads are started and {@link #probeTick}
+     *        runs probes on the caller
+     */
+    EndpointBalancer(UpstreamSource source, Pools pools, Resilience.Retry retry, Outlier outlier, Duration grace,
+            LongSupplier clock, ActiveHealth activeHealth, boolean startScheduler) {
         this.source = Objects.requireNonNull(source, "source");
         this.factory = Objects.requireNonNull(pools, "pools");
         this.retry = retry;
@@ -124,11 +159,43 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         this.outlier = outlier == null ? Outlier.DEFAULT : outlier;
         this.grace = grace;
         this.clock = clock;
+        this.activeHealth = activeHealth;
         this.subscription = source.subscribe(this::swap);
         var initial = source.current();
         if (initial != null) {
             swap(initial);
         }
+        if (activeHealth == null) {
+            this.probes = null;
+            this.probeWorkers = null;
+            this.syncProbes = false;
+        } else if (!startScheduler) {
+            this.probes = null;
+            this.probeWorkers = null;
+            this.syncProbes = true;
+        } else {
+            String label = initial != null ? initial.service() : "upstream";
+            var exec = Executors.newSingleThreadScheduledExecutor(r -> {
+                var t = new Thread(r, "sjws-active-health-" + label);
+                t.setDaemon(true);
+                return t;
+            });
+            this.probes = exec;
+            this.probeWorkers = Executors.newFixedThreadPool(MAX_PROBES_IN_FLIGHT, r -> {
+                var t = new Thread(r, "sjws-active-health-probe-" + label);
+                t.setDaemon(true);
+                return t;
+            });
+            this.syncProbes = false;
+            long tickMs = tickMillis(activeHealth);
+            exec.scheduleAtFixedRate(this::probeTick, tickMs, tickMs, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    static long tickMillis(ActiveHealth health) {
+        long a = Math.max(1, health.interval().toMillis());
+        long b = Math.max(1, health.ejectInterval().toMillis());
+        return Math.max(10, Math.min(50, Math.min(a, b) / 2));
     }
 
     /** Immutable per set: the pools in set order, and the policy's precomputed structures. */
@@ -173,6 +240,7 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         final AtomicInteger inflight = new AtomicInteger();
         final Health health;
         int refs; // guarded by the balancer
+        volatile boolean abandoned; // left every set: in-flight probes must not update health
 
         Pool(String key, ProxyHandler proxy, Health health) {
             this.key = key;
@@ -204,7 +272,9 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
             if (old != null) {
                 for (var pool : old.pools) {
                     if (--pool.refs == 0) {
+                        pool.abandoned = true;
                         this.pools.remove(pool.key);
+                        this.lastProbe.remove(pool.key);
                         pool.health.forget();
                         closeLater(pool.proxy);
                     }
@@ -242,11 +312,24 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
     @Override
     public void close() {
         this.lock.lock();
+        boolean already;
         try {
-            if (this.closed) {
+            already = this.closed;
+            this.closed = true;
+        } finally {
+            this.lock.unlock();
+        }
+        if (this.probes != null) {
+            this.probes.shutdownNow();
+        }
+        if (this.probeWorkers != null) {
+            this.probeWorkers.shutdownNow();
+        }
+        this.lock.lock();
+        try {
+            if (already) {
                 return;
             }
-            this.closed = true;
             try {
                 this.subscription.close();
             } catch (Exception e) {
@@ -279,6 +362,11 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         while (true) {
             long now = this.clock.getAsLong();
             int i = pick(v, tried, tries, now);
+            if (i < 0) {
+                var refused = StaticFileHandler.error(503, head);
+                refused.headers().add("retry-after", Long.toString(retryAfterSeconds(v, now)));
+                return refused;
+            }
             var pool = v.pools[i];
             Resilience.On failed;
             Response response = null;
@@ -329,7 +417,7 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         int draws = Math.min(n, 4);
         for (int d = 0; d < draws; d++) {
             int i = policyPick(v);
-            if (!contains(tried, nTried, i) && (panic || v.pools[i].health.available(now))) {
+            if (!contains(tried, nTried, i) && clientMayUse(v.pools[i], now, panic)) {
                 return i;
             }
         }
@@ -339,18 +427,150 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                 int i = (start + k) % n;
                 boolean weighted = v.set.endpointAt(i).effectiveWeight() > 0 || v.positive.length == n;
                 if (weighted == (pass == 0) && !contains(tried, nTried, i)
-                        && (panic || v.pools[i].health.available(now))) {
+                        && clientMayUse(v.pools[i], now, panic)) {
                     return i;
                 }
             }
         }
         for (int k = 0; k < n; k++) { // only tried endpoints are healthy: retry one of them
             int i = (start + k) % n;
-            if (panic || v.pools[i].health.available(now)) {
+            if (clientMayUse(v.pools[i], now, panic)) {
                 return i;
             }
         }
+        if (this.activeHealth != null && !panic) {
+            return -1; // probes own recovery; do not send client traffic as a half-open probe
+        }
         return policyPick(v); // everything ejected and below the panic line: still answer
+    }
+
+    /**
+     * With active health, ejected endpoints stay out of rotation until a synthetic probe succeeds;
+     * the half-open slot is not given to a client request. Without it, {@link Health#available}
+     * admits one client probe after {@code eject_for}.
+     */
+    private boolean clientMayUse(Pool pool, long now, boolean panic) {
+        if (panic) {
+            return true;
+        }
+        if (this.activeHealth != null) {
+            return !pool.health.ejected();
+        }
+        return pool.health.available(now);
+    }
+
+    private long retryAfterSeconds(View v, long now) {
+        long min = Long.MAX_VALUE;
+        for (var pool : v.pools) {
+            min = Math.min(min, pool.health.retryAfterSeconds(now));
+        }
+        return min == Long.MAX_VALUE ? 1 : min;
+    }
+
+    static final int MAX_PROBES_IN_FLIGHT = 2;
+
+    void probeTick() {
+        var v = this.view;
+        var policy = this.activeHealth;
+        if (v == null || policy == null || this.closed) {
+            return;
+        }
+        int n = v.pools.length;
+        if (n == 0) {
+            return;
+        }
+        long now = this.clock.getAsLong();
+        int start = Math.floorMod(this.probeScan.get(), n);
+        int i = 0;
+        for (; i < n; i++) {
+            if (this.closed) {
+                return;
+            }
+            if (this.probeInFlight.get() >= MAX_PROBES_IN_FLIGHT) {
+                break;
+            }
+            var pool = v.pools[Math.floorMod(start + i, n)];
+            boolean ejected = pool.health.ejected();
+            if (ejected) {
+                long last = this.lastProbe.getOrDefault(pool.key, 0L);
+                if (last != 0L && now - last < policy.ejectInterval().toNanos()) {
+                    continue;
+                }
+                if (!pool.health.available(now)) {
+                    continue; // still in eject_for, or the half-open slot is taken
+                }
+                // available() has reserved the half-open slot
+            } else {
+                Long last = this.lastProbe.get(pool.key);
+                if (last == null) {
+                    // stagger the first in-rotation probe so a set does not fire as a herd
+                    long interval = Math.max(1, policy.interval().toNanos());
+                    long delay = Math.floorMod(pool.key.hashCode(), interval);
+                    last = now - interval + delay;
+                    this.lastProbe.put(pool.key, last);
+                }
+                if (now - last < policy.interval().toNanos()) {
+                    continue;
+                }
+            }
+            this.lastProbe.put(pool.key, now);
+            this.probeInFlight.incrementAndGet();
+            this.probesSent.incrementAndGet();
+            if (this.syncProbes) {
+                runProbe(pool, ejected);
+                continue;
+            }
+            try {
+                this.probeWorkers.execute(() -> runProbe(pool, ejected));
+            } catch (RejectedExecutionException e) {
+                this.probeInFlight.decrementAndGet();
+                if (ejected) {
+                    pool.health.release();
+                }
+                break;
+            }
+        }
+        this.probeScan.set(Math.floorMod(start + i, n));
+    }
+
+    private void runProbe(Pool pool, boolean heldHalfOpen) {
+        try {
+            if (this.closed || pool.abandoned) {
+                if (heldHalfOpen) {
+                    pool.health.release();
+                }
+                return;
+            }
+            int status;
+            try {
+                status = pool.proxy.probe(this.activeHealth.method(), this.activeHealth.path(),
+                        this.activeHealth.timeout());
+            } catch (IOException | InterruptedException e) {
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                if (!this.closed && !pool.abandoned) {
+                    pool.health.failure(this.clock.getAsLong());
+                } else if (heldHalfOpen) {
+                    pool.health.release();
+                }
+                return;
+            }
+            if (this.closed || pool.abandoned) {
+                if (heldHalfOpen) {
+                    pool.health.release();
+                }
+                return;
+            }
+            long now = this.clock.getAsLong();
+            if (ActiveHealth.success(status)) {
+                pool.health.success(now);
+            } else {
+                pool.health.failure(now);
+            }
+        } finally {
+            this.probeInFlight.decrementAndGet();
+        }
     }
 
     private int policyPick(View v) {
@@ -384,6 +604,18 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
     /** Ejected endpoints of the pools in use. */
     int ejectedCount() {
         return this.ejected.get();
+    }
+
+    public ActiveHealth activeHealth() {
+        return this.activeHealth;
+    }
+
+    public boolean hasActiveProbes() {
+        return this.activeHealth != null;
+    }
+
+    int probesSent() {
+        return this.probesSent.get();
     }
 
     int poolCount() {
@@ -447,6 +679,16 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
 
         boolean ejected() {
             return this.ejectedUntil != 0;
+        }
+
+        /** Seconds until a probe is allowed, for Retry-After (at least 1). */
+        long retryAfterSeconds(long now) {
+            long until = this.ejectedUntil;
+            if (until == 0) {
+                return 1;
+            }
+            long left = until - now;
+            return Math.max(1, (left + 999_999_999L) / 1_000_000_000L);
         }
 
         void release() {
