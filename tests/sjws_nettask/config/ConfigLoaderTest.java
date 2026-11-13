@@ -597,6 +597,43 @@ class ConfigLoaderTest {
     }
 
     @Test
+    void maxPendingAndMaxConnectionsParseAndRoundTrip() throws Exception {
+        var off = ConfigLoader.load(new String[] {"--config=" + write(up(""))}, Map.of());
+        assertTrue(off.ok(), off.errors().toString());
+        var plain = off.document().routing().upstreams().get("api");
+        assertEquals(0, plain.maxPending());
+        assertEquals(0, plain.maxConnections());
+        assertFalse(ConfigCodec.text(off.document()).contains("max_pending"));
+        assertFalse(ConfigCodec.text(off.document()).contains("      max_connections:"));
+
+        var on = ConfigLoader.load(new String[] {"--config=" + write(up("""
+                      max_pending: 128
+                      max_connections: 64
+                """))}, Map.of());
+        assertTrue(on.ok(), on.errors().toString());
+        var api = on.document().routing().upstreams().get("api");
+        assertEquals(128, api.maxPending());
+        assertEquals(64, api.maxConnections());
+        var text = ConfigCodec.text(on.document());
+        assertTrue(text.contains("max_pending: 128"), text);
+        assertTrue(text.contains("max_connections: 64"), text);
+        var again = ConfigLoader.load(new String[] {"--config=" + write(text)}, Map.of());
+        assertTrue(again.ok(), again.errors().toString());
+        var api2 = again.document().routing().upstreams().get("api");
+        assertEquals(128, api2.maxPending());
+        assertEquals(64, api2.maxConnections());
+    }
+
+    @Test
+    void maxPendingAndMaxConnectionsErrors() throws Exception {
+        assertTrue(error(up("      max_pending: 0\n")).contains("max_pending"));
+        assertTrue(error(up("      max_connections: 0\n")).contains("max_connections"));
+        assertTrue(error(up("      max_pending: -1\n")).contains("max_pending"));
+        assertTrue(error(up("      max_pending: lots\n")).contains("max_pending"));
+        assertTrue(error(up("      max_inflight: 1\n")).contains("Unknown key"));
+    }
+
+    @Test
     void haClusterKeyComesFromTheFileOrEnvAndIsNeverLogged() throws Exception {
         var fileKey = "file-cluster-key-0123456789";
         var previous = "file-previous-key-0123456";
