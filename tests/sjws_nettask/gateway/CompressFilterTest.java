@@ -600,12 +600,22 @@ class CompressFilterTest {
         assertEquals("application/problem+json", response.headers().get("content-type"));
         assertNull(response.headers().get("content-encoding"), "the JSON body is not gzip");
         assertNull(response.headers().get("etag"));
+        assertNull(response.headers().get("vary"), "compression-added Vary is not a property of the JSON body");
         var data = ((Body.Bytes) response.body()).data().duplicate();
         var bytes = new byte[data.remaining()];
         data.get(bytes);
         var json = new String(bytes, StandardCharsets.UTF_8);
         assertTrue(json.startsWith("{\"type\":"), json);
-        assertEquals("Accept-Encoding", response.headers().get("vary"));
+
+        var mixed = ResponseHeaders.of()
+                .add("content-encoding", "gzip")
+                .add("etag", "\"abc-gzip\"")
+                .add("vary", "Origin, Accept-Encoding");
+        var converted = sjws_nettask.core.Problem.of(503, null, "/", mixed, false);
+        assertNull(converted.headers().get("content-encoding"));
+        assertNull(converted.headers().get("etag"));
+        assertEquals("Origin", converted.headers().get("vary"),
+                "Vary tokens not added by compression must be kept");
     }
 
     @Test
