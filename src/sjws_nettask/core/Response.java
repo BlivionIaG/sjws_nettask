@@ -27,9 +27,12 @@ import java.util.Objects;
  * @param headOnly the request was HEAD: send the head (with the body's length) but no body
  * @param localAdmission produced by local proxy admission (e.g. peer-budget share) rather than an
  *        upstream; balancers must not count these against endpoint health
+ * @param generated an error page, listing or redirect built by this server (not an upstream or
+ *        file body). Survives a later filter rewriting headers, so problem+json conversion does
+ *        not depend on a header marker.
  */
 public record Response(int status, ResponseHeaders headers, Body body, boolean headOnly,
-        boolean localAdmission) {
+        boolean localAdmission, boolean generated) {
 
     public Response {
         if (status < 100 || status > 999) {
@@ -40,16 +43,27 @@ public record Response(int status, ResponseHeaders headers, Body body, boolean h
     }
 
     public Response(int status, ResponseHeaders headers, Body body) {
-        this(status, headers, body, false, false);
+        this(status, headers, body, false, false, false);
     }
 
     public Response(int status, ResponseHeaders headers, Body body, boolean headOnly) {
-        this(status, headers, body, headOnly, false);
+        this(status, headers, body, headOnly, false, false);
+    }
+
+    public Response(int status, ResponseHeaders headers, Body body, boolean headOnly, boolean localAdmission) {
+        this(status, headers, body, headOnly, localAdmission, false);
     }
 
     /** Copy with {@link #localAdmission()} set; same instance if already marked. */
     public Response asLocalAdmission() {
-        return this.localAdmission ? this : new Response(this.status, this.headers, this.body, this.headOnly, true);
+        return this.localAdmission ? this
+                : new Response(this.status, this.headers, this.body, this.headOnly, true, this.generated);
+    }
+
+    /** Copy with {@link #generated()} set; same instance if already marked. */
+    public Response asGenerated() {
+        return this.generated ? this
+                : new Response(this.status, this.headers, this.body, this.headOnly, this.localAdmission, true);
     }
 
     public long contentLength() {

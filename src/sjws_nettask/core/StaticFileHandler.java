@@ -356,16 +356,18 @@ public final class StaticFileHandler implements Handler {
                 .add("content-type", Mime.contentType("text/html"))
                 .add("x-content-type-options", NOSNIFF)
                 .add("content-security-policy", HTML_CSP);
-        return new Response(status, headers, Body.Bytes.of(html.getBytes(StandardCharsets.UTF_8)), head);
+        return new Response(status, headers, Body.Bytes.of(html.getBytes(StandardCharsets.UTF_8)), head)
+                .asGenerated();
     }
 
     /**
-     * True for a page built by {@link #error}/{@link #html} here (identity check on the shared
-     * {@link #HTML_CSP} constant, so a proxied upstream response never qualifies). Lets a route
+     * True for a page built by {@link #error}/{@link #html} here (the {@link Response#generated()}
+     * flag, so a proxied upstream response never qualifies even if it copies {@link #HTML_CSP},
+     * and a later filter that rewrites that header does not drop the mark). Lets a route
      * re-render server-generated errors (e.g. as problem+json) without touching upstream bodies.
      */
     public static boolean isGenerated(Response response) {
-        return response.headers().get("content-security-policy") == HTML_CSP;
+        return response.generated();
     }
 
     public static Response error(int status, boolean head) {
