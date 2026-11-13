@@ -120,7 +120,7 @@ final class RoutingCompiler {
                 u.idleReadTimeout(), u.maxBody(), proto, cidrs, u.preserveHost(), 256),
                 sjws_nettask.routing.ByteBudget.shared(), null);
         var retry = u.resilience() == null ? null : u.resilience().retry();
-        return new EndpointBalancer(source, pools, retry, d.outlier());
+        return new EndpointBalancer(source, pools, retry, d.outlier(), u.activeHealth());
     }
 
     private static ProxyHandler proxy(Upstream u, String proto, java.util.List<Cidr> cidrs) {

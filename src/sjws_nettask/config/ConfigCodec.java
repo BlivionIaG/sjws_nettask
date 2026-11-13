@@ -221,6 +221,14 @@ public final class ConfigCodec {
                             .append(", window: ").append(quote(duration(o.window())))
                             .append(", max_ejection: ").append(o.maxEjectionPercent()).append(" }\n");
                 }
+                var active = upstream.activeHealth();
+                if (active != null) {
+                    out.append("      active_health: { path: ").append(quote(active.path()))
+                            .append(", method: ").append(active.method())
+                            .append(", interval: ").append(quote(duration(active.interval())))
+                            .append(", eject_interval: ").append(quote(duration(active.ejectInterval())))
+                            .append(", timeout: ").append(quote(duration(active.timeout()))).append(" }\n");
+                }
                 out.append("      connect_timeout: ").append(quote(duration(upstream.connectTimeout()))).append('\n');
                 out.append("      response_timeout: ").append(quote(duration(upstream.responseTimeout())))
                         .append('\n');

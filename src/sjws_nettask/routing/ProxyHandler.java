@@ -286,6 +286,44 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         return exchange(request, out, length, true);
     }
 
+    /**
+     * One synthetic health-check exchange: no retries, no circuit, no forwarding headers.
+     * {@code path} is the origin-form target as-is (not prefixed with the upstream path).
+     *
+     * @return the upstream status code
+     */
+    int probe(String method, String path, Duration timeout) throws IOException, InterruptedException {
+        if (path == null || !path.startsWith("/")) {
+            throw new IllegalArgumentException("probe path must be origin-form");
+        }
+        var out = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.valueOf(method), path,
+                Unpooled.EMPTY_BUFFER);
+        out.headers().set("Host", this.authority);
+        var lease = this.pool.acquire(timeout);
+        var ch = lease.channel();
+        var ex = new UpstreamPool.Exchange(ch, timeout, this.pool.budget());
+        try {
+            ex.send(out, timeout);
+            var response = ex.head.get();
+            int status = response.status().code();
+            // Health is decided by the status line. Do not sit on an unbounded body.
+            ex.abandon();
+            ch.close();
+            return status;
+        } catch (java.util.concurrent.ExecutionException e) {
+            ex.abandon();
+            ch.close();
+            if (e.getCause() instanceof UpstreamPool.HeadTimeout) {
+                throw new ResponseTimeout();
+            }
+            throw e.getCause() instanceof IOException io ? io : new IOException(e.getCause());
+        } catch (RuntimeException | InterruptedException e) {
+            ex.abandon();
+            ch.close();
+            throw e;
+        }
+    }
+
     static int status(IOException e) {
         return e instanceof UpstreamPool.ConnectTimeout || e instanceof ResponseTimeout ? 504 : 502;
     }

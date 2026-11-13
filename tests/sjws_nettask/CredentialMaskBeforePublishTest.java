@@ -18,15 +18,18 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import sjws_nettask.config.ConfigLoader;
 import sjws_nettask.core.Handler;
 import sjws_nettask.core.Request;
 import sjws_nettask.core.RequestFilters;
 import sjws_nettask.gateway.GatewayFilters;
+import sjws_nettask.h2.Http2Server;
 import sjws_nettask.observe.ObserverSlot;
 
 /** A published config's credential query names are masked before a transport is armed with it. */
@@ -165,8 +168,91 @@ class CredentialMaskBeforePublishTest {
 
             var after = maskedNames(started);
             assertFalse(after.contains(outgoingName),
-                    "the outgoing-only name is retired after swap-out: " + after);
+                    "the outgoing-only name is retired once no generation holds it: " + after);
             return after;
+        }
+    }
+
+
+    /**
+     * A task that already entered the outgoing HTTP/2 generation, and is still queued,
+     * keeps that generation's mask names until the generation quiesces.
+     */
+    @Test
+    @Timeout(20)
+    void outgoingNamesStayUntilThePreviousGenerationQuiesces() throws Exception {
+        var first = Files.createDirectory(dir.resolve("q-first"));
+        Files.writeString(first.resolve("index.html"), "first");
+        var second = Files.createDirectory(dir.resolve("q-second"));
+        Files.writeString(second.resolve("index.html"), "second");
+        var cert = dir.resolve("q-cert.pem");
+        var key = dir.resolve("q-key.pem");
+        mintLocalhostPem(cert, key);
+        var log = dir.resolve("q-access.log");
+        var yaml = dir.resolve("q-sjws.yaml");
+        Files.writeString(yaml, yaml(first, log, "old_key"));
+        var loaded = ConfigLoader.load(new String[] {"--config=" + yaml, "--h2", "--h2-port=0", "--h2c-port=0",
+                "--no-h3", "--cert=" + cert, "--key=" + key}, Map.of());
+        assertTrue(loaded.ok(), loaded.errors().toString());
+        try (var started = SjwsServer.start(loaded)) {
+            var gen = generation(started);
+            assertTrue(gen.tryEnter(), "pin the outgoing generation before the reload");
+            var go = new CountDownLatch(1);
+            var done = new CountDownLatch(1);
+            var error = new AtomicReference<Exception>();
+            Thread.ofVirtual().name("queued-after-tryEnter").start(() -> {
+                try {
+                    go.await();
+                    gen.handler().handle(new Request("GET", "/index.html?old_key=" + SECRET + "&queued=1"));
+                } catch (Exception e) {
+                    error.set(e);
+                } finally {
+                    gen.leave();
+                    done.countDown();
+                }
+            });
+            try {
+                Files.writeString(yaml, yaml(second, log, "new_key"));
+                var result = started.reload();
+                assertTrue(result.applied(), result.errors().toString());
+                var held = maskedNames(started);
+                assertTrue(held.contains("old_key"),
+                        "outgoing name stays while the previous generation is still entered: " + held);
+                assertTrue(held.contains("new_key"), held.toString());
+            } finally {
+                go.countDown();
+            }
+            assertTrue(done.await(10, TimeUnit.SECONDS), "queued task did not finish");
+            if (error.get() != null) {
+                throw new AssertionError(error.get());
+            }
+            var text = awaitLog(log, "queued=1");
+            assertTrue(text.contains("old_key=***"), text);
+            assertFalse(text.contains(SECRET), text);
+
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            List<String> after = maskedNames(started);
+            while (after.contains("old_key") && System.nanoTime() < deadline) {
+                Thread.sleep(20);
+                after = maskedNames(started);
+            }
+            assertFalse(after.contains("old_key"),
+                    "outgoing name is retired after the generation quiesces: " + after);
+            assertTrue(after.contains("new_key"), after.toString());
+        }
+    }
+
+    private static Http2Server.Generation generation(SjwsServer server) {
+        var transport = server.h2();
+        assertTrue(transport instanceof Http2Server, "expected a real HTTP/2 transport: " + transport);
+        try {
+            var method = Http2Server.class.getDeclaredMethod("generation");
+            method.setAccessible(true);
+            var gen = (Http2Server.Generation) method.invoke(transport);
+            assertNotNull(gen, "HTTP/2 has no current generation");
+            return gen;
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
         }
     }
 
