@@ -371,9 +371,9 @@ class AdmissionTest {
                 Duration.ofMillis(200), Duration.ofMillis(200), 1024, "http", null), ByteBudget.shared(), null, failed);
         try {
             assertEquals(502, refused.handle(new Request("GET", "/")).status());
-            assertEquals(0, failed.connections());
+            awaitNoConnections(failed);
             assertEquals(502, refused.handle(new Request("GET", "/")).status());
-            assertEquals(0, failed.connections());
+            awaitNoConnections(failed);
         } finally {
             refused.close();
         }
@@ -382,7 +382,7 @@ class AdmissionTest {
                 Duration.ofMillis(200), Duration.ofMillis(200), 1024, "http", null), ByteBudget.shared(), null, timed);
         try {
             assertEquals(504, blackhole.handle(new Request("GET", "/")).status());
-            assertEquals(0, timed.connections());
+            awaitNoConnections(timed);
         } finally {
             blackhole.close();
         }
@@ -470,5 +470,13 @@ class AdmissionTest {
     private ProxyHandler proxy(Admission admission) {
         return new ProxyHandler(new ProxyHandler.Settings(base(), Duration.ofSeconds(2), Duration.ofSeconds(2), 1024,
                 "http", null), ByteBudget.shared(), null, admission);
+    }
+
+    /** closeFuture listeners can lag the handle() return; wait for the cap to drop. */
+    private static void awaitNoConnections(Admission admission) throws InterruptedException {
+        for (int i = 0; i < 50 && admission.connections() > 0; i++) {
+            Thread.sleep(20);
+        }
+        assertEquals(0, admission.connections());
     }
 }

@@ -187,6 +187,52 @@ class UpstreamPoolConnectTest {
     }
 
     /**
+     * Codex P2 on #475: if the close wait times out because the event loops are still
+     * parked, awaitAbandonedSlot must leave the hold on the close-future listener.
+     * Releasing then would let a second acquire open another socket while the first
+     * is still open, exceeding max_connections.
+     */
+    @Test
+    @Timeout(30)
+    void closeWaitTimeoutKeepsTheSlotUntilTheChannelCloses() throws Exception {
+        var admission = Admission.of(0, 1);
+        // Short connect timeout so the close wait expires while the loops are parked.
+        try (var pool = new UpstreamPool(URI.create("http://192.0.2.1:9/"),
+                        Duration.ofMillis(200), 4, new ByteBudget(1 << 20), admission)) {
+            var started = new CountDownLatch(1);
+            var finished = new CompletableFuture<Throwable>();
+            var resume = parkEventLoops();
+            try {
+                Thread.ofPlatform().start(() -> {
+                    try {
+                        started.countDown();
+                        pool.acquire(Duration.ofMillis(50));
+                        finished.complete(null);
+                    } catch (Throwable e) {
+                        finished.complete(e);
+                    }
+                });
+                assertTrue(started.await(5, TimeUnit.SECONDS));
+                var outcome = finished.get(5, TimeUnit.SECONDS);
+                assertInstanceOf(UpstreamPool.ConnectTimeout.class, outcome);
+                assertEquals(1, admission.connections());
+                var stolen = admission.tryConnection();
+                if (stolen != null) {
+                    stolen.release();
+                    fail("the slot was released before the abandoned channel closed");
+                }
+                assertThrows(UpstreamPool.ConnectionLimit.class, () -> pool.acquire(Duration.ofMillis(50)));
+            } finally {
+                resume.run();
+            }
+            for (int i = 0; i < 50 && admission.connections() > 0; i++) {
+                Thread.sleep(20);
+            }
+            assertEquals(0, admission.connections());
+        }
+    }
+
+    /**
      * Queues a parking task on every upstream event loop so close futures cannot complete
      * until the returned runnable runs.
      */

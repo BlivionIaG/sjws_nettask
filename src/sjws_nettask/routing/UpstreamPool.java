@@ -231,8 +231,6 @@ final class UpstreamPool implements AutoCloseable {
             return new Lease(ch, false);
         } catch (TimeoutException e) {
             abandonConnect(future);
-            // Pass the already-attached hold: closeFuture.await() can return before
-            // its release listener runs, and a retry would still see the cap as full.
             awaitAbandonedSlot(future, releasedOnClose != null ? releasedOnClose : slot);
             throw new ConnectTimeout("connect to " + this.host + ":" + this.port + " timed out");
         } catch (InterruptedException e) {
@@ -254,17 +252,27 @@ final class UpstreamPool implements AutoCloseable {
         }
     }
 
-    /** Waits for an abandoned connect's slot to free so a retry sees an accurate cap. */
+    /**
+     * Waits for an abandoned connect's slot to free so a retry sees an accurate cap.
+     * Releases the hold only after close is confirmed; otherwise the closeFuture
+     * listener keeps it (Codex P2 on #475). Hold.release is idempotent.
+     */
     private void awaitAbandonedSlot(io.netty.channel.ChannelFuture future, Admission.Hold slot) {
         var ch = future.channel();
-        if (ch != null) {
-            try {
-                ch.closeFuture().await(Math.max(1, this.connectTimeout.toMillis()), TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+        if (ch == null) {
+            if (slot != null) {
+                slot.release(); // no channel, so no close listener was attached
             }
+            return;
         }
-        if (slot != null) {
+        boolean closed = false;
+        try {
+            closed = ch.closeFuture().await(Math.max(1, this.connectTimeout.toMillis()), TimeUnit.MILLISECONDS)
+                    && ch.closeFuture().isDone();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (closed && slot != null) {
             slot.release();
         }
     }
