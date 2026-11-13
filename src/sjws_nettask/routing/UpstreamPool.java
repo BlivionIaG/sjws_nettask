@@ -211,11 +211,13 @@ final class UpstreamPool implements AutoCloseable {
         });
         // Hold the slot until the channel actually closes, including when the wait is
         // interrupted or times out while the socket is still connecting (Codex P2 on #475).
+        Admission.Hold releasedOnClose = null;
         if (slot != null) {
             var ch = future.channel();
             if (ch != null) {
                 var held = slot;
                 ch.closeFuture().addListener(f -> held.release());
+                releasedOnClose = held;
                 slot = null;
             }
         }
@@ -229,7 +231,9 @@ final class UpstreamPool implements AutoCloseable {
             return new Lease(ch, false);
         } catch (TimeoutException e) {
             abandonConnect(future);
-            awaitAbandonedSlot(future, slot);
+            // Pass the already-attached hold: closeFuture.await() can return before
+            // its release listener runs, and a retry would still see the cap as full.
+            awaitAbandonedSlot(future, releasedOnClose != null ? releasedOnClose : slot);
             throw new ConnectTimeout("connect to " + this.host + ":" + this.port + " timed out");
         } catch (InterruptedException e) {
             // Cancel and close; keep the slot on closeFuture until the socket is gone so
@@ -241,7 +245,7 @@ final class UpstreamPool implements AutoCloseable {
             throw e;
         } catch (ExecutionException e) {
             abandonConnect(future);
-            awaitAbandonedSlot(future, slot);
+            awaitAbandonedSlot(future, releasedOnClose != null ? releasedOnClose : slot);
             var cause = e.getCause();
             if (cause instanceof io.netty.channel.ConnectTimeoutException) {
                 throw new ConnectTimeout(cause.getMessage());
