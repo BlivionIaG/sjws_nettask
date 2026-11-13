@@ -108,14 +108,6 @@ public final class WeightedHandler implements Handler {
     }
 
     /**
-     * One try on the selected backend, skipping that backend's own retry / circuit so a
-     * {@link RouteResilience} wrapper can apply a per-route policy without nesting.
-     */
-    Response oneShot(Request request) throws IOException, InterruptedException {
-        return oneShot(request, null);
-    }
-
-    /**
      * Per-request history of route-level retries: which backends were tried, and for each
      * {@link EndpointBalancer} backend its own tried-endpoint identities (authorities, private to
      * one balancer, so they are never shared across backends and survive a discovery reorder).
@@ -129,10 +121,6 @@ public final class WeightedHandler implements Handler {
         private Attempts(int cap) {
             this.cap = Math.max(1, cap);
         }
-
-        boolean tried(int backend) {
-            return this.backends[backend];
-        }
     }
 
     /** @param cap the most attempts one request can make (route retries + 1) */
@@ -144,21 +132,16 @@ public final class WeightedHandler implements Handler {
      * One try that, on a route retry, prefers a backend not tried yet (pins and sticky keep their
      * backend) and keeps endpoint history per balancer.
      *
-     * @param state null for a single try without history
+     * @param state this request's history, from {@link #attempts(int)}
      */
     Response oneShot(Request request, Attempts state) throws IOException, InterruptedException {
-        int i = state == null ? select(request.headers()) : select(request.headers(), state.backends);
+        int i = select(request.headers(), state.backends);
         var handler = this.handlers[i];
-        if (state != null) {
-            state.backends[i] = true;
-        }
+        state.backends[i] = true;
         if (handler instanceof ProxyHandler proxy) {
             return proxy.attemptWithPending(request);
         }
         if (handler instanceof EndpointBalancer balancer) {
-            if (state == null) {
-                return balancer.oneShot(request);
-            }
             if (state.endpoints[i] == null) {
                 state.endpoints[i] = new String[state.cap];
                 state.counts[i] = new int[1];

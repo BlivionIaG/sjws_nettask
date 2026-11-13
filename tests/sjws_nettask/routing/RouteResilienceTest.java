@@ -611,4 +611,65 @@ class RouteResilienceTest {
             ok.stop(0);
         }
     }
+
+    @Test
+    void weightedRouteRetryReinvokesAPlainBackend() {
+        var hits = new AtomicInteger();
+        Handler plain = request -> StaticFileHandler.error(hits.incrementAndGet() == 1 ? 503 : 200,
+                request.headOnly());
+        var weighted = new WeightedHandler(List.of(new WeightedHandler.Backend(plain, 1, null)), null);
+        var wrap = new RouteResilience(weighted, new Resilience(retry503(1), null));
+        assertEquals(200, wrap.handle(new Request("GET", "/")).status());
+        assertEquals(2, hits.get(), "route retry should re-invoke a plain weighted backend");
+    }
+
+    @Test
+    void interruptingARouteOneShotReturns502AndReleasesTheCircuitAndPendingSlot() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var heldUp = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        heldUp.createContext("/", ex -> {
+            entered.countDown();
+            try {
+                release.await(8, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            ex.close();
+        });
+        heldUp.start();
+        var admission = Admission.of(1, 0);
+        var proxied = new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://127.0.0.1:" + heldUp.getAddress().getPort()), Duration.ofSeconds(5),
+                Duration.ofSeconds(5), 1024, "http", null), ByteBudget.shared(), null, admission);
+        try {
+            // threshold 1: counting the interrupt as a failure would open the circuit
+            var wrap = new RouteResilience(proxied,
+                    new Resilience(retry503(1), new Resilience.Circuit(1, Duration.ofSeconds(30))));
+            var status = new AtomicInteger();
+            var stillInterrupted = new AtomicBoolean();
+            var err = new AtomicReference<Throwable>();
+            var t = Thread.ofPlatform().start(() -> {
+                try {
+                    status.set(wrap.handle(new Request("GET", "/")).status());
+                    stillInterrupted.set(Thread.currentThread().isInterrupted());
+                } catch (Throwable e) {
+                    err.set(e);
+                }
+            });
+            assertTrue(entered.await(8, TimeUnit.SECONDS));
+            assertEquals(1, admission.pending());
+            t.interrupt();
+            t.join(8000);
+            assertNull(err.get());
+            assertEquals(502, status.get());
+            assertTrue(stillInterrupted.get(), "the interrupt flag must be restored");
+            assertEquals(0, admission.pending());
+            assertEquals("CLOSED", wrap.circuitState());
+        } finally {
+            release.countDown();
+            proxied.close();
+            heldUp.stop(0);
+        }
+    }
 }
