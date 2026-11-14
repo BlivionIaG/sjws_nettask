@@ -233,11 +233,13 @@ public final class CompressFilter implements RequestFilter {
     }
 
     /**
-     * Rewrites {@code If-None-Match} and {@code If-Match} so filter-generated {@code -gzip}
-     * validators are presented to the inner handler in identity form. Leaves {@code *},
-     * malformed fields, and {@code If-Range} unchanged: a translated If-Range would make
-     * the inner handler apply identity byte offsets to a client that already has gzip
-     * bytes, and this filter does not recompress 206 responses.
+     * Rewrites {@code If-None-Match} so filter-generated {@code -gzip} validators are
+     * presented to the inner handler in identity form. {@code If-Match} lists that identity
+     * form and keeps the original tag, so a pass-through upstream that already owns a
+     * {@code -gzip} ETag still matches. Leaves {@code *}, malformed fields, and
+     * {@code If-Range} unchanged: a translated If-Range would make the inner handler apply
+     * identity byte offsets to a client that already has gzip bytes, and this filter does
+     * not recompress 206 responses.
      */
     static Request withIdentityValidators(Request request) {
         var headers = request.headers();
@@ -264,10 +266,11 @@ public final class CompressFilter implements RequestFilter {
         if (values == null || values.isEmpty()) {
             return false;
         }
+        boolean ifMatch = "if-match".equals(name);
         var next = new ArrayList<String>(values.size());
         boolean changed = false;
         for (var raw : values) {
-            var translated = identityValidators(raw);
+            var translated = ifMatch ? ifMatchValidators(raw) : identityValidators(raw);
             changed |= !same(translated, raw);
             next.add(translated);
         }
@@ -275,6 +278,19 @@ public final class CompressFilter implements RequestFilter {
             fields.put(name, List.copyOf(next));
         }
         return changed;
+    }
+
+    /**
+     * If-Match carries the identity form of a generated gzip validator and the original
+     * tag, so a pass-through response whose upstream ETag already ends in {@code -gzip}
+     * still satisfies the precondition.
+     */
+    static String ifMatchValidators(String raw) {
+        var identity = identityValidators(raw);
+        if (same(identity, raw)) {
+            return raw;
+        }
+        return identity + ", " + raw;
     }
 
     private static boolean same(String a, String b) {

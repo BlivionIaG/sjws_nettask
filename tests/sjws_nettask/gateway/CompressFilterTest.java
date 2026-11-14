@@ -441,6 +441,60 @@ class CompressFilterTest {
     }
 
     @Test
+    void ifMatchKeepsUpstreamOwnedGzipValidatorsOnPassThrough() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
+        var plain = "hello gzip ".repeat(40);
+        var etag = "\"abc-gzip\"";
+        var seen = new java.util.ArrayList<String>();
+        java.util.function.Function<ResponseHeaders, java.util.function.Function<Request, Response>> inner =
+                (headers) -> (r) -> {
+                    var ifMatch = r.headers().values("if-match").isEmpty() ? null
+                            : r.headers().values("if-match").getFirst();
+                    seen.add(ifMatch);
+                    if (ifMatch == null || !sjws_nettask.core.EntityTag.noneMatchHits(ifMatch, etag)) {
+                        return new Response(412, ResponseHeaders.of().add("etag", etag), Body.Empty.INSTANCE);
+                    }
+                    return new Response(200, headers, Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8)));
+                };
+
+        var already = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-match", List.of("\"abc-gzip\"")))),
+                inner.apply(ResponseHeaders.of()
+                        .add("content-type", "text/plain")
+                        .add("content-encoding", "br")
+                        .add("etag", etag)));
+        assertEquals(200, already.status(), "already-encoded upstream must not 412 on its own -gzip ETag");
+        assertEquals("br", already.headers().get("content-encoding"));
+        assertEquals(etag, already.headers().get("etag"));
+        assertTrue(sjws_nettask.core.EntityTag.noneMatchHits(seen.get(0), "\"abc\""));
+        assertTrue(sjws_nettask.core.EntityTag.noneMatchHits(seen.get(0), etag));
+
+        var excluded = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-match", List.of("\"abc-gzip\"")))),
+                inner.apply(ResponseHeaders.of()
+                        .add("content-type", "image/png")
+                        .add("etag", etag)));
+        assertEquals(200, excluded.status(), "excluded media type must not 412 on an upstream -gzip ETag");
+        assertNull(excluded.headers().get("content-encoding"));
+        assertEquals(etag, excluded.headers().get("etag"));
+        assertTrue(sjws_nettask.core.EntityTag.noneMatchHits(seen.get(1), etag));
+
+        var noTransform = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-match", List.of("\"abc-gzip\"")))),
+                inner.apply(ResponseHeaders.of()
+                        .add("content-type", "text/plain")
+                        .add("cache-control", "no-transform")
+                        .add("etag", etag)));
+        assertEquals(200, noTransform.status(), "no-transform pass-through must not 412 on an upstream -gzip ETag");
+        assertNull(noTransform.headers().get("content-encoding"));
+        assertEquals(etag, noTransform.headers().get("etag"));
+        assertTrue(sjws_nettask.core.EntityTag.noneMatchHits(seen.get(2), etag));
+    }
+
+    @Test
     void ifRangeWithAGeneratedGzipValidatorIsLeftUnmatched() throws Exception {
         var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
         var plain = "hello gzip ".repeat(40);
