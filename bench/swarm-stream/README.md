@@ -222,6 +222,11 @@ wake precision), `pace_behind_*` (arrived after the slot: previous work overran)
 `pace_capwait_*` (in-flight cap full: real server back-pressure), plus `ack_rtt_p50/p99_us`
 and generator `gc_ms_window` / `gc_count_window` over the measure window.
 
+A/A spread: `sched_per_s_hist` holds the scheduled-latency histogram per 1 s measure block
+(by slot time); `merge-gen.py` merges it by second and reports `sched_p99_per_s_us`
+(`[[sec, p99, n], ...]`), so A/A legs can be compared with a block bootstrap instead of an iid
+bootstrap over autocorrelated samples. Instrumentation only; no extra blocks.
+
 After warmup, the generator scrapes `/metrics` and waits (timeout GRACE+SLACK, early return at 0)
 for `sjws_swarm_stream_open_sessions` to drain, logging the before/after gauges into `result.json`.
 That is the existing session gauge, used as a proxy; there is no ledger-writer gauge. Product
