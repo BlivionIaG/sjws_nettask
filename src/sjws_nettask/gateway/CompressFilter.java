@@ -233,68 +233,30 @@ public final class CompressFilter implements RequestFilter {
     }
 
     /**
-     * Rewrites {@code If-None-Match} so filter-generated {@code -gzip} validators are
-     * presented to the inner handler in identity form. {@code If-Match} lists that identity
-     * form and keeps the original tag, so a pass-through upstream that already owns a
-     * {@code -gzip} ETag still matches. Leaves {@code *}, malformed fields, and
-     * {@code If-Range} unchanged: a translated If-Range would make the inner handler apply
-     * identity byte offsets to a client that already has gzip bytes, and this filter does
-     * not recompress 206 responses.
+     * Rewrites {@code If-None-Match} so filter-generated {@code -gzip} validators are presented
+     * to the inner handler in identity form. Leaves {@code *} and malformed fields unchanged.
+     * {@code If-Match} and {@code If-Range} are forwarded unchanged: translating them cannot
+     * be done safely, because a mutation is applied upstream before this filter sees the
+     * response, and a translated If-Range would apply identity byte offsets to gzip content.
      */
     static Request withIdentityValidators(Request request) {
         var headers = request.headers();
+        var inm = headers.ifNoneMatch();
+        if (inm == null || inm.isBlank()) {
+            return request;
+        }
+        var translated = identityValidators(inm);
+        if (translated.equals(inm)) {
+            return request;
+        }
         var fields = headers.fields();
         if (fields.isEmpty()) {
-            var inm = identityValidators(headers.ifNoneMatch());
-            if (same(inm, headers.ifNoneMatch())) {
-                return request;
-            }
-            return request.withHeaders(new RequestHeaders(inm, headers.ifModifiedSince(),
+            return request.withHeaders(new RequestHeaders(translated, headers.ifModifiedSince(),
                     headers.ifRange(), headers.range(), headers.acceptEncoding(), headers.host()));
         }
         var copy = new LinkedHashMap<String, List<String>>(fields);
-        boolean changed = translateField(copy, "if-none-match")
-                | translateField(copy, "if-match");
-        if (!changed) {
-            return request;
-        }
+        copy.put("if-none-match", List.of(translated));
         return request.withHeaders(RequestHeaders.of(Map.copyOf(copy), headers.host()));
-    }
-
-    private static boolean translateField(Map<String, List<String>> fields, String name) {
-        var values = fields.get(name);
-        if (values == null || values.isEmpty()) {
-            return false;
-        }
-        boolean ifMatch = "if-match".equals(name);
-        var next = new ArrayList<String>(values.size());
-        boolean changed = false;
-        for (var raw : values) {
-            var translated = ifMatch ? ifMatchValidators(raw) : identityValidators(raw);
-            changed |= !same(translated, raw);
-            next.add(translated);
-        }
-        if (changed) {
-            fields.put(name, List.copyOf(next));
-        }
-        return changed;
-    }
-
-    /**
-     * If-Match carries the identity form of a generated gzip validator and the original
-     * tag, so a pass-through response whose upstream ETag already ends in {@code -gzip}
-     * still satisfies the precondition.
-     */
-    static String ifMatchValidators(String raw) {
-        var identity = identityValidators(raw);
-        if (same(identity, raw)) {
-            return raw;
-        }
-        return identity + ", " + raw;
-    }
-
-    private static boolean same(String a, String b) {
-        return a == null ? b == null : a.equals(b);
     }
 
     /** Inverse of {@link #withCoding}: strip a trailing {@code -gzip} from each listed tag. */
