@@ -418,6 +418,62 @@ class CompressFilterTest {
     }
 
     @Test
+    void ifMatchWithAGeneratedGzipValidatorIsTranslated() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
+        var plain = "hello gzip ".repeat(40);
+        java.util.function.Function<Request, Response> inner = (r) -> {
+            var etag = "\"abc\"";
+            var ifMatch = r.headers().values("if-match").isEmpty() ? null
+                    : r.headers().values("if-match").getFirst();
+            if (ifMatch == null || !sjws_nettask.core.EntityTag.noneMatchHits(ifMatch, etag)) {
+                return new Response(412, ResponseHeaders.of().add("etag", etag), Body.Empty.INSTANCE);
+            }
+            return new Response(200, ResponseHeaders.of()
+                    .add("content-type", "text/plain")
+                    .add("etag", etag), Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8)));
+        };
+        var response = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-match", List.of("\"abc-gzip\"")))), inner);
+        assertEquals(200, response.status(), "If-Match with the advertised gzip ETag must not 412");
+        assertEquals("gzip", response.headers().get("content-encoding"));
+        assertEquals("\"abc-gzip\"", response.headers().get("etag"));
+    }
+
+    @Test
+    void ifRangeTranslatesGeneratedGzipValidatorsAndLeavesDates() {
+        var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
+        var plain = "hello gzip ".repeat(40);
+        var seen = new java.util.ArrayList<String>();
+        java.util.function.Function<Request, Response> inner = (r) -> {
+            seen.add(r.headers().ifRange());
+            var etag = "\"abc\"";
+            var ifRange = r.headers().ifRange();
+            if (ifRange != null && ifRange.indexOf('"') >= 0
+                    && !sjws_nettask.core.EntityTag.noneMatchHits(ifRange, etag)) {
+                return new Response(412, ResponseHeaders.of().add("etag", etag), Body.Empty.INSTANCE);
+            }
+            return new Response(200, ResponseHeaders.of()
+                    .add("content-type", "text/plain")
+                    .add("etag", etag), Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8)));
+        };
+        var gzipRange = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-range", List.of("\"abc-gzip\""),
+                "range", List.of("bytes=0-10")))), inner);
+        assertEquals(200, gzipRange.status());
+        assertEquals("\"abc\"", seen.get(0), "If-Range gzip validator must be translated");
+        assertEquals("gzip", gzipRange.headers().get("content-encoding"));
+        var date = "Wed, 11 Nov 2026 17:00:00 GMT";
+        var dated = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-range", List.of(date),
+                "range", List.of("bytes=0-10")))), inner);
+        assertEquals(200, dated.status());
+        assertEquals(date, seen.get(1), "If-Range dates must be forwarded unchanged");
+    }
+
+    @Test
     void negotiatesAcrossRepeatedAcceptEncodingFields() throws Exception {
         var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
         var plain = "hello gzip ".repeat(40);

@@ -233,31 +233,59 @@ public final class CompressFilter implements RequestFilter {
     }
 
     /**
-     * Rewrites {@code If-None-Match} so filter-generated {@code -gzip} validators are presented
-     * to the inner handler in identity form. Leaves {@code *} and malformed fields unchanged.
+     * Rewrites {@code If-None-Match}, {@code If-Match} and {@code If-Range} so filter-generated
+     * {@code -gzip} validators are presented to the inner handler in identity form. Leaves
+     * {@code *}, HTTP dates in {@code If-Range}, and malformed fields unchanged.
      */
     static Request withIdentityValidators(Request request) {
         var headers = request.headers();
-        var inm = headers.ifNoneMatch();
-        if (inm == null || inm.isBlank()) {
-            return request;
-        }
-        var translated = identityValidators(inm);
-        if (translated.equals(inm)) {
-            return request;
-        }
         var fields = headers.fields();
         if (fields.isEmpty()) {
-            return request.withHeaders(new RequestHeaders(translated, headers.ifModifiedSince(),
-                    headers.ifRange(), headers.range(), headers.acceptEncoding(), headers.host()));
+            var inm = identityValidators(headers.ifNoneMatch());
+            var ifRange = identityValidators(headers.ifRange());
+            if (same(inm, headers.ifNoneMatch()) && same(ifRange, headers.ifRange())) {
+                return request;
+            }
+            return request.withHeaders(new RequestHeaders(inm, headers.ifModifiedSince(),
+                    ifRange, headers.range(), headers.acceptEncoding(), headers.host()));
         }
         var copy = new LinkedHashMap<String, List<String>>(fields);
-        copy.put("if-none-match", List.of(translated));
+        boolean changed = translateField(copy, "if-none-match")
+                | translateField(copy, "if-match")
+                | translateField(copy, "if-range");
+        if (!changed) {
+            return request;
+        }
         return request.withHeaders(RequestHeaders.of(Map.copyOf(copy), headers.host()));
+    }
+
+    private static boolean translateField(Map<String, List<String>> fields, String name) {
+        var values = fields.get(name);
+        if (values == null || values.isEmpty()) {
+            return false;
+        }
+        var next = new ArrayList<String>(values.size());
+        boolean changed = false;
+        for (var raw : values) {
+            var translated = identityValidators(raw);
+            changed |= !same(translated, raw);
+            next.add(translated);
+        }
+        if (changed) {
+            fields.put(name, List.copyOf(next));
+        }
+        return changed;
+    }
+
+    private static boolean same(String a, String b) {
+        return a == null ? b == null : a.equals(b);
     }
 
     /** Inverse of {@link #withCoding}: strip a trailing {@code -gzip} from each listed tag. */
     static String identityValidators(String ifNoneMatch) {
+        if (ifNoneMatch == null || ifNoneMatch.isBlank()) {
+            return ifNoneMatch;
+        }
         var suffix = "-gzip";
         var out = new StringBuilder(ifNoneMatch.length());
         int i = 0;
