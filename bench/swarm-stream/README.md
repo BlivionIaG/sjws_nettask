@@ -213,8 +213,19 @@ time was counted as generator lag (smoke7 floor n1: lag p50 2 µs, p99 157696 µ
 waves now keep up to `--pipeline-depth` (default `--window`, 8) requests in flight on the same
 HTTP/1.1 connection (the server answers pipelined requests in order); acks are read on the same
 thread while it waits for the next slot. A non-2xx answer or transport error falls back to an
-ordered synchronous resend (server dedups `:chunk`). `PIPELINE_DEPTH=1` (`--pipeline-depth 1`)
-restores the legacy loop for diagnosis. The self-test also proves the mechanism against an
+ordered synchronous resend (server dedups `:chunk`). Since 2026-11-14 01:48 the default is
+back to the legacy loop (`--pipeline-depth 1`); per-thread pipelining is opt-in
+(`PIPELINE_DEPTH=8`), because pacer-check showed its spin starving the consumer on the same
+pinned core (1 stream: 88.7 % CPU, p99_send 220 -> 6976 µs) and 32 streams were dominated by
+wake latency (wake p99 1264-1632 µs) with about 11 producer threads per pinned core.
+
+Pacing loop (`PACER_LOOP=1`, `--pacer-loop`, opt-in): one platform thread per generator process
+sends every paced lean stream's slots in deadline order, each on its own keep-alive socket with
+a bounded in-flight window (`--window`, or `--pipeline-depth` if > 1). Acks are read without
+blocking in the slack before the next deadline; the loop parks until `--pacer-spin-us`
+(default 20 µs) before the slot and spins only that long. A stream with a full window is set
+aside (CAPWAIT) without blocking the others. Producer threads only claim, register, wait and
+send LAST; consumers keep their own threads. `result.json` records `pacer_loop`. The self-test also proves the mechanism against an
 in-JVM fake server with a 250 µs ack delay (sync falls behind by ~1 s; pipelined stays at µs).
 
 Lag split per measured slot (`result.json`): `pace_wake_*` (arrived early, then parked/spun:

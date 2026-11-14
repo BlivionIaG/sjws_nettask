@@ -276,6 +276,9 @@ if [ "$LOADGEN" = java ]; then
   if [ -n "${CLAIM_DELAY_MS:-}" ]; then GEN_EXTRA+=(--claim-delay-ms "$CLAIM_DELAY_MS"); fi
   if [ -n "${HANG_EVERY:-}" ]; then GEN_EXTRA+=(--hang-every "$HANG_EVERY"); fi
   if [ -n "${PIPELINE_DEPTH:-}" ]; then GEN_EXTRA+=(--pipeline-depth "$PIPELINE_DEPTH"); fi
+  # #502: PACER_LOOP=1 = one pacing loop per generator process (opt-in).
+  if [ "${PACER_LOOP:-0}" = 1 ]; then GEN_EXTRA+=(--pacer-loop); fi
+  if [ -n "${PACER_SPIN_US:-}" ]; then GEN_EXTRA+=(--pacer-spin-us "$PACER_SPIN_US"); fi
   # #415/#414: optional generator JVM flags (e.g. JFR on the generator to find its own hot spots).
   read -r -a GEN_JAVA_ARGS <<< "${GEN_JAVA_OPTS:-}"
   # Launch one StreamLoad: _launch_streamload <pin> <streams> <groups> <group_offset> <rate_or_empty> <out>

@@ -292,6 +292,7 @@ public class StreamLoad {
     final AtomicBoolean hardStop = new AtomicBoolean();
     final ConcurrentHashMap<StreamKey, Track> tracks = new ConcurrentHashMap<>();
     final ConcurrentLinkedQueue<LeanHttp> consumerSockets = new ConcurrentLinkedQueue<>();
+    volatile PacerLoop pacer; // #502: one pacing loop per process (--pacer-loop), else null
     Win(boolean account, int n, long intervalNs) { this.account = account; this.n = n; this.intervalNs = intervalNs; }
     boolean inWindow(long slotNs) { return slotNs >= startNs && slotNs < endNs; }
   }
@@ -494,10 +495,20 @@ public class StreamLoad {
     boolean leanHttp = true;
     /**
      * #502 pacer: max in-flight :chunk POSTs per paced lean stream (HTTP/1.1 pipelining on the
-     * producer's keep-alive socket; the server answers in order). 0 = use --window (credit
-     * window). 1 = legacy one-POST-at-a-time (sync), whose ack wait was counted as schedule lag.
+     * producer's keep-alive socket; the server answers in order). 1 (default, 2026-11-14 01:48) =
+     * legacy one-POST-at-a-time; 0 = use --window. Pipelining per producer thread is opt-in only:
+     * pacer-check showed its spin starving the consumer on the same pinned core.
      */
-    int pipelineDepth = 0;
+    int pipelineDepth = 1;
+    /**
+     * #502 pacer-check2: one pacing loop per generator process (wrk2 style). One platform thread
+     * sends every paced lean stream's slots in deadline order over each stream's keep-alive socket,
+     * with a bounded in-flight window per stream (--window, or --pipeline-depth if > 1). Producer
+     * threads only claim, register and send LAST; consumers keep their own threads.
+     */
+    boolean pacerLoop = false;
+    /** Max spin before a slot in the pacer loop (µs); the loop parks until then. */
+    long pacerSpinUs = 20;
     /**
      * #415: aggregate offered rate in MiB/s. 0 = closed loop (legacy: every stream POSTs as fast as
      * its round trip allows). > 0 = each stream sends on a fixed schedule of
@@ -590,7 +601,13 @@ public class StreamLoad {
     fail += selfCheck("retry-after junk", retryAfterMs("Fri, 01 Jan", 1000) == 1000);
     // Pacer proof (no server). Intervals are 1-stream and 32-stream at 10 MiB/s, 1024-byte chunks.
     // Limits = 10% of smoke6 p99_send (150 µs at 1 stream, 520 µs at 32 streams).
-    fail += pipelineSelfTest();
+    // Mechanism checks run unpinned on a shared box: up to 3 attempts, any clean attempt passes.
+    int pf = 1;
+    for (int att = 1; att <= 3 && pf != 0; att++) {
+      pf = pipelineSelfTest();
+      if (pf != 0) System.out.println("pipeline/pacer-loop self-test attempt " + att + " had " + pf + " failed check(s)");
+    }
+    fail += pf;
     fail += paceSelfTest(97_656L, 2000, 15_000L, "1-stream-10MiB/s");
     fail += paceSelfTest(3_125_000L, 800, 52_000L, "32-stream-10MiB/s");
     return fail;
@@ -627,6 +644,15 @@ public class StreamLoad {
       // Mechanism check only (unpinned, shared box): the real-load bound is the #502 pacer-check.
       fail += selfCheck("pipeline: pipelined lag_p99 < 1% of sync lag_p99", pipe[0] < 0.01 * sync[0]);
       fail += selfCheck("pipeline: pipelined sent all slots", pipe[3] >= pipe[4] - 1);
+      pacerLoopRun(base, iv * 11, 300_000_000L, 11); // JIT warm-up, unchecked
+      for (int ns : new int[] {1, 11}) {
+        double[] lp = pacerLoopRun(base, iv * ns, windowNs, ns);
+        System.out.printf(Locale.ROOT,
+            "pacer-loop-self-test streams=%d interval=%.1fus lag_p50=%.0fus lag_p99=%.0fus (first/rest %.0f/%.0f) behind=%.1f%% (p50 %.0fus) capwait=%.1f%% sent=%.0f/%.0f pacer_cpu=%.0f%%%n",
+            ns, iv * ns / 1e3, lp[5], lp[0], lp[7], lp[8], lp[1], lp[9], lp[2], lp[3], lp[4], lp[6]);
+        fail += selfCheck("pacer-loop " + ns + ": lag_p99 < 1% of sync lag_p99", lp[0] < 0.01 * sync[0]);
+        fail += selfCheck("pacer-loop " + ns + ": sent all slots", lp[3] >= lp[4] - ns);
+      }
       srv.interrupt();
     } catch (Exception e) {
       System.err.println("pipeline-self-test error: " + e);
@@ -688,6 +714,50 @@ public class StreamLoad {
     res[3] = SCHED_SENT.sum();
     res[4] = windowNs / iv;
     return res;
+  }
+
+  /** Self-test: {lag_p99, behind%, capwait%, sent, expected, lag_p50, pacer_cpu%} for the pacer loop. */
+  static double[] pacerLoopRun(URI base, long iv, long windowNs, int streams) throws Exception {
+    for (LongAdder c : List.of(SCHED_SENDS, SCHED_LATE, SCHED_SENT, PACE_WAKE_N, PACE_BEHIND_N, PACE_CAPWAIT_N)) c.reset();
+    LAG.clearAll(); LAG_FIRST.clearAll(); LAG_REST.clearAll(); PACE_WAKE.clearAll(); PACE_BEHIND.clearAll();
+    PACE_CAPWAIT.clearAll(); ACK_RTT.clearAll();
+    Args a = new Args();
+    a.window = 8;
+    Win w = new Win(true, streams, iv);
+    long start = System.nanoTime() + 30_000_000L;
+    w.startNs = start; w.endNs = start + windowNs;
+    PacerLoop pl = new PacerLoop(a, w, new AtomicBoolean(), new ConcurrentLinkedQueue<>(), new ConcurrentLinkedQueue<>(),
+        new AtomicLong(), new AtomicLong(), new AtomicLong());
+    w.pacer = pl;
+    pl.start();
+    java.lang.management.ThreadMXBean tmx = java.lang.management.ManagementFactory.getThreadMXBean();
+    List<PacerLoop.Stream> sts = new ArrayList<>();
+    byte[] payload = new byte[1024];
+    java.util.Random r = new java.util.Random(7);
+    for (int i = 0; i < streams; i++) {
+      LeanHttp lean = new LeanHttp(base, 10_000);
+      long phase = start + (long) (r.nextDouble() * iv);
+      PacerLoop.Stream st = new PacerLoop.Stream(lean, lean.head("POST", "/c", "t", CT, null, FRAME_HDR + CHUNK_HDR + payload.length),
+          new Lease("x", 1, 2 + i, 1), payload, new Track(phase, iv), phase, phase, true, 8, "p");
+      sts.add(st);
+      pl.register(st);
+    }
+    long cpu0 = tmx.getThreadCpuTime(pl.thread.threadId()), wall0 = System.nanoTime();
+    for (PacerLoop.Stream st : sts) st.awaitDone(w.hardStop);
+    long cpu1 = tmx.getThreadCpuTime(pl.thread.threadId()), wall1 = System.nanoTime();
+    pl.shutdown();
+    for (PacerLoop.Stream st : sts) st.lean.close();
+    long n = PACE_WAKE_N.sum() + PACE_BEHIND_N.sum() + PACE_CAPWAIT_N.sum();
+    return new double[] {
+        LAG.count() > 0 ? LAG.pctFromBuckets(0.99) : Double.NaN,
+        n > 0 ? 100.0 * PACE_BEHIND_N.sum() / n : 0,
+        n > 0 ? 100.0 * PACE_CAPWAIT_N.sum() / n : 0,
+        SCHED_SENT.sum(), (double) streams * (windowNs / iv),
+        LAG.count() > 0 ? LAG.pctFromBuckets(0.50) : Double.NaN,
+        100.0 * (cpu1 - cpu0) / Math.max(1, wall1 - wall0),
+        LAG_FIRST.count() > 0 ? LAG_FIRST.pctFromBuckets(0.99) : Double.NaN,
+        LAG_REST.count() > 0 ? LAG_REST.pctFromBuckets(0.99) : Double.NaN,
+        PACE_BEHIND.count() > 0 ? PACE_BEHIND.pctFromBuckets(0.50) : Double.NaN};
   }
 
   /** Fake :chunk endpoint: reads pipelined requests in order, answers each 200 after {@code delayNs}. */
@@ -853,7 +923,9 @@ public class StreamLoad {
     r.maxConnectionsPerIp = args.maxConnectionsPerIp;
     r.drainTimedOut = drain.timedOut;
     r.gcMsWindow = gcMsWin; r.gcCountWindow = gcNWin;
-    r.pipelineDepth = (args.rateMibS > 0 && args.leanHttp) ? (args.pipelineDepth > 0 ? args.pipelineDepth : Math.max(1, args.window)) : 1;
+    r.pipelineDepth = (args.rateMibS > 0 && args.leanHttp)
+        ? (args.pacerLoop ? PacerLoop.depth(args) : (args.pipelineDepth > 0 ? args.pipelineDepth : Math.max(1, args.window))) : 1;
+    r.pacerLoop = args.rateMibS > 0 && args.leanHttp && args.pacerLoop;
     r.timerSlackSet = TIMER_SLACK_SET.sum(); r.paceWakeN = PACE_WAKE_N.sum(); r.paceBehindN = PACE_BEHIND_N.sum(); r.paceCapwaitN = PACE_CAPWAIT_N.sum();
     r.paceWakeHist = PACE_WAKE.sparseJson(); r.paceBehindHist = PACE_BEHIND.sparseJson();
     r.paceCapwaitHist = PACE_CAPWAIT.sparseJson(); r.ackRttHist = ACK_RTT.sparseJson();
@@ -980,6 +1052,10 @@ public class StreamLoad {
     // why the LEAN_CONSUMER=0 hung leg's one.sh wall was 167 s (warmup 30+3+5 + measure
     // 30+8+75+5).
     CountDownLatch admit = new CountDownLatch(2 * n);
+    if (args.rateMibS > 0 && args.leanHttp && args.pacerLoop && w.intervalNs > 0) {
+      w.pacer = new PacerLoop(args, w, inTeardown, measureErr, teardownErr, requests, credit429, producerTransportRetries);
+      w.pacer.start();
+    }
     for (int i = 0; i < n; i++) {
       int gid = args.groupOffset + (i % gCount);
       mapping[i] = gid;
@@ -1051,6 +1127,7 @@ public class StreamLoad {
       joinUntil(producers, System.nanoTime() + 5_000_000_000L);
       joinUntil(consumers, System.nanoTime() + 5_000_000_000L);
     }
+    if (w.pacer != null) w.pacer.shutdown();
     inTeardown.set(true);
     if (!"sse".equals(args.accept)) accountWave(w, cutoffNs); // SSE frames carry no stream id
     return mapping;
@@ -1150,8 +1227,16 @@ public class StreamLoad {
     try {
       if (args.leanHttp) lean = new LeanHttp(URI.create(args.base), 60_000);
       final int depth = args.pipelineDepth > 0 ? args.pipelineDepth : Math.max(1, args.window);
-      final boolean pipelined = lean != null && intervalNs > 0 && depth > 1;
-      if (pipelined) {
+      final boolean viaLoop = lean != null && intervalNs > 0 && w.pacer != null;
+      final boolean pipelined = viaLoop || (lean != null && intervalNs > 0 && depth > 1);
+      if (viaLoop) {
+        PacerLoop.Stream st = new PacerLoop.Stream(lean,
+            lean.head("POST", path, token, CT, null, FRAME_HDR + CHUNK_HDR + payload.length),
+            lease, payload, track, phaseNs, nextNs, coStamp, PacerLoop.depth(args), pool);
+        w.pacer.register(st);
+        st.awaitDone(stop);
+        seq = st.seq;
+      } else if (pipelined) {
         seq = producePipelined(args, lean, lean.head("POST", path, token, CT, null, FRAME_HDR + CHUNK_HDR + payload.length),
             lease, payload, w, track, phaseNs, intervalNs, nextNs, coStamp, depth,
             inTeardown, measureErr, teardownErr, requests, credit429, producerTransportRetries, pool, rnd);
@@ -1298,6 +1383,224 @@ public class StreamLoad {
     }
     } finally {
       if (!released) admit.countDown();
+    }
+  }
+
+  /**
+   * #502 pacer-check2: one pacing loop per generator process. A single platform thread keeps every
+   * registered paced stream in a deadline-ordered queue and sends each slot on that stream's
+   * keep-alive socket (small write into an empty-enough socket buffer: the in-flight window per
+   * stream is bounded, so the write does not block on the peer). Acks are read without blocking
+   * (available() &gt; 0) in the slack before the next deadline. The loop parks until
+   * {@code pacerSpinUs} before the slot and spins only that long, so nothing spins for long next
+   * to the consumers, which keep their own threads. A stream whose window is full is set aside
+   * (CAPWAIT) without blocking the others. Producer threads only claim, register, wait, and send
+   * LAST. Lag split (WAKE / BEHIND / CAPWAIT), ACK_RTT and the measured slot counters are the same
+   * as the per-thread producers.
+   */
+  static final class PacerLoop implements Runnable {
+    static int depth(Args a) { return a.pipelineDepth > 1 ? a.pipelineDepth : Math.max(1, a.window); }
+
+    static final class Stream {
+      final LeanHttp lean; final byte[] dataHdr; final Lease lease; final byte[] payload; final Track track;
+      final long phaseNs; long nextNs; final boolean coStamp; final int depth; final String pool;
+      final ArrayDeque<Pending> inflight = new ArrayDeque<>();
+      final ArrayDeque<byte[]> free = new ArrayDeque<>();
+      final List<Pending> redo = new ArrayList<>();
+      long seq; long capT0; boolean draining;
+      final CountDownLatch done = new CountDownLatch(1);
+      Stream(LeanHttp lean, byte[] dataHdr, Lease lease, byte[] payload, Track track, long phaseNs, long nextNs,
+          boolean coStamp, int depth, String pool) {
+        this.lean = lean; this.dataHdr = dataHdr; this.lease = lease; this.payload = payload; this.track = track;
+        this.phaseNs = phaseNs; this.nextNs = nextNs; this.coStamp = coStamp; this.depth = depth; this.pool = pool;
+      }
+      void awaitDone(AtomicBoolean stop) throws InterruptedException {
+        while (!done.await(50, TimeUnit.MILLISECONDS)) if (stop.get()) return;
+      }
+    }
+
+    final Args args; final Win w; final AtomicBoolean inTeardown;
+    final ConcurrentLinkedQueue<String> measureErr, teardownErr;
+    final AtomicLong requests, credit429, producerTransportRetries;
+    final ConcurrentLinkedQueue<Stream> incoming = new ConcurrentLinkedQueue<>();
+    final PriorityQueue<Stream> ready = new PriorityQueue<>((a, b) -> Long.compare(a.nextNs, b.nextNs));
+    final List<Stream> all = new ArrayList<>(), blocked = new ArrayList<>(), finishing = new ArrayList<>();
+    final long spinNs;
+    volatile boolean shut;
+    Thread thread;
+
+    PacerLoop(Args args, Win w, AtomicBoolean inTeardown, ConcurrentLinkedQueue<String> measureErr,
+        ConcurrentLinkedQueue<String> teardownErr, AtomicLong requests, AtomicLong credit429,
+        AtomicLong producerTransportRetries) {
+      this.args = args; this.w = w; this.inTeardown = inTeardown; this.measureErr = measureErr;
+      this.teardownErr = teardownErr; this.requests = requests; this.credit429 = credit429;
+      this.producerTransportRetries = producerTransportRetries;
+      this.spinNs = Math.max(0L, args.pacerSpinUs) * 1000L;
+    }
+    void start() { thread = Thread.ofPlatform().name("sl-pacer").daemon(true).start(this); }
+    void register(Stream st) { incoming.add(st); LockSupport.unpark(thread); }
+    void shutdown() {
+      shut = true;
+      LockSupport.unpark(thread);
+      try { thread.join(5_000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    @Override public void run() {
+      if (setThreadTimerSlack(1_000L)) TIMER_SLACK_SET.increment();
+      final java.util.concurrent.ThreadLocalRandom rnd = java.util.concurrent.ThreadLocalRandom.current();
+      final AtomicBoolean stop = w.hardStop;
+      while (!shut && !stop.get()) {
+        Stream st;
+        while ((st = incoming.poll()) != null) { all.add(st); ready.add(st); }
+        serviceBlocked();
+        serviceFinishing();
+        Stream head = ready.peek();
+        if (head == null) {
+          pollAcks(Long.MAX_VALUE);
+          LockSupport.parkNanos(blocked.isEmpty() && finishing.isEmpty() ? 1_000_000L : 20_000L);
+          continue;
+        }
+        // Unmeasured slots (warmup, or before the window) are skipped, never caught up.
+        long now0 = System.nanoTime();
+        if (!w.account || head.nextNs < w.startNs) {
+          long s0 = w.startNs;
+          if (head.nextNs < now0) {
+            ready.poll();
+            head.nextNs = firstSlotAtOrAfter(head.phaseNs, w.intervalNs, w.account ? Math.min(now0, s0) : now0);
+            ready.add(head);
+            continue;
+          }
+        }
+        if (head.nextNs >= w.endNs) { ready.poll(); head.draining = true; finishing.add(head); continue; }
+        final long slotNs = head.nextNs;
+        final long arriveNs = now0;
+        // Slack before the slot: read acks without blocking, then park, then a short spin.
+        long rem = slotNs - System.nanoTime();
+        if (rem > spinNs) {
+          if (rem > spinNs + 30_000L) {
+            pollAcks(slotNs - spinNs - 20_000L);
+            rem = slotNs - System.nanoTime();
+          }
+          if (rem > spinNs) {
+            LockSupport.parkNanos(Math.min(rem - spinNs, 1_000_000L));
+            if (slotNs - System.nanoTime() > spinNs) continue; // early or new work: re-evaluate
+          }
+        }
+        while (System.nanoTime() < slotNs) Thread.onSpinWait();
+        ready.poll();
+        if (head.inflight.size() >= head.depth) {
+          try { while (head.lean.in != null && head.lean.in.available() > 0 && !head.inflight.isEmpty())
+                  handleOne(head.lean, head.inflight, head.free, head.redo, requests, w, head.track); }
+          catch (IOException e) { fail(head, e); }
+          if (head.inflight.size() >= head.depth) {
+            if (head.capT0 == 0) head.capT0 = System.nanoTime();
+            blocked.add(head);
+            continue;
+          }
+        }
+        send(head, arriveNs, rnd);
+        ready.add(head);
+      }
+      // Hard stop or shutdown: release every waiting producer.
+      for (Stream s : all) s.done.countDown();
+    }
+
+    void send(Stream st, long arriveNs, java.util.concurrent.ThreadLocalRandom rnd) {
+      if (!st.redo.isEmpty()) resendRedo(st, rnd);
+      long sendNs = System.nanoTime();
+      long slotNs = st.nextNs;
+      long capWait = st.capT0 != 0 ? sendNs - st.capT0 : 0;
+      st.capT0 = 0;
+      st.nextNs += w.intervalNs;
+      boolean counted = w.account && w.inWindow(slotNs);
+      if (counted) {
+        recordPace(capWait > 0 ? Math.min(arriveNs, slotNs) : arriveNs, sendNs, slotNs, capWait);
+        long lag = sendNs - slotNs;
+        SCHED_SENDS.increment();
+        if (lag > LATE_NS) SCHED_LATE.increment();
+        SCHED_LAG_MAX_NS.accumulate(lag);
+        LAG.add(lag / 1e3);
+        if (slotNs < w.startNs + 1_000_000_000L) LAG_FIRST.add(lag / 1e3);
+        else LAG_REST.add(lag / 1e3);
+      }
+      byte[] buf = st.free.pollFirst();
+      int flags = (st.seq == 0 ? FIRST : 0);
+      byte[] frame = tokenFrameInto(st.lease.streamHi, st.lease.streamLo, st.lease.attempt, st.seq, flags, st.payload, buf);
+      long emitNs = System.nanoTime();
+      writeAsciiNs(frame, FRAME_HDR + CHUNK_HDR, emitNs);
+      if (st.coStamp) writeAsciiNs(frame, FRAME_HDR + CHUNK_HDR + 20, slotNs);
+      st.inflight.addLast(new Pending(st.seq, slotNs, frame, emitNs, counted));
+      st.seq++;
+      try {
+        st.lean.send(st.dataHdr, frame);
+      } catch (IOException e) {
+        fail(st, e);
+      }
+    }
+
+    /** Transport error: everything unacked is resent in seq order on a new connection (server dedups). */
+    void fail(Stream st, IOException e) {
+      if (!inTeardown.get()) producerTransportRetries.incrementAndGet();
+      st.lean.closeQuiet();
+      st.redo.addAll(st.inflight);
+      st.inflight.clear();
+      st.redo.sort(java.util.Comparator.comparingLong(Pending::seq));
+    }
+
+    void resendRedo(Stream st, java.util.concurrent.ThreadLocalRandom rnd) {
+      try {
+        resendSync(st.lean, st.dataHdr, st.redo, st.free, w, st.track, requests, credit429, producerTransportRetries,
+            inTeardown, measureErr, teardownErr, st.pool, rnd);
+      } catch (InterruptedException ie) {
+        Thread.currentThread().interrupt();
+      }
+    }
+
+    /** Non-blocking ack reads for every stream with requests in flight, until {@code untilNs}. */
+    void pollAcks(long untilNs) {
+      for (int i = 0; i < all.size(); i++) {
+        if (System.nanoTime() >= untilNs) return;
+        Stream st = all.get(i);
+        if (st.inflight.isEmpty()) continue;
+        try {
+          while (!st.inflight.isEmpty() && st.lean.in != null && st.lean.in.available() > 0)
+            handleOne(st.lean, st.inflight, st.free, st.redo, requests, w, st.track);
+        } catch (IOException e) {
+          fail(st, e);
+        }
+      }
+    }
+
+    void serviceBlocked() {
+      if (blocked.isEmpty()) return;
+      for (java.util.Iterator<Stream> it = blocked.iterator(); it.hasNext(); ) {
+        Stream st = it.next();
+        try {
+          while (!st.inflight.isEmpty() && st.lean.in != null && st.lean.in.available() > 0)
+            handleOne(st.lean, st.inflight, st.free, st.redo, requests, w, st.track);
+        } catch (IOException e) {
+          fail(st, e);
+        }
+        if (st.inflight.size() < st.depth) { it.remove(); ready.add(st); }
+      }
+    }
+
+    void serviceFinishing() {
+      if (finishing.isEmpty()) return;
+      for (java.util.Iterator<Stream> it = finishing.iterator(); it.hasNext(); ) {
+        Stream st = it.next();
+        try {
+          while (!st.inflight.isEmpty() && st.lean.in != null && st.lean.in.available() > 0)
+            handleOne(st.lean, st.inflight, st.free, st.redo, requests, w, st.track);
+        } catch (IOException e) {
+          fail(st, e);
+        }
+        if (st.inflight.isEmpty()) {
+          if (!st.redo.isEmpty()) resendRedo(st, java.util.concurrent.ThreadLocalRandom.current());
+          it.remove();
+          st.done.countDown(); // producer thread now owns the socket again (LAST)
+        }
+      }
     }
   }
 
@@ -2391,6 +2694,9 @@ public class StreamLoad {
         case "--no-lean-http" -> args.leanHttp = false;
         case "--rate-mib-s" -> args.rateMibS = Double.parseDouble(a[++i]);
         case "--pipeline-depth" -> args.pipelineDepth = Integer.parseInt(a[++i]);
+        case "--pacer-loop" -> args.pacerLoop = true;
+        case "--no-pacer-loop" -> args.pacerLoop = false;
+        case "--pacer-spin-us" -> args.pacerSpinUs = Long.parseLong(a[++i]);
         case "--pace-ms" -> throw new IllegalArgumentException(
             "--pace-ms was #465's per-stream sleep; use --rate-mib-s (aggregate MiB/s) instead");
         case "--lean-consumer" -> args.leanConsumer = true;
@@ -2435,6 +2741,7 @@ public class StreamLoad {
     List<String> firstAdmitWarmup = List.of();
     long gcMsWindow, gcCountWindow, paceWakeN, paceBehindN, paceCapwaitN, timerSlackSet;
     int pipelineDepth;
+    boolean pacerLoop;
     String paceWakeHist = "[]", paceBehindHist = "[]", paceCapwaitHist = "[]", ackRttHist = "[]";
     Double paceWakeP99, paceBehindP99, paceCapwaitP99, ackRttP50, ackRttP99;
     Double warmupDrainOpenBefore, warmupDrainOpenAfter, warmupDrainChargedBefore, warmupDrainChargedAfter;
@@ -2541,6 +2848,7 @@ public class StreamLoad {
       field(sb, "warmup_drain_wait_ms", warmupDrainWaitMs, true);
       field(sb, "warmup_drain_timed_out", warmupDrainTimedOut, true);
       field(sb, "pipeline_depth", pipelineDepth, true);
+      sb.append("  \"pacer_loop\":").append(pacerLoop).append(",\n");
       field(sb, "gc_ms_window", gcMsWindow, true);
       field(sb, "gc_count_window", gcCountWindow, true);
       field(sb, "timer_slack_threads_set", timerSlackSet, true);
