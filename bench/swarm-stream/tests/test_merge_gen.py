@@ -191,8 +191,26 @@ def test_merge_gen_refuses_empty(tmp_path):
     print("OK test_merge_gen_refuses_empty")
 
 
+def test_merge_gen_pace_split():
+    """#502 pacer: WAKE/BEHIND/CAPWAIT counts and GC sum, hists merged exactly."""
+    a = part("a", pace_wake_n=90, pace_behind_n=10, pace_capwait_n=0, gc_ms_window=3, gc_count_window=1,
+             pipeline_depth=8, pace_wake_hist=[[idx(2), 90]], pace_behind_hist=[[idx(500), 10]],
+             ack_rtt_hist=[[idx(60), 100]])
+    b = part("b", pace_wake_n=100, pace_behind_n=0, pace_capwait_n=0, gc_ms_window=2, gc_count_window=1,
+             pipeline_depth=8, pace_wake_hist=[[idx(2), 100]], ack_rtt_hist=[[idx(60), 99], [idx(900), 1]])
+    m = mod.merge([a, b], gen_cores=3, secs=20)
+    assert m["pace_wake_n"] == 190 and m["pace_behind_n"] == 10 and m["pace_capwait_n"] == 0, m
+    assert m["gc_ms_window"] == 5 and m["gc_count_window"] == 2 and m["pipeline_depth"] == 8
+    assert m["pace_behind_p99_us"] == mod.upper(idx(500))
+    assert m["pace_capwait_p99_us"] is None and m["pace_capwait_hist"] == []
+    assert m["ack_rtt_p50_us"] == mod.upper(idx(60))
+    assert sum(c for _, c in m["ack_rtt_hist"]) == 200
+    print("OK test_merge_gen_pace_split")
+
+
 if __name__ == "__main__":
     import tempfile
     main()
+    test_merge_gen_pace_split()
     with tempfile.TemporaryDirectory() as d:
         test_merge_gen_refuses_empty(Path(d))

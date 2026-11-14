@@ -102,9 +102,12 @@ def main():
     ev = wv.evaluate(base_ok(producer_transport_retries=3))
     assert not ev["valid"] and ev["transport_retry_flag"], ev
 
-    # mid-block load1 peak via load1_peak / samples
-    ev = wv.evaluate(base_ok(load1_peak=6.5, load1_post=2.0))
-    assert not ev["valid"] and ev["noisy"], ev
+    # inceptor 01:06: load1_peak / load1_post / samples are information only
+    ev = wv.evaluate(base_ok(load1_peak=127.0, load1_post=6.5, load1_samples=[2.0, 9.0]))
+    assert ev["valid"] and not ev["noisy"], ev
+    # ... but the pre-leg gate load1_pre < 3 still applies
+    ev = wv.evaluate(base_ok(load1_pre=3.0))
+    assert not ev["valid"], ev
 
     # CLI prints 0/1
     with tempfile.TemporaryDirectory() as td:

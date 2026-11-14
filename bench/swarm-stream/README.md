@@ -93,12 +93,18 @@ leg dirs before the logs were deleted). `one.sh` therefore:
   disk is bounded by the post-leg delete.
 - `merge-gen.py` refuses empty or non-JSON `gen-*.json` and does not write `-o` on failure.
 
-## Validity / NOISY (inceptor 2026-11-01 07:05)
+## Validity / NOISY (inceptor 2026-11-14 01:06; replaces the 2026-11-01 07:05 load1 >= 6 trigger)
 
-- Start gate: `load1 < 3` before **every** leg (`gate.sh` / `cross-check.sh`), recorded as `load1_pre`.
-- During a leg: `foreign_cpu.py` samples every 5 s. A leg is **NOISY** if foreign processes
-  (not the bench server/generator/harness tree) average **> 0.5 core**, or any sample shows a
-  foreign `java`/`mvn`/load-gen process, or **any** sample (including end-of-leg) has `load1 >= 6`.
+Enabled by default, no flag:
+
+- Pre-leg gate: `load1 < 3`, measured before the server or generator starts, before **every**
+  leg (`gate.sh` / `cross-check.sh` / `one.sh`), recorded as `load1_pre`. A leg that fails it does not run.
+- During a leg: `foreign_cpu.py` samples every 5 s. A leg is **NOISY** if and only if foreign
+  processes (not the bench server/generator/harness tree, and not the sand-host platform:
+  `host-main.cjs`, uid 999) use **> 0.5 core summed, averaged over the leg**, or any sample shows a
+  foreign `java` / `mvn` / `wrk` (load-gen) process.
+- `load1_peak` (max over the leg's samples) and `load1_post` are recorded as **information only**;
+  they never make a leg NOISY or invalid.
 - Absolute-window validity is one shared rule: `window_valid.py` (used by `agg.py` and `gate.sh`).
 - `agg.py` and `gate.sh` discard NOISY legs (never counted). A/A remains mandatory in `PHASE=aa|all`.
 - On completion `gate.sh` writes `$OUT/DONE` (`DONE swarm-stream-gate <time> …`). Queue owners still
@@ -195,9 +201,26 @@ this test does not raise that budget.
 ## Deadline pacer, warmup drain, NOISY platform exclusion
 
 Paced waves (`--rate-mib-s`) wait with `parkUntilDeadline`: `LockSupport.parkNanos` to 200 µs
-before the slot, then a short `onSpinWait` spin. `StreamLoad --self-test` includes a no-server
-pacer proof at the 1-stream and 32-stream 10 MiB/s intervals (target: typical lag under 10% of
-smoke6 `p99_send`). Paced producers run on platform threads.
+before the slot, then a short `onSpinWait` spin. Paced producers run on platform threads with
+timer slack set to 1 µs (`/proc/<tid>/timerslack_ns`, generator only, best-effort; count in
+`timer_slack_threads_set`). `StreamLoad --self-test` includes a no-server pacer proof at the
+1-stream and 32-stream 10 MiB/s intervals.
+
+Pipelined producer (#502 smoke7 root cause). The legacy lean producer sent one `:chunk` POST and
+blocked on its ack before the next slot. When ack RTT exceeds the slot interval (1 stream at
+10 MiB/s: 97.7 µs; smoke7 send p90 was 113 µs) every later slot falls behind, and server ack
+time was counted as generator lag (smoke7 floor n1: lag p50 2 µs, p99 157696 µs). Paced lean
+waves now keep up to `--pipeline-depth` (default `--window`, 8) requests in flight on the same
+HTTP/1.1 connection (the server answers pipelined requests in order); acks are read on the same
+thread while it waits for the next slot. A non-2xx answer or transport error falls back to an
+ordered synchronous resend (server dedups `:chunk`). `PIPELINE_DEPTH=1` (`--pipeline-depth 1`)
+restores the legacy loop for diagnosis. The self-test also proves the mechanism against an
+in-JVM fake server with a 250 µs ack delay (sync falls behind by ~1 s; pipelined stays at µs).
+
+Lag split per measured slot (`result.json`): `pace_wake_*` (arrived early, then parked/spun:
+wake precision), `pace_behind_*` (arrived after the slot: previous work overran),
+`pace_capwait_*` (in-flight cap full: real server back-pressure), plus `ack_rtt_p50/p99_us`
+and generator `gc_ms_window` / `gc_count_window` over the measure window.
 
 After warmup, the generator scrapes `/metrics` and waits (timeout GRACE+SLACK, early return at 0)
 for `sjws_swarm_stream_open_sessions` to drain, logging the before/after gauges into `result.json`.

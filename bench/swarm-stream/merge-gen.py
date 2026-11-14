@@ -309,6 +309,22 @@ def merge(parts: list[dict], gen_cores: int, secs: float | None) -> dict:
     for r in parts:
         fa.extend(r.get("first_admit") or [])
         fw.extend(r.get("first_admit_warmup") or [])
+    # #502 pacer split (WAKE / BEHIND / CAPWAIT), ack RTT and generator GC over the window.
+    for k in ("pace_wake_n", "pace_behind_n", "pace_capwait_n", "gc_ms_window", "gc_count_window",
+              "timer_slack_threads_set"):
+        out[k] = sum_num(parts, k)
+    out["pipeline_depth"] = first_present(parts, "pipeline_depth")
+    for name, p99key, p50key in (
+        ("pace_wake_hist", "pace_wake_p99_us", None),
+        ("pace_behind_hist", "pace_behind_p99_us", None),
+        ("pace_capwait_hist", "pace_capwait_p99_us", None),
+        ("ack_rtt_hist", "ack_rtt_p99_us", "ack_rtt_p50_us"),
+    ):
+        h = merge_hist([r.get(name) for r in parts])
+        out[name] = h
+        out[p99key] = pct_from_hist(h, 0.99) if h else None
+        if p50key:
+            out[p50key] = pct_from_hist(h, 0.50) if h else None
     out["first_admit"] = fa[:40]
     out["first_admit_warmup"] = fw[:40]
     return out

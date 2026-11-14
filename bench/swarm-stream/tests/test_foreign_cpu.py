@@ -45,22 +45,22 @@ def main():
     ], load1_end=1.0)
     assert j["noisy"] and any("foreign_java" in r for r in j["reasons"]), j
 
-    # End load1 >= 6
+    # inceptor 01:06: load1 is information only. End load1 >= 6 alone is NOT noisy.
     j = fc.judge([
         samp(0, {}),
         samp(5, {}, load1=6.2),
     ], load1_end=6.2)
-    assert j["noisy"] and any("load1_sample_peak" in r for r in j["reasons"]), j
+    assert not j["noisy"] and j["reasons"] == [], j
     assert j["load1_peak"] >= 6.2, j
 
-    # Mid-block spike then quiet end (Codex P1 / inceptor HOLD): still NOISY
+    # Mid-block spike is recorded as load1_peak but is not a NOISY reason
     j = fc.judge([
         samp(0, {}, load1=2.0),
-        samp(5, {}, load1=6.5),
+        samp(5, {}, load1=127.0),
         samp(10, {}, load1=2.0),
     ], load1_end=2.0)
-    assert j["noisy"] and j["load1_peak"] >= 6.5, j
-    assert any("load1_sample_peak" in r for r in j["reasons"]), j
+    assert not j["noisy"] and j["load1_peak"] >= 127.0, j
+    assert not any("load1" in r for r in j["reasons"]), j
 
     # Below 6 throughout → not load-noisy (foreign quiet)
     j = fc.judge([

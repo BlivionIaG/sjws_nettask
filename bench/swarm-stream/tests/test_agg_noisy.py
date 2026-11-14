@@ -84,12 +84,18 @@ def main():
         assert "valid=False" in line(out3, "abs-01")
         assert "noisy=True" in out3
 
-        # load1_post >= 6
+        # load1_post >= 6 is information only (inceptor 01:06): still valid
         root4 = Path(td) / "l"
         root4.mkdir()
-        write_abs(root4, "abs-01", load1_post=6.0)
+        write_abs(root4, "abs-01", load1_post=6.0, load1_peak=40.0)
         out4 = run_agg(root4)
-        assert "valid=False" in line(out4, "abs-01")
+        assert "valid=True" in line(out4, "abs-01"), out4
+        # pre-leg load1 >= 3 is still invalid
+        root5 = Path(td) / "p"
+        root5.mkdir()
+        write_abs(root5, "abs-01", load1_pre=3.2)
+        out5 = run_agg(root5)
+        assert "valid=False" in line(out5, "abs-01"), out5
 
         print("OK test_agg_noisy")
 

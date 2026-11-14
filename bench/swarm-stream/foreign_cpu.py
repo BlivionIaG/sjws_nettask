@@ -5,7 +5,10 @@ A block is NOISY if:
   - processes OTHER than the bench's own server/generator/harness use > 0.5 core
     averaged over the block, OR
   - any sample shows a foreign java / mvn / load process, OR
-  - ANY sample (or end-of-block) load1 >= 6 (absolute guard; 07:05 addendum).
+
+load1 is NOT a NOISY trigger (inceptor 2026-11-14 01:06): load1_peak / load1_end
+are recorded as information only. The load1 rule is the pre-leg gate load1 < 3,
+measured before the server or generator starts (gate.sh / one.sh / window_valid).
 
 Own processes = allowlisted PIDs plus their descendants (one.sh tree).
 
@@ -174,7 +177,7 @@ def snapshot(allow: set[int]) -> dict:
 
 
 def judge(samples: list[dict], load1_end: float | None = None,
-          avg_threshold: float = 0.5, load1_end_limit: float = 6.0) -> dict:
+          avg_threshold: float = 0.5) -> dict:
     """Decide NOISY from ≥1 samples. Pure function for unit tests."""
     if not samples:
         return {
@@ -278,7 +281,7 @@ def judge(samples: list[dict], load1_end: float | None = None,
         end_f = float(end) if end is not None else 0.0
     except (TypeError, ValueError):
         end_f = 0.0
-    # Absolute guard on EVERY sample (Codex P1 / 07:05): mid-block spike still NOISY
+    # load1 peak over every sample: information only (inceptor 2026-11-14 01:06)
     peak = end_f
     for s in samples:
         try:
@@ -287,8 +290,6 @@ def judge(samples: list[dict], load1_end: float | None = None,
             v = 0.0
         if v > peak:
             peak = v
-    if peak >= load1_end_limit:
-        reasons.append(f"load1_sample_peak={peak}>={load1_end_limit}")
     return {
         "noisy": bool(reasons),
         "foreign_cpu_avg_cores": avg,

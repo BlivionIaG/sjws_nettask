@@ -262,6 +262,7 @@ if [ "$LOADGEN" = java ]; then
   if [ "${LEAN_CONSUMER:-1}" = 0 ]; then GEN_EXTRA+=(--no-lean-consumer); fi
   if [ -n "${CLAIM_DELAY_MS:-}" ]; then GEN_EXTRA+=(--claim-delay-ms "$CLAIM_DELAY_MS"); fi
   if [ -n "${HANG_EVERY:-}" ]; then GEN_EXTRA+=(--hang-every "$HANG_EVERY"); fi
+  if [ -n "${PIPELINE_DEPTH:-}" ]; then GEN_EXTRA+=(--pipeline-depth "$PIPELINE_DEPTH"); fi
   # #415/#414: optional generator JVM flags (e.g. JFR on the generator to find its own hot spots).
   read -r -a GEN_JAVA_ARGS <<< "${GEN_JAVA_OPTS:-}"
   # Launch one StreamLoad: _launch_streamload <pin> <streams> <groups> <group_offset> <rate_or_empty> <out>
