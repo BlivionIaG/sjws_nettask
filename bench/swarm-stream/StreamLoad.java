@@ -1827,7 +1827,10 @@ public class StreamLoad {
       if (c < le) {
         String name = new String(a, ls, c - ls, StandardCharsets.US_ASCII).trim().toLowerCase(Locale.ROOT);
         String val = new String(a, c + 1, le - c - 1, StandardCharsets.US_ASCII).trim();
-        if (name.equals("content-length")) cl = Long.parseLong(val);
+        if (name.equals("content-length")) {
+          cl = Long.parseLong(val);
+          if (cl < 0 || cl > Integer.MAX_VALUE) throw new IOException("pacer-loop: bad content-length");
+        }
         else if (name.equals("transfer-encoding")) chunked = val.toLowerCase(Locale.ROOT).contains("chunked");
       }
       ls = le + 2;
@@ -1854,8 +1857,10 @@ public class StreamLoad {
             if (empty) return q - off;
           }
         }
-        if (q + size + 2 > end) return -1;
-        q += (int) size + 2;
+        if (size < 0 || size > Integer.MAX_VALUE - 2) throw new IOException("pacer-loop: bad chunk size");
+        int sz = (int) size;
+        if (sz + 2 > end - q) return -1;
+        q += sz + 2;
       }
     }
     long need = (hdrEnd - off) + Math.max(0L, cl);
