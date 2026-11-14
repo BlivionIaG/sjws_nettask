@@ -188,6 +188,13 @@ existing Vary, left alone when Vary is `*`). Stale `Content-Length`, `Content-MD
 `Content-Digest`, `Repr-Digest`, `Digest` and `Accept-Ranges` are removed; the transport writes `Content-Length` from the new body. A present
 ETag is suffixed with `-gzip` inside the quotes.
 
+Enabling response compression over TLS on responses that mix secrets with
+attacker-influenced content can enable compression side-channel attacks. Leave
+compression off for those routes, or have the client send `Cache-Control: no-transform`.
+Strong validators from compressed responses (the `-gzip` ETags) are for caching only
+and cannot be used for `If-Match` or `If-Range`. Clients should refetch the identity
+representation before a conditional write or a range resume.
+
 
 ## ip-acl
 

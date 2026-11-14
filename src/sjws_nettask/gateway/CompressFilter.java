@@ -235,6 +235,9 @@ public final class CompressFilter implements RequestFilter {
     /**
      * Rewrites {@code If-None-Match} so filter-generated {@code -gzip} validators are presented
      * to the inner handler in identity form. Leaves {@code *} and malformed fields unchanged.
+     * {@code If-Match} and {@code If-Range} are forwarded unchanged: translating them cannot
+     * be done safely, because a mutation is applied upstream before this filter sees the
+     * response, and a translated If-Range would apply identity byte offsets to gzip content.
      */
     static Request withIdentityValidators(Request request) {
         var headers = request.headers();
@@ -258,6 +261,9 @@ public final class CompressFilter implements RequestFilter {
 
     /** Inverse of {@link #withCoding}: strip a trailing {@code -gzip} from each listed tag. */
     static String identityValidators(String ifNoneMatch) {
+        if (ifNoneMatch == null || ifNoneMatch.isBlank()) {
+            return ifNoneMatch;
+        }
         var suffix = "-gzip";
         var out = new StringBuilder(ifNoneMatch.length());
         int i = 0;
