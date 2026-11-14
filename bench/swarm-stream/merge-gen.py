@@ -315,6 +315,9 @@ def merge(parts: list[dict], gen_cores: int, secs: float | None) -> dict:
         out[k] = sum_num(parts, k)
     out["pipeline_depth"] = first_present(parts, "pipeline_depth")
     out["pacer_loop"] = bool(first_present(parts, "pacer_loop", False))
+    for k in ("pacer_write_p99_us", "pacer_write_max_us", "pacer_drain_p99_us", "pacer_drain_max_us"):
+        vs = [r.get(k) for r in parts if isinstance(r.get(k), (int, float)) and r.get(k) == r.get(k)]
+        out[k] = max(vs) if vs else None  # p99: max over processes (upper bound)
     for name, p99key, p50key in (
         ("pace_wake_hist", "pace_wake_p99_us", None),
         ("pace_behind_hist", "pace_behind_p99_us", None),

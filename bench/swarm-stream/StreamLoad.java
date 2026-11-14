@@ -354,6 +354,9 @@ public class StreamLoad {
     }
   }
   static final LongAdder TIMER_SLACK_SET = new LongAdder();
+  /** #502 pacer loop: time inside the socket write and inside one non-blocking ack drain (µs). */
+  static final LatBag PACER_WRITE = new LatBag(), PACER_DRAIN = new LatBag();
+  static final LongAccumulator PACER_WRITE_MAX_NS = new LongAccumulator(Math::max, 0), PACER_DRAIN_MAX_NS = new LongAccumulator(Math::max, 0);
 
   static void parkUntilDeadline(long deadlineNs) {
     while (parkStep(deadlineNs, Long.MAX_VALUE)) { /* parked; re-check */ }
@@ -601,6 +604,15 @@ public class StreamLoad {
     fail += selfCheck("retry-after junk", retryAfterMs("Fri, 01 Jan", 1000) == 1000);
     // Pacer proof (no server). Intervals are 1-stream and 32-stream at 10 MiB/s, 1024-byte chunks.
     // Limits = 10% of smoke6 p99_send (150 µs at 1 stream, 520 µs at 32 streams).
+    try {
+      byte[] r1 = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcHTTP/1.1 429 X\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\nHTTP/1.1 200".getBytes(StandardCharsets.US_ASCII);
+      int[] st = new int[1];
+      int u1 = parseResponse(r1, 0, r1.length, st); int s1 = st[0];
+      int u2 = parseResponse(r1, u1, r1.length - u1, st); int s2 = st[0];
+      int u3 = parseResponse(r1, u1 + u2, r1.length - u1 - u2, st);
+      int u4 = parseResponse(r1, 0, u1 - 1, st);
+      fail += selfCheck("parseResponse content-length/chunked/partial", s1 == 200 && u1 == 41 && s2 == 429 && u2 > 0 && u3 == -1 && u4 == -1);
+    } catch (IOException e) { fail += selfCheck("parseResponse threw " + e, false); }
     // Mechanism checks run unpinned on a shared box: up to 3 attempts, any clean attempt passes.
     int pf = 1;
     for (int att = 1; att <= 3 && pf != 0; att++) {
@@ -861,6 +873,7 @@ public class StreamLoad {
     SCHED_SENDS.reset(); SCHED_LATE.reset(); SCHED_LAG_MAX_NS.reset(); measureErr.clear(); teardownErr.clear();
     PACE_WAKE.clearAll(); PACE_BEHIND.clearAll(); PACE_CAPWAIT.clearAll(); ACK_RTT.clearAll();
     PACE_WAKE_N.reset(); PACE_BEHIND_N.reset(); PACE_CAPWAIT_N.reset();
+    PACER_WRITE.clearAll(); PACER_DRAIN.clearAll(); PACER_WRITE_MAX_NS.reset(); PACER_DRAIN_MAX_NS.reset();
     for (LongAdder c : List.of(SCHED_EXPECTED, SCHED_SENT, SCHED_RECEIVED, SCHED_UNRECEIVED,
         SCHED_PHANTOM_STREAMS, SCHED_STAMP_FALLBACK, SCHED_INFLIGHT_AT_END, SCHED_STREAMS_SHORT,
         SCHED_LATE_REGISTERED)) c.reset();
@@ -926,6 +939,9 @@ public class StreamLoad {
     r.pipelineDepth = (args.rateMibS > 0 && args.leanHttp)
         ? (args.pacerLoop ? PacerLoop.depth(args) : (args.pipelineDepth > 0 ? args.pipelineDepth : Math.max(1, args.window))) : 1;
     r.pacerLoop = args.rateMibS > 0 && args.leanHttp && args.pacerLoop;
+    r.pacerWriteP99 = PACER_WRITE.count() > 0 ? PACER_WRITE.pctFromBuckets(0.99) : Double.NaN;
+    r.pacerDrainP99 = PACER_DRAIN.count() > 0 ? PACER_DRAIN.pctFromBuckets(0.99) : Double.NaN;
+    r.pacerWriteMaxUs = PACER_WRITE_MAX_NS.get() / 1e3; r.pacerDrainMaxUs = PACER_DRAIN_MAX_NS.get() / 1e3;
     r.timerSlackSet = TIMER_SLACK_SET.sum(); r.paceWakeN = PACE_WAKE_N.sum(); r.paceBehindN = PACE_BEHIND_N.sum(); r.paceCapwaitN = PACE_CAPWAIT_N.sum();
     r.paceWakeHist = PACE_WAKE.sparseJson(); r.paceBehindHist = PACE_BEHIND.sparseJson();
     r.paceCapwaitHist = PACE_CAPWAIT.sparseJson(); r.ackRttHist = ACK_RTT.sparseJson();
@@ -1408,6 +1424,7 @@ public class StreamLoad {
       final ArrayDeque<byte[]> free = new ArrayDeque<>();
       final List<Pending> redo = new ArrayList<>();
       long seq; long capT0; boolean draining;
+      byte[] acc = new byte[16384]; int accLen; // bytes read without blocking, not yet parsed
       final CountDownLatch done = new CountDownLatch(1);
       Stream(LeanHttp lean, byte[] dataHdr, Lease lease, byte[] payload, Track track, long phaseNs, long nextNs,
           boolean coStamp, int depth, String pool) {
@@ -1489,9 +1506,7 @@ public class StreamLoad {
         while (System.nanoTime() < slotNs) Thread.onSpinWait();
         ready.poll();
         if (head.inflight.size() >= head.depth) {
-          try { while (head.lean.in != null && head.lean.in.available() > 0 && !head.inflight.isEmpty())
-                  handleOne(head.lean, head.inflight, head.free, head.redo, requests, w, head.track); }
-          catch (IOException e) { fail(head, e); }
+          try { drainNb(head); } catch (IOException e) { fail(head, e); }
           if (head.inflight.size() >= head.depth) {
             if (head.capT0 == 0) head.capT0 = System.nanoTime();
             blocked.add(head);
@@ -1532,7 +1547,10 @@ public class StreamLoad {
       st.inflight.addLast(new Pending(st.seq, slotNs, frame, emitNs, counted));
       st.seq++;
       try {
+        long t0 = System.nanoTime();
         st.lean.send(st.dataHdr, frame);
+        long dt = System.nanoTime() - t0;
+        if (counted) { PACER_WRITE.add(dt / 1e3); PACER_WRITE_MAX_NS.accumulate(dt); }
       } catch (IOException e) {
         fail(st, e);
       }
@@ -1542,6 +1560,7 @@ public class StreamLoad {
     void fail(Stream st, IOException e) {
       if (!inTeardown.get()) producerTransportRetries.incrementAndGet();
       st.lean.closeQuiet();
+      st.accLen = 0;
       st.redo.addAll(st.inflight);
       st.inflight.clear();
       st.redo.sort(java.util.Comparator.comparingLong(Pending::seq));
@@ -1556,6 +1575,52 @@ public class StreamLoad {
       }
     }
 
+    /**
+     * Read whatever bytes are already there (never blocks: only up to available()) and handle every
+     * complete in-order response. A response split across TCP segments stays buffered until the
+     * rest arrives, instead of blocking the loop in readResponse.
+     */
+    void drainNb(Stream st) throws IOException {
+      if (st.inflight.isEmpty() || st.lean.in == null) return;
+      long t0 = System.nanoTime();
+      try { drainNb0(st); } finally {
+        long dt = System.nanoTime() - t0;
+        if (w.account && w.startNs != Long.MAX_VALUE && t0 >= w.startNs && t0 < w.endNs) {
+          PACER_DRAIN.add(dt / 1e3); PACER_DRAIN_MAX_NS.accumulate(dt);
+        }
+      }
+    }
+    void drainNb0(Stream st) throws IOException {
+      InputStream in = st.lean.in;
+      int av;
+      while ((av = in.available()) > 0) {
+        if (st.accLen == st.acc.length) st.acc = Arrays.copyOf(st.acc, st.acc.length * 2);
+        int r = in.read(st.acc, st.accLen, Math.min(av, st.acc.length - st.accLen));
+        if (r < 0) throw new EOFException("pacer-loop: connection closed");
+        st.accLen += r;
+      }
+      int pos = 0;
+      int[] status = new int[1];
+      while (pos < st.accLen && !st.inflight.isEmpty()) {
+        int used = parseResponse(st.acc, pos, st.accLen - pos, status);
+        if (used < 0) break;
+        pos += used;
+        Pending pd = st.inflight.pollFirst();
+        requests.incrementAndGet();
+        if (pd.counted()) ACK_RTT.add((System.nanoTime() - pd.writeNs()) / 1e3);
+        if (status[0] == 200 || status[0] == 204) {
+          if (pd.counted()) { st.track.sent.incrementAndGet(); SCHED_SENT.increment(); }
+          st.free.addLast(pd.frame());
+        } else {
+          st.redo.add(pd);
+        }
+      }
+      if (pos > 0) {
+        System.arraycopy(st.acc, pos, st.acc, 0, st.accLen - pos);
+        st.accLen -= pos;
+      }
+    }
+
     /** Non-blocking ack reads for every stream with requests in flight, until {@code untilNs}. */
     void pollAcks(long untilNs) {
       for (int i = 0; i < all.size(); i++) {
@@ -1563,8 +1628,7 @@ public class StreamLoad {
         Stream st = all.get(i);
         if (st.inflight.isEmpty()) continue;
         try {
-          while (!st.inflight.isEmpty() && st.lean.in != null && st.lean.in.available() > 0)
-            handleOne(st.lean, st.inflight, st.free, st.redo, requests, w, st.track);
+          drainNb(st);
         } catch (IOException e) {
           fail(st, e);
         }
@@ -1576,8 +1640,7 @@ public class StreamLoad {
       for (java.util.Iterator<Stream> it = blocked.iterator(); it.hasNext(); ) {
         Stream st = it.next();
         try {
-          while (!st.inflight.isEmpty() && st.lean.in != null && st.lean.in.available() > 0)
-            handleOne(st.lean, st.inflight, st.free, st.redo, requests, w, st.track);
+          drainNb(st);
         } catch (IOException e) {
           fail(st, e);
         }
@@ -1590,8 +1653,7 @@ public class StreamLoad {
       for (java.util.Iterator<Stream> it = finishing.iterator(); it.hasNext(); ) {
         Stream st = it.next();
         try {
-          while (!st.inflight.isEmpty() && st.lean.in != null && st.lean.in.available() > 0)
-            handleOne(st.lean, st.inflight, st.free, st.redo, requests, w, st.track);
+          drainNb(st);
         } catch (IOException e) {
           fail(st, e);
         }
@@ -1602,6 +1664,73 @@ public class StreamLoad {
         }
       }
     }
+  }
+
+  /**
+   * Parse one complete HTTP/1.1 response at {@code a[off, off+len)}. Returns bytes used, or -1 when
+   * it is not complete yet. {@code status[0]} gets the status code. Content-Length and chunked
+   * bodies are supported (no body for 1xx/204/304). Mirrored by the pacer-loop self-test.
+   */
+  static int parseResponse(byte[] a, int off, int len, int[] status) throws IOException {
+    int end = off + len, i = off, hdrEnd = -1;
+    for (; i + 3 < end; i++) {
+      if (a[i] == '\r' && a[i + 1] == '\n' && a[i + 2] == '\r' && a[i + 3] == '\n') { hdrEnd = i + 4; break; }
+    }
+    if (hdrEnd < 0) return -1;
+    int sp = off;
+    while (sp < hdrEnd && a[sp] != ' ') sp++;
+    if (sp + 4 > hdrEnd) throw new IOException("pacer-loop: bad status line");
+    int sc = 0;
+    for (int k = sp + 1; k < sp + 4; k++) {
+      int d = a[k] - '0';
+      if (d < 0 || d > 9) throw new IOException("pacer-loop: bad status code");
+      sc = sc * 10 + d;
+    }
+    status[0] = sc;
+    long cl = -1;
+    boolean chunked = false;
+    int ls = off;
+    while (ls < hdrEnd - 2) {
+      int le = ls;
+      while (le < hdrEnd && a[le] != '\r') le++;
+      int c = ls;
+      while (c < le && a[c] != ':') c++;
+      if (c < le) {
+        String name = new String(a, ls, c - ls, StandardCharsets.US_ASCII).trim().toLowerCase(Locale.ROOT);
+        String val = new String(a, c + 1, le - c - 1, StandardCharsets.US_ASCII).trim();
+        if (name.equals("content-length")) cl = Long.parseLong(val);
+        else if (name.equals("transfer-encoding")) chunked = val.toLowerCase(Locale.ROOT).contains("chunked");
+      }
+      ls = le + 2;
+    }
+    if (sc / 100 == 1 || sc == 204 || sc == 304) return hdrEnd - off;
+    if (chunked) {
+      int q = hdrEnd;
+      for (;;) {
+        int le = q;
+        while (le + 1 < end && !(a[le] == '\r' && a[le + 1] == '\n')) le++;
+        if (le + 1 >= end) return -1;
+        int semi = q;
+        while (semi < le && a[semi] != ';') semi++;
+        long size = Long.parseLong(new String(a, q, semi - q, StandardCharsets.US_ASCII).trim(), 16);
+        q = le + 2;
+        if (size == 0) {
+          // trailers until an empty line
+          for (;;) {
+            int te = q;
+            while (te + 1 < end && !(a[te] == '\r' && a[te + 1] == '\n')) te++;
+            if (te + 1 >= end) return -1;
+            boolean empty = te == q;
+            q = te + 2;
+            if (empty) return q - off;
+          }
+        }
+        if (q + size + 2 > end) return -1;
+        q += (int) size + 2;
+      }
+    }
+    long need = (hdrEnd - off) + Math.max(0L, cl);
+    return need <= len ? (int) need : -1;
   }
 
   /** One in-flight pipelined :chunk. */
@@ -2742,6 +2871,7 @@ public class StreamLoad {
     long gcMsWindow, gcCountWindow, paceWakeN, paceBehindN, paceCapwaitN, timerSlackSet;
     int pipelineDepth;
     boolean pacerLoop;
+    double pacerWriteP99 = Double.NaN, pacerDrainP99 = Double.NaN, pacerWriteMaxUs, pacerDrainMaxUs;
     String paceWakeHist = "[]", paceBehindHist = "[]", paceCapwaitHist = "[]", ackRttHist = "[]";
     Double paceWakeP99, paceBehindP99, paceCapwaitP99, ackRttP50, ackRttP99;
     Double warmupDrainOpenBefore, warmupDrainOpenAfter, warmupDrainChargedBefore, warmupDrainChargedAfter;
@@ -2849,6 +2979,10 @@ public class StreamLoad {
       field(sb, "warmup_drain_timed_out", warmupDrainTimedOut, true);
       field(sb, "pipeline_depth", pipelineDepth, true);
       sb.append("  \"pacer_loop\":").append(pacerLoop).append(",\n");
+      field(sb, "pacer_write_p99_us", pacerWriteP99, true);
+      field(sb, "pacer_write_max_us", pacerWriteMaxUs, true);
+      field(sb, "pacer_drain_p99_us", pacerDrainP99, true);
+      field(sb, "pacer_drain_max_us", pacerDrainMaxUs, true);
       field(sb, "gc_ms_window", gcMsWindow, true);
       field(sb, "gc_count_window", gcCountWindow, true);
       field(sb, "timer_slack_threads_set", timerSlackSet, true);
