@@ -355,7 +355,22 @@ public class StreamLoad {
   }
   static final LongAdder TIMER_SLACK_SET = new LongAdder();
   /** #502 pacer loop: time inside the socket write and inside one non-blocking ack drain (µs). */
-  static final LatBag PACER_WRITE = new LatBag(), PACER_DRAIN = new LatBag();
+  static final LatBag PACER_WRITE = new LatBag(), PACER_DRAIN = new LatBag(), PACER_ITER = new LatBag();
+  /** Pacer-loop thread over the measure window: CPU run time, runqueue wait, involuntary switches. */
+  static volatile long PACER_RUN_NS = -1, PACER_RQWAIT_NS = -1, PACER_NONVOL_CS = -1;
+  static long[] threadSched() {
+    try {
+      Path link = Files.readSymbolicLink(Path.of("/proc/thread-self"));
+      String tid = link.getFileName().toString();
+      String[] ss = Files.readString(Path.of("/proc", tid, "schedstat")).trim().split("\\s+");
+      long nv = -1;
+      for (String line : Files.readAllLines(Path.of("/proc", tid, "status")))
+        if (line.startsWith("nonvoluntary_ctxt_switches:")) nv = Long.parseLong(line.substring(27).trim());
+      return new long[] {Long.parseLong(ss[0]), Long.parseLong(ss[1]), nv};
+    } catch (Exception e) {
+      return null;
+    }
+  }
   static final LongAccumulator PACER_WRITE_MAX_NS = new LongAccumulator(Math::max, 0), PACER_DRAIN_MAX_NS = new LongAccumulator(Math::max, 0);
 
   static void parkUntilDeadline(long deadlineNs) {
@@ -512,6 +527,12 @@ public class StreamLoad {
     boolean pacerLoop = false;
     /** Max spin before a slot in the pacer loop (µs); the loop parks until then. */
     long pacerSpinUs = 20;
+    /**
+     * In-flight :chunk cap per stream in the pacer loop. pacer-check2: a cap of 8 (780 µs at 1 stream)
+     * turned server ack tails into CAPWAIT; the server's own credit window is 256 chunks + 4 MiB
+     * (it answers 429 past it), so 64 stays well inside credit. --pipeline-depth > 1 overrides.
+     */
+    int pacerDepth = 64;
     /**
      * #415: aggregate offered rate in MiB/s. 0 = closed loop (legacy: every stream POSTs as fast as
      * its round trip allows). > 0 = each stream sends on a fixed schedule of
@@ -873,7 +894,8 @@ public class StreamLoad {
     SCHED_SENDS.reset(); SCHED_LATE.reset(); SCHED_LAG_MAX_NS.reset(); measureErr.clear(); teardownErr.clear();
     PACE_WAKE.clearAll(); PACE_BEHIND.clearAll(); PACE_CAPWAIT.clearAll(); ACK_RTT.clearAll();
     PACE_WAKE_N.reset(); PACE_BEHIND_N.reset(); PACE_CAPWAIT_N.reset();
-    PACER_WRITE.clearAll(); PACER_DRAIN.clearAll(); PACER_WRITE_MAX_NS.reset(); PACER_DRAIN_MAX_NS.reset();
+    PACER_WRITE.clearAll(); PACER_DRAIN.clearAll(); PACER_ITER.clearAll(); PACER_WRITE_MAX_NS.reset(); PACER_DRAIN_MAX_NS.reset();
+    PACER_RUN_NS = -1; PACER_RQWAIT_NS = -1; PACER_NONVOL_CS = -1;
     for (LongAdder c : List.of(SCHED_EXPECTED, SCHED_SENT, SCHED_RECEIVED, SCHED_UNRECEIVED,
         SCHED_PHANTOM_STREAMS, SCHED_STAMP_FALLBACK, SCHED_INFLIGHT_AT_END, SCHED_STREAMS_SHORT,
         SCHED_LATE_REGISTERED)) c.reset();
@@ -942,6 +964,9 @@ public class StreamLoad {
     r.pacerWriteP99 = PACER_WRITE.count() > 0 ? PACER_WRITE.pctFromBuckets(0.99) : Double.NaN;
     r.pacerDrainP99 = PACER_DRAIN.count() > 0 ? PACER_DRAIN.pctFromBuckets(0.99) : Double.NaN;
     r.pacerWriteMaxUs = PACER_WRITE_MAX_NS.get() / 1e3; r.pacerDrainMaxUs = PACER_DRAIN_MAX_NS.get() / 1e3;
+    r.pacerIterP99 = PACER_ITER.count() > 0 ? PACER_ITER.pctFromBuckets(0.99) : Double.NaN;
+    r.pacerIterMax = PACER_ITER.count() > 0 ? PACER_ITER.pctFromBuckets(1.0) : Double.NaN;
+    r.pacerRunMs = PACER_RUN_NS / 1e6; r.pacerRqWaitMs = PACER_RQWAIT_NS / 1e6; r.pacerNonvolCs = PACER_NONVOL_CS;
     r.timerSlackSet = TIMER_SLACK_SET.sum(); r.paceWakeN = PACE_WAKE_N.sum(); r.paceBehindN = PACE_BEHIND_N.sum(); r.paceCapwaitN = PACE_CAPWAIT_N.sum();
     r.paceWakeHist = PACE_WAKE.sparseJson(); r.paceBehindHist = PACE_BEHIND.sparseJson();
     r.paceCapwaitHist = PACE_CAPWAIT.sparseJson(); r.ackRttHist = ACK_RTT.sparseJson();
@@ -1415,7 +1440,7 @@ public class StreamLoad {
    * as the per-thread producers.
    */
   static final class PacerLoop implements Runnable {
-    static int depth(Args a) { return a.pipelineDepth > 1 ? a.pipelineDepth : Math.max(1, a.window); }
+    static int depth(Args a) { return a.pipelineDepth > 1 ? a.pipelineDepth : Math.max(1, a.pacerDepth); }
 
     static final class Stream {
       final LeanHttp lean; final byte[] dataHdr; final Lease lease; final byte[] payload; final Track track;
@@ -1466,7 +1491,22 @@ public class StreamLoad {
       if (setThreadTimerSlack(1_000L)) TIMER_SLACK_SET.increment();
       final java.util.concurrent.ThreadLocalRandom rnd = java.util.concurrent.ThreadLocalRandom.current();
       final AtomicBoolean stop = w.hardStop;
+      long[] sched0 = null;
+      boolean schedDone = false;
+      long segStart = System.nanoTime();
       while (!shut && !stop.get()) {
+        if (w.account && !schedDone) {
+          long tn = System.nanoTime();
+          if (sched0 == null && w.startNs != Long.MAX_VALUE && tn >= w.startNs) sched0 = threadSched();
+          else if (sched0 != null && tn >= w.endNs) {
+            long[] s1 = threadSched();
+            if (s1 != null) {
+              PACER_RUN_NS = s1[0] - sched0[0]; PACER_RQWAIT_NS = s1[1] - sched0[1];
+              PACER_NONVOL_CS = s1[2] >= 0 && sched0[2] >= 0 ? s1[2] - sched0[2] : -1;
+            }
+            schedDone = true;
+          }
+        }
         Stream st;
         while ((st = incoming.poll()) != null) { all.add(st); ready.add(st); }
         serviceBlocked();
@@ -1499,11 +1539,15 @@ public class StreamLoad {
             rem = slotNs - System.nanoTime();
           }
           if (rem > spinNs) {
+            long tp = System.nanoTime();
+            if (inMeasure(tp)) PACER_ITER.add((tp - segStart) / 1e3);
             LockSupport.parkNanos(Math.min(rem - spinNs, 1_000_000L));
+            segStart = System.nanoTime();
             if (slotNs - System.nanoTime() > spinNs) continue; // early or new work: re-evaluate
           }
         }
         while (System.nanoTime() < slotNs) Thread.onSpinWait();
+        segStart = System.nanoTime();
         ready.poll();
         if (head.inflight.size() >= head.depth) {
           try { drainNb(head); } catch (IOException e) { fail(head, e); }
@@ -1519,6 +1563,8 @@ public class StreamLoad {
       // Hard stop or shutdown: release every waiting producer.
       for (Stream s : all) s.done.countDown();
     }
+
+    boolean inMeasure(long t) { return w.account && w.startNs != Long.MAX_VALUE && t >= w.startNs && t < w.endNs; }
 
     void send(Stream st, long arriveNs, java.util.concurrent.ThreadLocalRandom rnd) {
       if (!st.redo.isEmpty()) resendRedo(st, rnd);
@@ -2826,6 +2872,7 @@ public class StreamLoad {
         case "--pacer-loop" -> args.pacerLoop = true;
         case "--no-pacer-loop" -> args.pacerLoop = false;
         case "--pacer-spin-us" -> args.pacerSpinUs = Long.parseLong(a[++i]);
+        case "--pacer-depth" -> args.pacerDepth = Integer.parseInt(a[++i]);
         case "--pace-ms" -> throw new IllegalArgumentException(
             "--pace-ms was #465's per-stream sleep; use --rate-mib-s (aggregate MiB/s) instead");
         case "--lean-consumer" -> args.leanConsumer = true;
@@ -2872,6 +2919,8 @@ public class StreamLoad {
     int pipelineDepth;
     boolean pacerLoop;
     double pacerWriteP99 = Double.NaN, pacerDrainP99 = Double.NaN, pacerWriteMaxUs, pacerDrainMaxUs;
+    double pacerIterP99 = Double.NaN, pacerIterMax = Double.NaN, pacerRunMs, pacerRqWaitMs;
+    long pacerNonvolCs;
     String paceWakeHist = "[]", paceBehindHist = "[]", paceCapwaitHist = "[]", ackRttHist = "[]";
     Double paceWakeP99, paceBehindP99, paceCapwaitP99, ackRttP50, ackRttP99;
     Double warmupDrainOpenBefore, warmupDrainOpenAfter, warmupDrainChargedBefore, warmupDrainChargedAfter;
@@ -2983,6 +3032,11 @@ public class StreamLoad {
       field(sb, "pacer_write_max_us", pacerWriteMaxUs, true);
       field(sb, "pacer_drain_p99_us", pacerDrainP99, true);
       field(sb, "pacer_drain_max_us", pacerDrainMaxUs, true);
+      field(sb, "pacer_iter_p99_us", pacerIterP99, true);
+      field(sb, "pacer_iter_max_us", pacerIterMax, true);
+      field(sb, "pacer_run_ms", pacerRunMs, true);
+      field(sb, "pacer_rqwait_ms", pacerRqWaitMs, true);
+      field(sb, "pacer_nonvol_cs", pacerNonvolCs, true);
       field(sb, "gc_ms_window", gcMsWindow, true);
       field(sb, "gc_count_window", gcCountWindow, true);
       field(sb, "timer_slack_threads_set", timerSlackSet, true);

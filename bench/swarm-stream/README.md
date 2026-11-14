@@ -221,7 +221,11 @@ wake latency (wake p99 1264-1632 µs) with about 11 producer threads per pinned 
 
 Pacing loop (`PACER_LOOP=1`, `--pacer-loop`, opt-in): one platform thread per generator process
 sends every paced lean stream's slots in deadline order, each on its own keep-alive socket with
-a bounded in-flight window (`--window`, or `--pipeline-depth` if > 1). Acks are read without
+a bounded in-flight window (`--pacer-depth`, default 64, well inside the server's 256-chunk
+credit window; `--pipeline-depth` > 1 overrides). Over the measure window the loop also records
+`pacer_write_*`, `pacer_drain_*`, `pacer_iter_*` (its own work time per wake) and, from
+`/proc/<tid>/schedstat`, `pacer_run_ms` / `pacer_rqwait_ms` (runnable but waiting for the core,
+i.e. starved by consumers or others) / `pacer_nonvol_cs`. Acks are read without
 blocking in the slack before the next deadline; the loop parks until `--pacer-spin-us`
 (default 20 µs) before the slot and spins only that long. A stream with a full window is set
 aside (CAPWAIT) without blocking the others. Producer threads only claim, register, wait and
