@@ -3,10 +3,15 @@
 
 A window is valid only when ALL of:
   - chunk_samples >= 10000, p99 present, load1_pre < 3
-  - not self_loaded (recomputed: load1_post>=4 OR cpu > 80*gen_cores)
+  - not self_loaded (recomputed from generator CPU only: sum cpu > 80*gen_cores
+    OR any process > 80% of its own pinned core). load1_post is not part of this
+    rule. Do not OR StreamLoad's stale pre-drain flag.
   - no transport retries / refused_per_ip / drain timeout / open sessions after drain
   - no setup failures (error_count / group_open_refusals)
-  - not NOISY (marker, foreign_cpu_avg>0.5, foreign load proc, OR any/end load1>=6)
+  - not NOISY (inceptor 2026-11-14 01:06): marker, foreign_cpu_avg > 0.5 core summed
+    over the leg (sand-host host-main.cjs / uid 999 excluded), OR any foreign
+    java/mvn/wrk process. load1_peak / load1_post are information only; the only
+    load1 rule is the pre-leg gate load1_pre < 3.
 """
 from __future__ import annotations
 
@@ -42,7 +47,28 @@ def evaluate(r: dict) -> dict:
     except (TypeError, ValueError):
         cpu_f = float("nan")
     gen_sat = (cpu_f == cpu_f) and cpu_f > sat_lim
-    self_loaded = bool(r.get("self_loaded")) or gen_sat or load1_post >= 4.0
+    # Mode B (inceptor 2026-11-13 20:02): also self_loaded if ANY process is
+    # above 80% of its own pinned core, even when the sum is under 80*gen_cores.
+    per = r.get("client_cpu_pct_per_proc") or []
+    any_proc = False
+    for c in per:
+        try:
+            if c is not None and float(c) > 80.0:
+                any_proc = True
+                break
+        except (TypeError, ValueError):
+            pass
+    gen_sat = gen_sat or any_proc
+    # Q4: recompute only. Do not OR a stale result.self_loaded: StreamLoad sets that
+    # flag from end-of-measure load1, then merge_noisy overwrites load1_post with
+    # the (usually lower) end-of-drain sample. Trusting the stale flag would
+    # mark a 136%-CPU / load1_post=1.77 leg self_loaded just because mid-measure
+    # load1 briefly crossed 4. Folded in from #465's harness after it merged.
+    # Mode B (inceptor 2026-11-13 21:32): self_loaded is ONLY any-proc > 80%
+    # or sum > 80*gen_cores. load1_post>=4 is not this flag (it wrongly marked
+    # the 25 and 50 MiB/s rungs self_loaded at 140.5%/208.9% with every proc
+    # under 80% and the sum under 240%). load1 is not NOISY either (01:06 rule).
+    self_loaded = gen_sat
 
     ptr = _i(r.get("producer_transport_retries"))
     ccr = _i(r.get("consumer_connect_retries"))
@@ -68,13 +94,7 @@ def evaluate(r: dict) -> dict:
         noisy = True
     if r.get("foreign_load_proc_seen"):
         noisy = True
-    if load1_post >= 6.0:
-        noisy = True
-    # any mid-block sample (07:05 / Codex P1): foreign_cpu judgment may stash load1_peak
-    if _f(r.get("load1_peak"), 0.0) >= 6.0:
-        noisy = True
-    if any(_f(x, 0.0) >= 6.0 for x in (r.get("load1_samples") or [])):
-        noisy = True
+    # load1_post / load1_peak / load1_samples: information only (inceptor 2026-11-14 01:06).
 
     valid = (
         n >= 10000
