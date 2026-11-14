@@ -280,8 +280,9 @@ if [ "$LOADGEN" = java ]; then
   if [ "${PACER_LOOP:-0}" = 1 ]; then GEN_EXTRA+=(--pacer-loop); fi
   if [ -n "${PACER_SPIN_US:-}" ]; then GEN_EXTRA+=(--pacer-spin-us "$PACER_SPIN_US"); fi
   if [ -n "${PACER_DEPTH:-}" ]; then GEN_EXTRA+=(--pacer-depth "$PACER_DEPTH"); fi
-  # #502: PACER_NICE_BOOST=1 (with PACER_LOOP=1) launches the generator at nice 0; StreamLoad then
-  # moves every thread except the pacing loop back to nice 10 (the usual launch nice).
+  # #502: PACER_NICE_BOOST=1 (with PACER_LOOP=1) launches the generator with nice -n 0 instead of 10
+  # (relative to the caller; the bench waiters run at +10); StreamLoad then moves every thread
+  # except the pacing loop to nice 19, the value they had before (10 + 10, capped at 19).
   GEN_NICE=10
   if [ "${PACER_LOOP:-0}" = 1 ] && [ "${PACER_NICE_BOOST:-0}" = 1 ]; then GEN_EXTRA+=(--pacer-nice-boost); GEN_NICE=0; fi
   # #415/#414: optional generator JVM flags (e.g. JFR on the generator to find its own hot spots).

@@ -357,10 +357,11 @@ public class StreamLoad {
   static volatile int PACER_NICE = Integer.MIN_VALUE;
 
   /**
-   * #502 (a), harness only: one.sh launches a pacing-loop generator at nice 0 with --pacer-nice-boost.
-   * At startup every JVM thread except a small spawner is moved to nice 10 (the old launch nice); the
-   * spawner creates the pacing-loop threads, so only "sl-pacer" keeps nice 0. Threads created later
-   * inherit nice 10 from their (demoted) creator. Raising nice needs no privilege. Same cores, same
+   * #502 (a), harness only: with --pacer-nice-boost one.sh launches the generator 10 nice levels
+   * higher-priority than before (it used `nice -n 10` under waiters that already add 10, i.e. 19).
+   * At startup every JVM thread except a small spawner is moved to nice 19 (the effective old value);
+   * the spawner creates the pacing-loop threads, so only "sl-pacer" keeps the launch nice. Threads
+   * created later inherit 19 from their (demoted) creator. Raising nice needs no privilege. Same cores, same
    * pinning; this is not option (b).
    */
   static final class NiceBoost {
@@ -401,11 +402,11 @@ public class StreamLoad {
           try { comm = Files.readString(t.resolve("comm")).trim(); } catch (Exception e) { continue; }
           if (KEEP.contains(comm)) continue;
           int n = nice(id);
-          if (n != Integer.MIN_VALUE && n < 10) tids.add(id);
+          if (n != Integer.MIN_VALUE && n < 19) tids.add(id);
         }
       } catch (Exception e) { FAILED.increment(); return; }
       if (tids.isEmpty()) return;
-      List<String> cmd = new ArrayList<>(List.of("renice", "-n", "10", "-p"));
+      List<String> cmd = new ArrayList<>(List.of("renice", "-n", "19", "-p"));
       cmd.addAll(tids);
       try {
         Process pr = new ProcessBuilder(cmd).redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
@@ -590,7 +591,7 @@ public class StreamLoad {
      * threads only claim, register and send LAST; consumers keep their own threads.
      */
     boolean pacerLoop = false;
-    /** #502: run the pacing-loop thread at the launch nice and every other thread at nice 10 (--pacer-nice-boost). */
+    /** #502: run the pacing-loop thread at the launch nice and every other thread at nice 19 (--pacer-nice-boost). */
     boolean pacerNiceBoost = false;
     /** Max spin before a slot in the pacer loop (µs); the loop parks until then. */
     long pacerSpinUs = 20;
