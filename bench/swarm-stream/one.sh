@@ -179,6 +179,19 @@ fi
 HEAP=${HEAP:--Xms2g -Xmx2g}
 # #414: optional extra server JVM flags (profile-414.sh passes JFR here). Empty for gate windows.
 read -r -a SERVER_JAVA_ARGS <<< "${SERVER_JAVA_OPTS:-}"
+# Pre-leg gate (inceptor 2026-11-14 01:06): load1 < 3 measured BEFORE the server or generator
+# starts. Wait up to PRE_LEG_WAIT_S (default 300 s) for it; the value is written to result.json
+# as load1_pre (window_valid rejects load1_pre >= 3). StreamLoad's own start-time sample is kept
+# as load1_at_gen_start (information only).
+PRE_LEG_WAIT_S=${PRE_LEG_WAIT_S:-300}
+_pre_t0=$(date +%s)
+LOAD1_PRE_LEG=$(awk '{print $1}' /proc/loadavg)
+while ! awk -v l="$LOAD1_PRE_LEG" 'BEGIN{exit !(l+0<3)}' && [ $(( $(date +%s) - _pre_t0 )) -lt "$PRE_LEG_WAIT_S" ]; do
+  sleep 5
+  LOAD1_PRE_LEG=$(awk '{print $1}' /proc/loadavg)
+done
+export LOAD1_PRE_LEG
+echo "one.sh: pre-leg load1=$LOAD1_PRE_LEG (gate <3, waited $(( $(date +%s) - _pre_t0 ))s)"
 # shellcheck disable=SC2086
 taskset -c "$SRV_CPUS" nice -n 10 java -XX:+UseZGC $HEAP "${SERVER_JAVA_ARGS[@]}" \
   -Dsjws.swarm.enabled=true -Dsjws.swarm.stream.enabled=true \

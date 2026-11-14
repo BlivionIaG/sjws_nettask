@@ -9,6 +9,16 @@ if os.path.isdir(swarm):
 r["writer_count"] = writers
 r["heap_flags"] = heap
 r["groups"] = r.get("groups") or groups
+# Pre-leg gate value measured by one.sh before the server/generator started (01:06 rule).
+pre = os.environ.get("LOAD1_PRE_LEG")
+if pre:
+    try:
+        if "load1_at_gen_start" not in r:
+            r["load1_at_gen_start"] = r.get("load1_pre")
+        r["load1_pre"] = float(pre)
+        r["load1_pre_source"] = "one.sh before server start"
+    except ValueError:
+        pass
 with open(out, "w") as f:
     json.dump(r, f, indent=2)
     f.write("\n")

@@ -97,7 +97,7 @@ leg dirs before the logs were deleted). `one.sh` therefore:
 
 Enabled by default, no flag:
 
-- Pre-leg gate: `load1 < 3`, measured before the server or generator starts, before **every**
+- Pre-leg gate: `load1 < 3`, measured before the server or generator starts (`one.sh` waits up to `PRE_LEG_WAIT_S`, default 300 s, and writes it as `load1_pre`; StreamLoad's own sample is `load1_at_gen_start`), before **every**
   leg (`gate.sh` / `cross-check.sh` / `one.sh`), recorded as `load1_pre`. A leg that fails it does not run.
 - During a leg: `foreign_cpu.py` samples every 5 s. A leg is **NOISY** if and only if foreign
   processes (not the bench server/generator/harness tree, and not the sand-host platform:
