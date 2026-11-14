@@ -441,36 +441,61 @@ class CompressFilterTest {
     }
 
     @Test
-    void ifRangeTranslatesGeneratedGzipValidatorsAndLeavesDates() {
+    void ifRangeWithAGeneratedGzipValidatorIsLeftUnmatched() throws Exception {
         var filter = CompressFilter.create(GatewayTestSupport.spec("compress", Map.of()));
         var plain = "hello gzip ".repeat(40);
+        var bytes = plain.getBytes(StandardCharsets.UTF_8);
         var seen = new java.util.ArrayList<String>();
         java.util.function.Function<Request, Response> inner = (r) -> {
             seen.add(r.headers().ifRange());
             var etag = "\"abc\"";
             var ifRange = r.headers().ifRange();
-            if (ifRange != null && ifRange.indexOf('"') >= 0
-                    && !sjws_nettask.core.EntityTag.noneMatchHits(ifRange, etag)) {
-                return new Response(412, ResponseHeaders.of().add("etag", etag), Body.Empty.INSTANCE);
+            var range = r.headers().range();
+            boolean validatorHits = ifRange != null && ifRange.indexOf('"') >= 0
+                    && sjws_nettask.core.EntityTag.noneMatchHits(ifRange, etag);
+            if (validatorHits && range != null && range.startsWith("bytes=")) {
+                var slice = java.util.Arrays.copyOfRange(bytes, 10, bytes.length);
+                return new Response(206, ResponseHeaders.of()
+                        .add("content-type", "text/plain")
+                        .add("etag", etag)
+                        .add("content-range", "bytes 10-" + (bytes.length - 1) + "/" + bytes.length),
+                        Body.Bytes.of(slice));
             }
             return new Response(200, ResponseHeaders.of()
                     .add("content-type", "text/plain")
-                    .add("etag", etag), Body.Bytes.of(plain.getBytes(StandardCharsets.UTF_8)));
+                    .add("etag", etag), Body.Bytes.of(bytes));
         };
         var gzipRange = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
                 "accept-encoding", List.of("gzip"),
                 "if-range", List.of("\"abc-gzip\""),
-                "range", List.of("bytes=0-10")))), inner);
-        assertEquals(200, gzipRange.status());
-        assertEquals("\"abc\"", seen.get(0), "If-Range gzip validator must be translated");
+                "range", List.of("bytes=10-")))), inner);
+        assertEquals("\"abc-gzip\"", seen.get(0), "If-Range gzip validator must not be translated");
+        assertEquals(200, gzipRange.status(), "unmatched If-Range must yield the full gzip body, not a 206");
         assertEquals("gzip", gzipRange.headers().get("content-encoding"));
+        assertEquals("\"abc-gzip\"", gzipRange.headers().get("etag"));
+        assertEquals(plain, gunzip(gzipRange));
+
+        var identityRange = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
+                "accept-encoding", List.of("gzip"),
+                "if-range", List.of("\"abc\""),
+                "range", List.of("bytes=10-")))), inner);
+        assertEquals("\"abc\"", seen.get(1));
+        assertEquals(206, identityRange.status());
+        assertNull(identityRange.headers().get("content-encoding"));
+        var slice = ((Body.Bytes) identityRange.body()).data().duplicate();
+        var got = new byte[slice.remaining()];
+        slice.get(got);
+        assertEquals(new String(java.util.Arrays.copyOfRange(bytes, 10, bytes.length), StandardCharsets.UTF_8),
+                new String(got, StandardCharsets.UTF_8));
+
         var date = "Wed, 11 Nov 2026 17:00:00 GMT";
         var dated = call(filter, new Request("GET", "/", RequestHeaders.of(Map.of(
                 "accept-encoding", List.of("gzip"),
                 "if-range", List.of(date),
-                "range", List.of("bytes=0-10")))), inner);
+                "range", List.of("bytes=10-")))), inner);
+        assertEquals(date, seen.get(2), "If-Range dates must be forwarded unchanged");
         assertEquals(200, dated.status());
-        assertEquals(date, seen.get(1), "If-Range dates must be forwarded unchanged");
+        assertEquals("gzip", dated.headers().get("content-encoding"));
     }
 
     @Test

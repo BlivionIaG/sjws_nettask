@@ -233,26 +233,26 @@ public final class CompressFilter implements RequestFilter {
     }
 
     /**
-     * Rewrites {@code If-None-Match}, {@code If-Match} and {@code If-Range} so filter-generated
-     * {@code -gzip} validators are presented to the inner handler in identity form. Leaves
-     * {@code *}, HTTP dates in {@code If-Range}, and malformed fields unchanged.
+     * Rewrites {@code If-None-Match} and {@code If-Match} so filter-generated {@code -gzip}
+     * validators are presented to the inner handler in identity form. Leaves {@code *},
+     * malformed fields, and {@code If-Range} unchanged: a translated If-Range would make
+     * the inner handler apply identity byte offsets to a client that already has gzip
+     * bytes, and this filter does not recompress 206 responses.
      */
     static Request withIdentityValidators(Request request) {
         var headers = request.headers();
         var fields = headers.fields();
         if (fields.isEmpty()) {
             var inm = identityValidators(headers.ifNoneMatch());
-            var ifRange = identityValidators(headers.ifRange());
-            if (same(inm, headers.ifNoneMatch()) && same(ifRange, headers.ifRange())) {
+            if (same(inm, headers.ifNoneMatch())) {
                 return request;
             }
             return request.withHeaders(new RequestHeaders(inm, headers.ifModifiedSince(),
-                    ifRange, headers.range(), headers.acceptEncoding(), headers.host()));
+                    headers.ifRange(), headers.range(), headers.acceptEncoding(), headers.host()));
         }
         var copy = new LinkedHashMap<String, List<String>>(fields);
         boolean changed = translateField(copy, "if-none-match")
-                | translateField(copy, "if-match")
-                | translateField(copy, "if-range");
+                | translateField(copy, "if-match");
         if (!changed) {
             return request;
         }
