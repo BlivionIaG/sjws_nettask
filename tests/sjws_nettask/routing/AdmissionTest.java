@@ -22,6 +22,7 @@ import com.sun.net.httpserver.HttpServer;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.time.Duration;
+import java.util.EnumSet;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -29,6 +30,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import sjws_nettask.core.Body;
 import sjws_nettask.core.Request;
+import sjws_nettask.core.Response;
+import sjws_nettask.core.ResponseHeaders;
 import sjws_nettask.core.RequestHeaders;
 import sjws_nettask.core.StaticFileHandler;
 
@@ -440,6 +443,31 @@ class AdmissionTest {
         Body.discard(held.get().body());
     }
 
+    @Test
+    void retryAfterADiscarded5xxWaitsForTheConnectionSlot() throws Exception {
+        var hits = new AtomicInteger();
+        var failBody = "f".repeat(8192).getBytes();
+        start(ex -> {
+            int n = hits.incrementAndGet();
+            if (n == 1) {
+                ex.sendResponseHeaders(503, failBody.length);
+                ex.getResponseBody().write(failBody);
+            } else {
+                var body = "ok".getBytes();
+                ex.sendResponseHeaders(200, body.length);
+                ex.getResponseBody().write(body);
+            }
+            ex.close();
+        });
+        var retry = new Resilience.Retry(1, EnumSet.of(Resilience.On.STATUS_503), 100);
+        this.proxy = new ProxyHandler(new ProxyHandler.Settings(base(), Duration.ofSeconds(2), Duration.ofSeconds(2),
+                1024, "http", null), ByteBudget.shared(), new Resilience(retry, null), Admission.of(0, 1));
+        var response = this.proxy.handle(new Request("GET", "/"));
+        assertEquals(200, response.status(), "the retry must not see a local 503 at the connection cap");
+        assertEquals("ok", ProxyHandlerTest.text(response));
+        assertEquals(2, hits.get());
+    }
+
     @FunctionalInterface
     private interface Exchange {
         void handle(com.sun.net.httpserver.HttpExchange ex) throws java.io.IOException, InterruptedException;
@@ -478,5 +506,247 @@ class AdmissionTest {
             Thread.sleep(20);
         }
         assertEquals(0, admission.connections());
+    }
+
+    @Test
+    void retryAfterADiscarded5xxDoesNotWaitWhenConnectionLimitingIsDisabled() throws Exception {
+        assertDoesNotWaitOnDiscardedClose(null);
+        if (this.proxy != null) {
+            this.proxy.close();
+            this.proxy = null;
+        }
+        if (this.upstream != null) {
+            this.upstream.stop(0);
+            this.upstream = null;
+        }
+        assertDoesNotWaitOnDiscardedClose(Admission.of(1, 0));
+    }
+
+    private void assertDoesNotWaitOnDiscardedClose(Admission admission) throws Exception {
+        var hits = new AtomicInteger();
+        var enteredSecond = new CountDownLatch(1);
+        var releaseFirst = new CountDownLatch(1);
+        start(ex -> {
+            int n = hits.incrementAndGet();
+            if (n == 1) {
+                var failBody = "f".repeat(8192).getBytes();
+                ex.sendResponseHeaders(503, failBody.length);
+                ex.getResponseBody().write(failBody);
+                if (!releaseFirst.await(8, TimeUnit.SECONDS)) {
+                    throw new RuntimeException("release timed out");
+                }
+            } else {
+                enteredSecond.countDown();
+                var body = "ok".getBytes();
+                ex.sendResponseHeaders(200, body.length);
+                ex.getResponseBody().write(body);
+            }
+            ex.close();
+        });
+        var retry = new Resilience.Retry(1, EnumSet.of(Resilience.On.STATUS_503), 100);
+        this.proxy = new ProxyHandler(new ProxyHandler.Settings(base(), Duration.ofSeconds(5), Duration.ofSeconds(2),
+                1024, "http", null), ByteBudget.shared(), new Resilience(retry, null), admission);
+        long t0 = System.nanoTime();
+        var response = this.proxy.handle(new Request("GET", "/"));
+        long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+        assertEquals(200, response.status());
+        assertEquals("ok", ProxyHandlerTest.text(response));
+        assertEquals(2, hits.get());
+        assertTrue(enteredSecond.await(0, TimeUnit.MILLISECONDS),
+                "the retry must start before the discarded 5xx connection closes");
+        assertTrue(ms < 1500, "must not await the discarded close when uncapped: " + ms);
+        releaseFirst.countDown();
+    }
+
+    @Test
+    void discardForRetryCoversNonStreamAndPendingWrappedBodies() throws Exception {
+        assertEquals(1, Admission.of(0, 1).maxConnections());
+        Admission.of(0, 1).attach(null);
+        var cap = Admission.of(0, 1);
+        assertTrue(cap.reclaimIdle(null, null)); // cap not full: no-op, covers default timeout
+        assertTrue(cap.reclaimIdle(null, Duration.ZERO));
+
+        ProxyHandler.discardForRetry(null, Duration.ofSeconds(1), cap);
+        var headers = ResponseHeaders.of();
+        var bytes = new Response(503, headers, Body.Bytes.of("f".repeat(32).getBytes()));
+        ProxyHandler.discardForRetry(bytes, Duration.ofSeconds(1), cap);
+        var custom = new Response(503, headers, new Body.Stream(4, new Body.Stream.Source() {
+            @Override
+            public java.nio.ByteBuffer next() {
+                return null;
+            }
+
+            @Override
+            public void close() {
+            }
+        }));
+        ProxyHandler.discardForRetry(custom, Duration.ofSeconds(1), cap);
+        ProxyHandler.discardForRetry(custom, Duration.ZERO, cap);
+        ProxyHandler.discardForRetry(custom, Duration.ofSeconds(-1), cap);
+        ProxyHandler.discardForRetry(custom, null, cap);
+    }
+
+    @Test
+    void retryAfterADiscarded5xxReleasesAPendingWrappedStream() throws Exception {
+        var hits = new AtomicInteger();
+        start(ex -> {
+            int n = hits.incrementAndGet();
+            if (n == 1) {
+                var failBody = "f".repeat(8192).getBytes();
+                ex.sendResponseHeaders(503, failBody.length);
+                ex.getResponseBody().write(failBody);
+            } else {
+                var body = "ok".getBytes();
+                ex.sendResponseHeaders(200, body.length);
+                ex.getResponseBody().write(body);
+            }
+            ex.close();
+        });
+        var retry = new Resilience.Retry(1, EnumSet.of(Resilience.On.STATUS_503), 100);
+        this.proxy = new ProxyHandler(new ProxyHandler.Settings(base(), Duration.ofSeconds(2), Duration.ofSeconds(2),
+                1024, "http", null), ByteBudget.shared(), new Resilience(retry, null), Admission.of(1, 1));
+        var response = this.proxy.handle(new Request("GET", "/"));
+        assertEquals(200, response.status());
+        assertEquals("ok", ProxyHandlerTest.text(response));
+        assertEquals(2, hits.get());
+        assertEquals(0, this.proxy.admission().pending());
+        if (this.proxy.admission().atConnectionCap()) {
+            this.proxy.admission().reclaimIdle(null, Duration.ZERO);
+        }
+    }
+
+    @Test
+    void discardForRetryOnAPendingWrappedStreamAndOnInterrupt() throws Exception {
+        start(ex -> {
+            var body = "ok".repeat(64).getBytes();
+            ex.getResponseHeaders().add("connection", "close");
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        this.proxy = proxy(Admission.of(1, 0));
+        var ok = this.proxy.handle(new Request("GET", "/"));
+        assertEquals(200, ok.status());
+        assertTrue(ok.body() instanceof Body.Stream);
+        ProxyHandler.discardForRetry(ok, Duration.ofSeconds(1), this.proxy.admission());
+        assertEquals(0, this.proxy.admission().pending());
+
+        this.proxy.close();
+        this.proxy = proxy(Admission.of(0, 1));
+        var failed = this.proxy.handle(new Request("GET", "/"));
+        // 200 here actually - same server answers 200. Use this stream + cap for interrupt after close.
+        Thread.currentThread().interrupt();
+        ProxyHandler.discardForRetry(failed, Duration.ofSeconds(5), this.proxy.admission());
+        assertTrue(Thread.interrupted(), "discardForRetry must restore the interrupt when await is interrupted");
+    }
+
+    @Test
+    void closeOneIdleAndAwaitOnAnUncappedPoolDoesNotWaitForASlot() throws Exception {
+        start(ex -> {
+            var body = "ok".getBytes();
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        var pool = new UpstreamPool(base(), Duration.ofSeconds(2), 256, ByteBudget.shared(), null);
+        try {
+            var first = pool.acquire();
+            var second = pool.acquire();
+            var third = pool.acquire();
+            pool.release(first.channel(), true);
+            pool.release(second.channel(), true);
+            pool.release(third.channel(), true);
+            assertEquals(3, pool.idleCount());
+            assertTrue(pool.closeOneIdleAndAwait(Duration.ZERO));
+            assertTrue(pool.closeOneIdleAndAwait(null));
+            assertTrue(pool.closeOneIdleAndAwait(Duration.ofSeconds(-1)));
+            assertEquals(0, pool.idleCount());
+        } finally {
+            pool.close();
+        }
+    }
+
+    @Test
+    void closeOneIdleAndAwaitReleasesThatSocketsHold() throws Exception {
+        start(ex -> {
+            var body = "ok".getBytes();
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        var admission = Admission.of(0, 1);
+        var pool = new UpstreamPool(base(), Duration.ofSeconds(2), 256, ByteBudget.shared(), admission);
+        try {
+            var lease = pool.acquire();
+            pool.release(lease.channel(), true);
+            assertEquals(1, admission.connections());
+            assertEquals(1, pool.idleCount());
+            assertTrue(pool.closeOneIdleAndAwait(Duration.ofSeconds(1)));
+            assertEquals(0, pool.idleCount());
+            assertEquals(0, admission.connections(), "the closed socket's own hold must be released");
+            var hold = admission.tryConnection();
+            assertNotNull(hold);
+            hold.release();
+        } finally {
+            pool.close();
+        }
+    }
+
+    @Test
+    void reclaimingAnIdleSlotDoesNotWaitOnTheAggregateCountWhenAnotherAcquireWins() throws Exception {
+        start(ex -> {
+            var body = "ok".getBytes();
+            ex.sendResponseHeaders(200, body.length);
+            ex.getResponseBody().write(body);
+            ex.close();
+        });
+        var admission = Admission.of(0, 1);
+        this.proxy = proxy(admission);
+        assertEquals("ok", ProxyHandlerTest.text(this.proxy.handle(new Request("GET", "/"))));
+        assertEquals(1, admission.connections());
+        assertEquals(1, this.proxy.idleConnections());
+
+        var sibling = new ProxyHandler(new ProxyHandler.Settings(base(), Duration.ofSeconds(5), Duration.ofSeconds(2),
+                1024, "http", null), ByteBudget.shared(), null, admission);
+        var stolen = new java.util.concurrent.atomic.AtomicReference<Admission.Hold>();
+        var stop = new java.util.concurrent.atomic.AtomicBoolean();
+        var sniper = Thread.ofPlatform().start(() -> {
+            while (!stop.get() && stolen.get() == null) {
+                var hold = admission.tryConnection();
+                if (hold != null) {
+                    stolen.set(hold);
+                    return;
+                }
+                Thread.onSpinWait();
+            }
+        });
+        try {
+            long t0 = System.nanoTime();
+            var response = sibling.handle(new Request("GET", "/"));
+            long ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0);
+            assertTrue(ms < 1500,
+                    "reclaim must return once the idle socket's own hold is released, not wait out the timeout: " + ms);
+            if (response.status() == 503) {
+                assertTrue(ProxyHandler.isLocalRefusal(response));
+            } else {
+                assertEquals(200, response.status());
+                ProxyHandlerTest.text(response);
+            }
+        } finally {
+            stop.set(true);
+            sniper.join(2000);
+            if (stolen.get() != null) {
+                stolen.get().release();
+            }
+            sibling.close();
+        }
+    }
+
+    @Test
+    void reclaimIdleOnAPendingOnlyAdmissionDoesNotWait() throws Exception {
+        var pendingOnly = Admission.of(1, 0);
+        assertFalse(pendingOnly.limitsConnections());
+        assertTrue(pendingOnly.reclaimIdle(null, Duration.ZERO));
+        assertTrue(pendingOnly.reclaimIdle(null, null));
     }
 }

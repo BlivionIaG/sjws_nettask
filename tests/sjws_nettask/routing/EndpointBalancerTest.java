@@ -761,6 +761,40 @@ class EndpointBalancerTest {
     }
 
     @Test
+    void atTheConnectionCapACompletedRequestPrefersAWarmIdleEndpoint() throws Exception {
+        var admission = Admission.of(0, 1);
+        var src = new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1), ep(1, 1)));
+        var b = balancer(src, null, null, Duration.ofSeconds(10), admission);
+        assertEquals("a", body(b.handle(new Request("GET", "/"))));
+        assertEquals(1, this.hits[0].get());
+        assertEquals(0, this.hits[1].get());
+        assertEquals(1, admission.connections());
+        // RR would otherwise select B, whose pool has no socket and cannot take the cap.
+        var again = b.handle(new Request("GET", "/"));
+        assertEquals(200, again.status());
+        assertEquals("a", body(again));
+        assertEquals(2, this.hits[0].get(), "the idle keep-alive on A must be reused");
+        assertEquals(0, this.hits[1].get());
+    }
+
+    @Test
+    void atTheConnectionCapASuspectEndpointsIdleIsReclaimedForAHealthyOne() throws Exception {
+        var admission = Admission.of(0, 1);
+        var src = new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1), ep(1, 1)));
+        var b = balancer(src, null, null, Duration.ofSeconds(10), admission);
+        assertEquals("a", body(b.handle(new Request("GET", "/"))));
+        assertEquals(1, admission.connections());
+        var suspectA = new Endpoint(null, "127.0.0.1", this.servers.get(0).getAddress().getPort(), 1, null,
+                Health.SUSPECT, null);
+        assertTrue(src.update(set(2, LbPolicy.ROUND_ROBIN, suspectA, ep(1, 1))));
+        var again = b.handle(new Request("GET", "/"));
+        assertEquals(200, again.status(), "B must get a slot after A's idle is reclaimed, not a local 503");
+        assertEquals("b", body(again));
+        assertEquals(1, this.hits[0].get());
+        assertEquals(1, this.hits[1].get());
+    }
+
+    @Test
     void publicConstructorHasNoAdmission() {
         EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
                 URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http",
@@ -771,4 +805,63 @@ class EndpointBalancerTest {
         assertEquals("a", body(b.handle(new Request("GET", "/"))));
     }
 
+
+    @Test
+    void pickWarmIdleDoesNotReserveAHalfOpenProbeOnAColdRecoveringEndpoint() throws Exception {
+        var admission = Admission.of(0, 1);
+        var o = new EndpointBalancer.Outlier(1, 100, 1_000_000, Duration.ofSeconds(10), Duration.ofSeconds(1), 100);
+        var src = new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1)));
+        var b = balancer(src, null, o, Duration.ZERO, admission);
+        this.failing.add("a");
+        var failed = b.handle(new Request("GET", "/"));
+        assertEquals(503, failed.status());
+        body(failed);
+        var poolA = b.poolOf(ep(0, 1).authority());
+        assertTrue(poolA.health.ejected());
+        if (admission.connections() > 0) {
+            assertTrue(admission.reclaimIdle(null, Duration.ofSeconds(1)),
+                    "the 503 keep-alive on A must be closed so B can take the cap");
+        }
+        for (int i = 0; i < 50 && admission.connections() > 0; i++) {
+            Thread.sleep(20);
+        }
+        assertEquals(0, admission.connections());
+        assertEquals(0, poolA.proxy.idleConnections());
+        assertTrue(src.update(set(2, LbPolicy.ROUND_ROBIN, ep(0, 1), ep(1, 1))));
+        var fromB = b.handle(new Request("GET", "/"));
+        assertEquals(200, fromB.status());
+        assertEquals("b", body(fromB));
+        assertEquals(1, admission.connections());
+        this.now.addAndGet(1_100_000_000L);
+        assertTrue(poolA.health.ejected());
+        assertEquals(0, poolA.proxy.idleConnections());
+        for (int i = 0; i < 20; i++) {
+            var again = b.handle(new Request("GET", "/"));
+            assertEquals(200, again.status());
+            assertEquals("b", body(again));
+        }
+        assertTrue(poolA.health.available(this.now.get()),
+                "scanning a cold recovering endpoint at the cap must not leak its half-open reservation");
+        poolA.health.release();
+    }
+
+    @Test
+    void publicConstructorsForwardAdmissionAndActiveHealth() {
+        EndpointBalancer.Pools pools = e -> new ProxyHandler(new ProxyHandler.Settings(
+                URI.create("http://" + e.authority()), Duration.ofMillis(500), Duration.ofSeconds(2), 1024, "http",
+                null));
+        var src = new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1)));
+        var admission = Admission.of(0, 1);
+        var withAdmission = new EndpointBalancer(src, pools, null, null, admission);
+        this.balancers.add(withAdmission);
+        assertSame(admission, withAdmission.admission());
+        assertEquals("a", body(withAdmission.handle(new Request("GET", "/"))));
+
+        var health = testHealth();
+        var withHealth = new EndpointBalancer(src, pools, null, null, Duration.ofSeconds(10), this.now::get, health,
+                false);
+        this.balancers.add(withHealth);
+        assertNull(withHealth.admission());
+        assertEquals("a", body(withHealth.handle(new Request("GET", "/"))));
+    }
 }

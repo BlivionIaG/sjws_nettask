@@ -18,6 +18,10 @@ package sjws_nettask.routing;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.time.Duration;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Per-upstream {@code max_pending} / {@code max_connections} caps (design §13). Lock-free.
@@ -30,6 +34,7 @@ public final class Admission {
     public static final class Hold {
         private final AtomicBoolean open = new AtomicBoolean(true);
         private final AtomicInteger counter;
+        private final CountDownLatch released = new CountDownLatch(1);
 
         Hold(AtomicInteger counter) {
             this.counter = counter;
@@ -38,7 +43,13 @@ public final class Admission {
         public void release() {
             if (this.open.compareAndSet(true, false)) {
                 this.counter.decrementAndGet();
+                this.released.countDown();
             }
+        }
+
+        /** Wait until {@link #release()} has run, or until {@code timeout}. */
+        boolean awaitReleased(long timeout, TimeUnit unit) throws InterruptedException {
+            return this.released.await(timeout, unit);
         }
     }
 
@@ -46,6 +57,19 @@ public final class Admission {
     private final int maxConnections;
     private final AtomicInteger pending = new AtomicInteger();
     private final AtomicInteger connections = new AtomicInteger();
+    /** Pools that share this cap; used to reclaim a sibling's idle socket (#508). */
+    private final CopyOnWriteArrayList<IdleReclaim> reclaimers = new CopyOnWriteArrayList<>();
+
+    /**
+     * An upstream pool that may close one idle keep-alive so a sibling can take the slot.
+     */
+    interface IdleReclaim {
+        /**
+         * Close one idle socket and wait until that socket's connection hold is released, or until
+         * {@code timeout}. @return true if this socket's slot was released
+         */
+        boolean closeOneIdleAndAwait(Duration timeout) throws InterruptedException;
+    }
 
     private Admission(int maxPending, int maxConnections) {
         this.maxPending = maxPending;
@@ -106,5 +130,44 @@ public final class Admission {
 
     int connections() {
         return this.connections.get();
+    }
+
+    int maxConnections() {
+        return this.maxConnections;
+    }
+
+    boolean atConnectionCap() {
+        return this.maxConnections > 0 && this.connections.get() >= this.maxConnections;
+    }
+
+    void attach(IdleReclaim pool) {
+        if (pool != null && this.maxConnections > 0) {
+            this.reclaimers.addIfAbsent(pool);
+        }
+    }
+
+    void detach(IdleReclaim pool) {
+        this.reclaimers.remove(pool);
+    }
+
+    /**
+     * Close one idle keep-alive on a sibling pool and wait until a connection slot is
+     * free. No-op when the cap is unset or a slot is already free.
+     */
+    boolean reclaimIdle(IdleReclaim except, Duration timeout) throws InterruptedException {
+        if (!limitsConnections() || this.connections.get() < this.maxConnections) {
+            return this.maxConnections <= 0 || this.connections.get() < this.maxConnections;
+        }
+        Duration wait = timeout == null || timeout.isZero() || timeout.isNegative()
+                ? Duration.ofSeconds(2) : timeout;
+        for (var pool : this.reclaimers) {
+            if (pool == except) {
+                continue;
+            }
+            if (pool.closeOneIdleAndAwait(wait) && this.connections.get() < this.maxConnections) {
+                return true;
+            }
+        }
+        return this.connections.get() < this.maxConnections;
     }
 }
