@@ -30,12 +30,21 @@ import sjws_nettask.routing.Router;
  *        {@code .example.com}); null otherwise
  * @param errors how server-generated error pages of this route are rendered
  * @param rateLimit {@code rate_limit:} of this route, or null
+ * @param retry optional per-route retry override, or null to follow the upstream
+ * @param circuit optional per-route circuit override, or null to follow the upstream
  */
 public record RouteSpec(String host, boolean wildcard, String hostSuffix, String prefix, String rewrite,
-        RouteSpec.Action action, RouteSpec.Errors errors, sjws_nettask.routing.RateLimitFilter.Limit rateLimit) {
+        RouteSpec.Action action, RouteSpec.Errors errors, sjws_nettask.routing.RateLimitFilter.Limit rateLimit,
+        sjws_nettask.routing.Resilience.Retry retry, sjws_nettask.routing.Resilience.Circuit circuit) {
 
     public RouteSpec {
         java.util.Objects.requireNonNull(errors, "errors");
+    }
+
+    /** No per-route retry or circuit. */
+    public RouteSpec(String host, boolean wildcard, String hostSuffix, String prefix, String rewrite, Action action,
+            Errors errors, sjws_nettask.routing.RateLimitFilter.Limit rateLimit) {
+        this(host, wildcard, hostSuffix, prefix, rewrite, action, errors, rateLimit, null, null);
     }
 
     /** No rate limit. */

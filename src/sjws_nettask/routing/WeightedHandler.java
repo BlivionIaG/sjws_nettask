@@ -16,6 +16,7 @@
  */
 package sjws_nettask.routing;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
@@ -77,6 +78,7 @@ public final class WeightedHandler implements Handler {
     private final Match[] pins; // null when no backend is pinned
     private final Match sticky;
     private final AliasTable table;
+    private final long[] weights;
 
     public WeightedHandler(List<Backend> backends, Match sticky) {
         if (backends.isEmpty()) {
@@ -97,6 +99,7 @@ public final class WeightedHandler implements Handler {
         this.pins = anyPin ? pins : null;
         this.sticky = sticky;
         this.table = new AliasTable(weights);
+        this.weights = weights;
     }
 
     @Override
@@ -104,8 +107,61 @@ public final class WeightedHandler implements Handler {
         return this.handlers[select(request.headers())].handle(request);
     }
 
+    /**
+     * Per-request history of route-level retries: which backends were tried, and for each
+     * {@link EndpointBalancer} backend its own tried-endpoint identities (authorities, private to
+     * one balancer, so they are never shared across backends and survive a discovery reorder).
+     */
+    final class Attempts {
+        private final int cap;
+        private final boolean[] backends = new boolean[WeightedHandler.this.handlers.length];
+        private final String[][] endpoints = new String[WeightedHandler.this.handlers.length][];
+        private final int[][] counts = new int[WeightedHandler.this.handlers.length][];
+
+        private Attempts(int cap) {
+            this.cap = Math.max(1, cap);
+        }
+    }
+
+    /** @param cap the most attempts one request can make (route retries + 1) */
+    Attempts attempts(int cap) {
+        return new Attempts(cap);
+    }
+
+    /**
+     * One try that, on a route retry, prefers a backend not tried yet (pins and sticky keep their
+     * backend) and keeps endpoint history per balancer.
+     *
+     * @param state this request's history, from {@link #attempts(int)}
+     */
+    Response oneShot(Request request, Attempts state) throws IOException, InterruptedException {
+        int i = select(request.headers(), state.backends);
+        var handler = this.handlers[i];
+        state.backends[i] = true;
+        if (handler instanceof ProxyHandler proxy) {
+            return proxy.attemptWithPending(request);
+        }
+        if (handler instanceof EndpointBalancer balancer) {
+            if (state.endpoints[i] == null) {
+                state.endpoints[i] = new String[state.cap];
+                state.counts[i] = new int[1];
+            }
+            return balancer.oneShot(request, state.endpoints[i], state.counts[i]);
+        }
+        return handler.handle(request);
+    }
+
     /** Index of the backend for these headers. Package-private for the distribution tests. */
     int select(RequestHeaders headers) {
+        return select(headers, null);
+    }
+
+    /**
+     * Like {@link #select(RequestHeaders)}, but a random (non-pinned, non-sticky) pick that lands
+     * on a backend in {@code tried} is redrawn by weight among the untried weighted backends.
+     * Falls back to the original pick when every weighted backend has been tried.
+     */
+    int select(RequestHeaders headers, boolean[] tried) {
         if (this.pins != null) {
             for (int i = 0; i < this.pins.length; i++) {
                 var pin = this.pins[i];
@@ -120,7 +176,30 @@ public final class WeightedHandler implements Handler {
                 return pick(mix(key.hashCode() * 0x9E3779B97F4A7C15L ^ key.length()));
             }
         }
-        return pick(ThreadLocalRandom.current().nextLong());
+        var random = ThreadLocalRandom.current();
+        int i = pick(random.nextLong());
+        if (tried == null || !tried[i]) {
+            return i;
+        }
+        long total = 0;
+        for (int j = 0; j < this.weights.length; j++) {
+            if (!tried[j]) {
+                total += this.weights[j];
+            }
+        }
+        if (total <= 0) {
+            return i;
+        }
+        long r = random.nextLong(total);
+        for (int j = 0; j < this.weights.length; j++) {
+            if (!tried[j]) {
+                r -= this.weights[j];
+                if (r < 0) {
+                    return j;
+                }
+            }
+        }
+        return i;
     }
 
     int pick(long bits) {

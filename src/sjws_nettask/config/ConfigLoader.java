@@ -937,7 +937,7 @@ public final class ConfigLoader {
             var path = "routing.routes[" + i + "]";
             var map = YamlValues.mapping(list.get(i), path);
             YamlValues.knownKeys(map, List.of("host", "prefix", "rewrite", "proxy", "backends", "sticky", "redirect",
-                    "static", "listing", "errors", "problem_type", "rate_limit"), path);
+                    "static", "listing", "errors", "problem_type", "rate_limit", "retry", "circuit"), path);
             if (!map.containsKey("prefix")) {
                 throw new ConfigException(path + ".prefix is required");
             }
@@ -985,7 +985,15 @@ public final class ConfigLoader {
                 throw new ConfigException(path + ".listing is only valid on a static route");
             }
             var limit = map.containsKey("rate_limit") ? rateLimit(map.get("rate_limit"), path + ".rate_limit", true) : null;
-            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action, errors(map, path), limit));
+            boolean proxyOrBackends = action instanceof RouteSpec.Action.Proxy
+                    || action instanceof RouteSpec.Action.Weighted;
+            if ((map.containsKey("retry") || map.containsKey("circuit")) && !proxyOrBackends) {
+                throw new ConfigException(path + ": retry and circuit are only valid with proxy or backends");
+            }
+            var retry = map.containsKey("retry") ? retry(map.get("retry"), path + ".retry") : null;
+            var circuit = map.containsKey("circuit") ? circuit(map.get("circuit"), path + ".circuit") : null;
+            out.add(new RouteSpec(host, wildcard, suffix, prefix, rewrite, action, errors(map, path), limit, retry,
+                    circuit));
         }
         return List.copyOf(out);
     }

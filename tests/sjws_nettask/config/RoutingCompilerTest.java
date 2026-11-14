@@ -40,6 +40,8 @@ import sjws_nettask.core.StaticFileHandler;
 import sjws_nettask.routing.ActiveHealth;
 import sjws_nettask.routing.Cidr;
 import sjws_nettask.routing.EndpointBalancer;
+import sjws_nettask.routing.ProxyHandler;
+import sjws_nettask.routing.RouteResilience;
 import sjws_nettask.routing.Router;
 
 class RoutingCompilerTest {
@@ -303,6 +305,51 @@ class RoutingCompilerTest {
 
     private static HttpResponse<String> get(HttpClient client, String url) throws IOException, InterruptedException {
         return client.send(HttpRequest.newBuilder(URI.create(url)).build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    @Test
+    void routeRetryWrapsTheSharedProxyAndLeavesThePlainRouteUnwrapped() throws IOException {
+        var loaded = load("""
+                routing:
+                  enabled: true
+                  upstreams:
+                    api: { url: "http://127.0.0.1:9", retry: { attempts: 3 }, circuit: { failures: 4, eject_for: 2s } }
+                  routes:
+                    - { prefix: /a, proxy: api, retry: { attempts: 1 } }
+                    - { prefix: /b, proxy: api }
+                """);
+        var router = RoutingCompiler.compile(loaded.document().routing(), null);
+        try {
+            var wrap = assertInstanceOf(RouteResilience.class, router.routes().get(0).handler());
+            var plain = assertInstanceOf(ProxyHandler.class, router.routes().get(1).handler());
+            assertSame(plain, wrap.inner());
+            var policy = RoutingCompiler.routePolicy(loaded.document().routing().routes().routes().get(0));
+            assertEquals(1, policy.retry().attempts());
+            assertEquals(4, policy.circuit().failures()); // inherited settings, private breaker
+            assertNull(RoutingCompiler.routePolicy(loaded.document().routing().routes().routes().get(1)));
+            var circuitOnly = RoutingCompiler.routePolicy(load("""
+                    routing:
+                      enabled: true
+                      upstreams:
+                        api: { url: "http://127.0.0.1:9", retry: { attempts: 3 }, circuit: { failures: 4, eject_for: 2s } }
+                      routes:
+                        - { prefix: /c, proxy: api, circuit: { failures: 2, eject_for: 1s } }
+                    """).document().routing().routes().routes().get(0));
+            assertEquals(3, circuitOnly.retry().attempts()); // inherited
+            assertEquals(2, circuitOnly.circuit().failures());
+            var backends = RoutingCompiler.routePolicy(load("""
+                    routing:
+                      enabled: true
+                      upstreams:
+                        api: { url: "http://127.0.0.1:9", retry: { attempts: 3 } }
+                      routes:
+                        - { prefix: /c, backends: [ { upstream: api } ], retry: { attempts: 1 } }
+                    """).document().routing().routes().routes().get(0));
+            assertEquals(1, backends.retry().attempts());
+            assertNull(backends.circuit()); // backends do not inherit
+        } finally {
+            router.close();
+        }
     }
 
     @Test
