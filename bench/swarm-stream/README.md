@@ -229,7 +229,16 @@ i.e. starved by consumers or others) / `pacer_nonvol_cs`. Acks are read without
 blocking in the slack before the next deadline; the loop parks until `--pacer-spin-us`
 (default 20 µs) before the slot and spins only that long. A stream with a full window is set
 aside (CAPWAIT) without blocking the others. Producer threads only claim, register, wait and
-send LAST; consumers keep their own threads. `result.json` records `pacer_loop`. The self-test also proves the mechanism against an
+send LAST; consumers keep their own threads. `result.json` records `pacer_loop`.
+
+Pacer priority (`PACER_NICE_BOOST=1` with `PACER_LOOP=1`, `--pacer-nice-boost`, opt-in): pacer-check3
+showed the loop's own work is short (iter p99 18-41 µs) but it waited for its core for 0.5-0.9 s
+per 20 s window (`pacer_rqwait_ms`), behind nice-0 platform daemons and its own process's
+threads, since every generator ran at nice 10. With the flag, one.sh launches the generator at
+nice 0 and StreamLoad moves every thread except `sl-pacer` (and the small spawner that creates
+it) back to nice 10 via `renice`, so only the pacing thread is at nice 0. Same cores and pinning
+(this is not dedicated pacer cores). `result.json` records `nice_boost`, `pacer_nice`,
+`nice_demoted_threads` and `nice_demote_failures`. The self-test also proves the mechanism against an
 in-JVM fake server with a 250 µs ack delay (sync falls behind by ~1 s; pipelined stays at µs).
 
 Lag split per measured slot (`result.json`): `pace_wake_*` (arrived early, then parked/spun:

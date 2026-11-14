@@ -354,6 +354,71 @@ public class StreamLoad {
     }
   }
   static final LongAdder TIMER_SLACK_SET = new LongAdder();
+  static volatile int PACER_NICE = Integer.MIN_VALUE;
+
+  /**
+   * #502 (a), harness only: one.sh launches a pacing-loop generator at nice 0 with --pacer-nice-boost.
+   * At startup every JVM thread except a small spawner is moved to nice 10 (the old launch nice); the
+   * spawner creates the pacing-loop threads, so only "sl-pacer" keeps nice 0. Threads created later
+   * inherit nice 10 from their (demoted) creator. Raising nice needs no privilege. Same cores, same
+   * pinning; this is not option (b).
+   */
+  static final class NiceBoost {
+    static volatile boolean on;
+    static final LinkedBlockingQueue<Runnable> q = new LinkedBlockingQueue<>();
+    static final LongAdder DEMOTED = new LongAdder(), FAILED = new LongAdder();
+    static final Set<String> KEEP = Set.of("sl-pacer", "sl-nice-spawner");
+    static String tid() {
+      try { return Files.readSymbolicLink(Path.of("/proc/thread-self")).getFileName().toString(); }
+      catch (Exception e) { return null; }
+    }
+    static int nice(String tid) {
+      if (tid == null) return Integer.MIN_VALUE;
+      try {
+        String st = Files.readString(Path.of("/proc/self/task", tid, "stat"));
+        String[] f = st.substring(st.lastIndexOf(')') + 2).trim().split("\\s+");
+        return Integer.parseInt(f[16]); // field 19 (nice); f[0] is field 3 (state)
+      } catch (Exception e) { return Integer.MIN_VALUE; }
+    }
+    static void init() throws InterruptedException {
+      CountDownLatch ready = new CountDownLatch(1);
+      Thread.ofPlatform().name("sl-nice-spawner").daemon(true).start(() -> {
+        ready.countDown();
+        while (true) {
+          try { q.take().run(); } catch (InterruptedException e) { return; }
+        }
+      });
+      ready.await();
+      on = true;
+      demoteOthers();
+    }
+    static void demoteOthers() {
+      List<String> tids = new ArrayList<>();
+      try (DirectoryStream<Path> ds = Files.newDirectoryStream(Path.of("/proc/self/task"))) {
+        for (Path t : ds) {
+          String id = t.getFileName().toString();
+          String comm;
+          try { comm = Files.readString(t.resolve("comm")).trim(); } catch (Exception e) { continue; }
+          if (KEEP.contains(comm)) continue;
+          int n = nice(id);
+          if (n != Integer.MIN_VALUE && n < 10) tids.add(id);
+        }
+      } catch (Exception e) { FAILED.increment(); return; }
+      if (tids.isEmpty()) return;
+      List<String> cmd = new ArrayList<>(List.of("renice", "-n", "10", "-p"));
+      cmd.addAll(tids);
+      try {
+        Process pr = new ProcessBuilder(cmd).redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
+        if (pr.waitFor() == 0) DEMOTED.add(tids.size()); else FAILED.increment();
+      } catch (Exception e) { FAILED.increment(); }
+    }
+    static Thread startThread(String name, Runnable r) {
+      if (!on) return Thread.ofPlatform().name(name).daemon(true).start(r);
+      CompletableFuture<Thread> f = new CompletableFuture<>();
+      q.add(() -> f.complete(Thread.ofPlatform().name(name).daemon(true).start(r)));
+      return f.join();
+    }
+  }
   /** #502 pacer loop: time inside the socket write and inside one non-blocking ack drain (µs). */
   static final LatBag PACER_WRITE = new LatBag(), PACER_DRAIN = new LatBag(), PACER_ITER = new LatBag();
   /** Pacer-loop thread over the measure window: CPU run time, runqueue wait, involuntary switches. */
@@ -525,6 +590,8 @@ public class StreamLoad {
      * threads only claim, register and send LAST; consumers keep their own threads.
      */
     boolean pacerLoop = false;
+    /** #502: run the pacing-loop thread at the launch nice and every other thread at nice 10 (--pacer-nice-boost). */
+    boolean pacerNiceBoost = false;
     /** Max spin before a slot in the pacer loop (µs); the loop parks until then. */
     long pacerSpinUs = 20;
     /**
@@ -562,6 +629,7 @@ public class StreamLoad {
       System.exit(n);
     }
     Args args = parse(a);
+    if (args.pacerLoop && args.pacerNiceBoost && args.rateMibS > 0) NiceBoost.init();
     List<String> tokens = loadTokens(args.tokensFile);
     Result r = run(args, tokens);
     Files.writeString(Path.of(args.out), r.toJson());
@@ -634,6 +702,16 @@ public class StreamLoad {
       int u4 = parseResponse(r1, 0, u1 - 1, st);
       fail += selfCheck("parseResponse content-length/chunked/partial", s1 == 200 && u1 == 41 && s2 == 429 && u2 > 0 && u3 == -1 && u4 == -1);
     } catch (IOException e) { fail += selfCheck("parseResponse threw " + e, false); }
+    {
+      // Nice-boost helpers: read this thread's nice, and the spawner keeps its nice for the threads it starts.
+      int n0 = NiceBoost.nice(NiceBoost.tid());
+      int[] seen = {Integer.MIN_VALUE};
+      try {
+        Thread nt = NiceBoost.startThread("sl-nice-test", () -> seen[0] = NiceBoost.nice(NiceBoost.tid()));
+        nt.join(2_000);
+      } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+      fail += selfCheck("nice read (" + n0 + "/" + seen[0] + ")", n0 != Integer.MIN_VALUE && seen[0] == n0);
+    }
     // Mechanism checks run unpinned on a shared box: up to 3 attempts, any clean attempt passes.
     int pf = 1;
     for (int att = 1; att <= 3 && pf != 0; att++) {
@@ -966,6 +1044,8 @@ public class StreamLoad {
     r.pacerWriteMaxUs = PACER_WRITE_MAX_NS.get() / 1e3; r.pacerDrainMaxUs = PACER_DRAIN_MAX_NS.get() / 1e3;
     r.pacerIterP99 = PACER_ITER.count() > 0 ? PACER_ITER.pctFromBuckets(0.99) : Double.NaN;
     r.pacerIterMax = PACER_ITER.count() > 0 ? PACER_ITER.pctFromBuckets(1.0) : Double.NaN;
+    r.pacerNice = PACER_NICE == Integer.MIN_VALUE ? -99 : PACER_NICE; r.niceBoost = NiceBoost.on;
+    r.niceDemoted = NiceBoost.DEMOTED.sum(); r.niceFailed = NiceBoost.FAILED.sum();
     r.pacerRunMs = PACER_RUN_NS / 1e6; r.pacerRqWaitMs = PACER_RQWAIT_NS / 1e6; r.pacerNonvolCs = PACER_NONVOL_CS;
     r.timerSlackSet = TIMER_SLACK_SET.sum(); r.paceWakeN = PACE_WAKE_N.sum(); r.paceBehindN = PACE_BEHIND_N.sum(); r.paceCapwaitN = PACE_CAPWAIT_N.sum();
     r.paceWakeHist = PACE_WAKE.sparseJson(); r.paceBehindHist = PACE_BEHIND.sparseJson();
@@ -1094,6 +1174,7 @@ public class StreamLoad {
     // 30+8+75+5).
     CountDownLatch admit = new CountDownLatch(2 * n);
     if (args.rateMibS > 0 && args.leanHttp && args.pacerLoop && w.intervalNs > 0) {
+      if (NiceBoost.on) NiceBoost.demoteOthers();
       w.pacer = new PacerLoop(args, w, inTeardown, measureErr, teardownErr, requests, credit429, producerTransportRetries);
       w.pacer.start();
     }
@@ -1479,7 +1560,7 @@ public class StreamLoad {
       this.producerTransportRetries = producerTransportRetries;
       this.spinNs = Math.max(0L, args.pacerSpinUs) * 1000L;
     }
-    void start() { thread = Thread.ofPlatform().name("sl-pacer").daemon(true).start(this); }
+    void start() { thread = NiceBoost.startThread("sl-pacer", this); }
     void register(Stream st) { incoming.add(st); LockSupport.unpark(thread); }
     void shutdown() {
       shut = true;
@@ -1489,6 +1570,7 @@ public class StreamLoad {
 
     @Override public void run() {
       if (setThreadTimerSlack(1_000L)) TIMER_SLACK_SET.increment();
+      PACER_NICE = NiceBoost.nice(NiceBoost.tid());
       final java.util.concurrent.ThreadLocalRandom rnd = java.util.concurrent.ThreadLocalRandom.current();
       final AtomicBoolean stop = w.hardStop;
       long[] sched0 = null;
@@ -2870,6 +2952,8 @@ public class StreamLoad {
         case "--rate-mib-s" -> args.rateMibS = Double.parseDouble(a[++i]);
         case "--pipeline-depth" -> args.pipelineDepth = Integer.parseInt(a[++i]);
         case "--pacer-loop" -> args.pacerLoop = true;
+        case "--pacer-nice-boost" -> args.pacerNiceBoost = true;
+        case "--no-pacer-nice-boost" -> args.pacerNiceBoost = false;
         case "--no-pacer-loop" -> args.pacerLoop = false;
         case "--pacer-spin-us" -> args.pacerSpinUs = Long.parseLong(a[++i]);
         case "--pacer-depth" -> args.pacerDepth = Integer.parseInt(a[++i]);
@@ -2920,7 +3004,8 @@ public class StreamLoad {
     boolean pacerLoop;
     double pacerWriteP99 = Double.NaN, pacerDrainP99 = Double.NaN, pacerWriteMaxUs, pacerDrainMaxUs;
     double pacerIterP99 = Double.NaN, pacerIterMax = Double.NaN, pacerRunMs, pacerRqWaitMs;
-    long pacerNonvolCs;
+    long pacerNonvolCs, pacerNice = -99, niceDemoted, niceFailed;
+    boolean niceBoost;
     String paceWakeHist = "[]", paceBehindHist = "[]", paceCapwaitHist = "[]", ackRttHist = "[]";
     Double paceWakeP99, paceBehindP99, paceCapwaitP99, ackRttP50, ackRttP99;
     Double warmupDrainOpenBefore, warmupDrainOpenAfter, warmupDrainChargedBefore, warmupDrainChargedAfter;
@@ -3028,6 +3113,7 @@ public class StreamLoad {
       field(sb, "warmup_drain_timed_out", warmupDrainTimedOut, true);
       field(sb, "pipeline_depth", pipelineDepth, true);
       sb.append("  \"pacer_loop\":").append(pacerLoop).append(",\n");
+      sb.append("  \"nice_boost\":").append(niceBoost).append(",\n");
       field(sb, "pacer_write_p99_us", pacerWriteP99, true);
       field(sb, "pacer_write_max_us", pacerWriteMaxUs, true);
       field(sb, "pacer_drain_p99_us", pacerDrainP99, true);
@@ -3037,6 +3123,9 @@ public class StreamLoad {
       field(sb, "pacer_run_ms", pacerRunMs, true);
       field(sb, "pacer_rqwait_ms", pacerRqWaitMs, true);
       field(sb, "pacer_nonvol_cs", pacerNonvolCs, true);
+      field(sb, "pacer_nice", pacerNice, true);
+      field(sb, "nice_demoted_threads", niceDemoted, true);
+      field(sb, "nice_demote_failures", niceFailed, true);
       field(sb, "gc_ms_window", gcMsWindow, true);
       field(sb, "gc_count_window", gcCountWindow, true);
       field(sb, "timer_slack_threads_set", timerSlackSet, true);

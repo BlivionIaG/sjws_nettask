@@ -280,6 +280,10 @@ if [ "$LOADGEN" = java ]; then
   if [ "${PACER_LOOP:-0}" = 1 ]; then GEN_EXTRA+=(--pacer-loop); fi
   if [ -n "${PACER_SPIN_US:-}" ]; then GEN_EXTRA+=(--pacer-spin-us "$PACER_SPIN_US"); fi
   if [ -n "${PACER_DEPTH:-}" ]; then GEN_EXTRA+=(--pacer-depth "$PACER_DEPTH"); fi
+  # #502: PACER_NICE_BOOST=1 (with PACER_LOOP=1) launches the generator at nice 0; StreamLoad then
+  # moves every thread except the pacing loop back to nice 10 (the usual launch nice).
+  GEN_NICE=10
+  if [ "${PACER_LOOP:-0}" = 1 ] && [ "${PACER_NICE_BOOST:-0}" = 1 ]; then GEN_EXTRA+=(--pacer-nice-boost); GEN_NICE=0; fi
   # #415/#414: optional generator JVM flags (e.g. JFR on the generator to find its own hot spots).
   read -r -a GEN_JAVA_ARGS <<< "${GEN_JAVA_OPTS:-}"
   # Launch one StreamLoad: _launch_streamload <pin> <streams> <groups> <group_offset> <rate_or_empty> <out>
@@ -299,7 +303,7 @@ if [ "$LOADGEN" = java ]; then
     # Per-process --gen-cores 1 (its pin is one core); merge-gen.py sets the combined width.
     local gcores=1
     [ "${GEN_PROCS:-1}" -le 1 ] && gcores="$GEN_CORES"
-    taskset -c "$pin" nice -n 10 java "${GEN_JAVA_ARGS[@]}" "$HERE_DIR/StreamLoad.java" \
+    taskset -c "$pin" nice -n "$GEN_NICE" java "${GEN_JAVA_ARGS[@]}" "$HERE_DIR/StreamLoad.java" \
       --base "http://127.0.0.1:$PORT" --tokens-file "$WD/tokens" \
       --accept "$ACCEPT" --warmup "$WARMUP" --secs "$SECS" --streams "$sp" \
       --groups "$gp" --group-offset "$goff" \

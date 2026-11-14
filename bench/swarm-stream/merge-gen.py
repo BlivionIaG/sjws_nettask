@@ -321,6 +321,10 @@ def merge(parts: list[dict], gen_cores: int, secs: float | None) -> dict:
     for k in ("pacer_iter_p99_us", "pacer_iter_max_us"):
         vs = [r.get(k) for r in parts if isinstance(r.get(k), (int, float)) and r.get(k) == r.get(k)]
         out[k] = max(vs) if vs else None
+    out["nice_boost"] = bool(first_present(parts, "nice_boost", False))
+    out["nice_demoted_threads"] = sum_num(parts, "nice_demoted_threads")
+    out["nice_demote_failures"] = sum_num(parts, "nice_demote_failures")
+    out["pacer_nice_per_proc"] = [r.get("pacer_nice") for r in parts]
     for k in ("pacer_run_ms", "pacer_rqwait_ms", "pacer_nonvol_cs"):
         vs = [r.get(k) for r in parts if isinstance(r.get(k), (int, float)) and r.get(k) == r.get(k) and r.get(k) >= 0]
         out[k] = sum(vs) if vs else None
