@@ -127,6 +127,40 @@ public class StreamLoad {
    * (inceptor Q1). Equal to LAT in closed loop, where the slot is the send time.
    */
   static final LatBag LAT_CO = new LatBag();
+  /**
+   * #502 A/A spread: scheduled latency per 1 s measure block (slot second since window start,
+   * clamped to the last bin). One unstriped 64 x 4096 array (2 MiB), written beside LAT_CO.
+   */
+  static final int PER_S_BINS = 64;
+  static final AtomicLongArray SCHED_PER_S = new AtomicLongArray(PER_S_BINS * LatBag.BUCKETS);
+  static void schedAdd(Win w, long slotNs, double us) {
+    LAT_CO.add(us);
+    long sec = (slotNs - w.startNs) / 1_000_000_000L;
+    int bin = (int) Math.max(0L, Math.min(PER_S_BINS - 1, sec));
+    SCHED_PER_S.incrementAndGet(bin * LatBag.BUCKETS + LatBag.index(us < 1 ? 1 : (long) us));
+  }
+  static void clearPerS() { for (int i = 0; i < SCHED_PER_S.length(); i++) SCHED_PER_S.set(i, 0); }
+  /** JSON [[sec, [[bucket,count],...]], ...] for non-empty seconds. */
+  static String perSJson() {
+    StringBuilder sb = new StringBuilder("[");
+    boolean firstS = true;
+    for (int sIdx = 0; sIdx < PER_S_BINS; sIdx++) {
+      StringBuilder h = new StringBuilder();
+      boolean first = true;
+      for (int b = 0; b < LatBag.BUCKETS; b++) {
+        long c = SCHED_PER_S.get(sIdx * LatBag.BUCKETS + b);
+        if (c == 0) continue;
+        if (!first) h.append(',');
+        first = false;
+        h.append('[').append(b).append(',').append(c).append(']');
+      }
+      if (first) continue;
+      if (!firstS) sb.append(',');
+      firstS = false;
+      sb.append('[').append(sIdx).append(",[").append(h).append("]]");
+    }
+    return sb.append(']').toString();
+  }
   /** #415 schedule lag (slot -> send start, µs) for in-window paced slots (Architecture item 5). */
   static final LatBag LAG = new LatBag();
   /** Smoke e: first measure second vs the rest, so a start-of-window catch-up burst is visible. */
@@ -395,7 +429,7 @@ public class StreamLoad {
       long kHi = Math.max(0L, Math.ceilDiv(end - t.phaseNs, iv));
       for (long j = 1; j <= missing; j++) {
         long slot = t.phaseNs + (kHi - j) * iv;
-        LAT_CO.add((cutoffNs - slot) / 1e3);
+        schedAdd(w, slot, (cutoffNs - slot) / 1e3);
       }
     }
     long phantom = Math.max(0, w.n - ts.size());
@@ -406,7 +440,7 @@ public class StreamLoad {
       SCHED_EXPECTED.add(phantom * per);
       SCHED_UNRECEIVED.add(phantom * per);
       for (long p = 0; p < phantom; p++)
-        for (long k = 0; k < per; k++) LAT_CO.add((cutoffNs - (start + k * iv)) / 1e3);
+        for (long k = 0; k < per; k++) schedAdd(w, start + k * iv, (cutoffNs - (start + k * iv)) / 1e3);
     }
   }
 
@@ -423,7 +457,7 @@ public class StreamLoad {
     if (slot <= 0) { SCHED_STAMP_FALLBACK.increment(); slot = emit; }
     if (!w.inWindow(slot)) return;
     LAT.add((recvNs - emit) / 1e3);
-    LAT_CO.add((recvNs - slot) / 1e3);
+    schedAdd(w, slot, (recvNs - slot) / 1e3);
     bytesRx.add(len - CHUNK_HDR);
     SCHED_RECEIVED.increment();
     Track t = cache[0];
@@ -753,7 +787,7 @@ public class StreamLoad {
     } catch (Exception e) {
       System.err.println("warmup-drain scrape failed: " + e);
     }
-    bytesRx.reset(); LAT.clearAll(); LAT_CO.clearAll(); LAG.clearAll(); LAG_FIRST.clearAll(); LAG_REST.clearAll(); creditWaits.clear();
+    bytesRx.reset(); LAT.clearAll(); LAT_CO.clearAll(); clearPerS(); LAG.clearAll(); LAG_FIRST.clearAll(); LAG_REST.clearAll(); creditWaits.clear();
     SCHED_SENDS.reset(); SCHED_LATE.reset(); SCHED_LAG_MAX_NS.reset(); measureErr.clear(); teardownErr.clear();
     PACE_WAKE.clearAll(); PACE_BEHIND.clearAll(); PACE_CAPWAIT.clearAll(); ACK_RTT.clearAll();
     PACE_WAKE_N.reset(); PACE_BEHIND_N.reset(); PACE_CAPWAIT_N.reset();
@@ -858,7 +892,7 @@ public class StreamLoad {
     r.p50 = gateLat.pctFromBuckets(0.50); r.p90 = gateLat.pctFromBuckets(0.90); r.p99 = gateLat.pctFromBuckets(0.99);
     r.p50Send = LAT.pctFromBuckets(0.50); r.p90Send = LAT.pctFromBuckets(0.90); r.p99Send = LAT.pctFromBuckets(0.99);
     r.p50Sched = LAT_CO.pctFromBuckets(0.50); r.p90Sched = LAT_CO.pctFromBuckets(0.90); r.p99Sched = LAT_CO.pctFromBuckets(0.99);
-    r.latHistSend = LAT.sparseJson(); r.latHistSched = LAT_CO.sparseJson();
+    r.latHistSend = LAT.sparseJson(); r.latHistSched = LAT_CO.sparseJson(); r.schedPerS = perSJson();
     if (paced && LAG.count() > 0) { r.lagP50 = LAG.pctFromBuckets(0.50); r.lagP99 = LAG.pctFromBuckets(0.99); }
     if (paced && LAG_FIRST.count() > 0) r.lagFirstP99 = LAG_FIRST.pctFromBuckets(0.99);
     if (paced && LAG_REST.count() > 0) r.lagRestP99 = LAG_REST.pctFromBuckets(0.99);
@@ -1764,7 +1798,7 @@ public class StreamLoad {
               if (slot <= 0) { SCHED_STAMP_FALLBACK.increment(); slot = emit; }
               if (w.inWindow(slot)) {
                 LAT.add((recv - emit) / 1e3);
-                LAT_CO.add((recv - slot) / 1e3);
+                schedAdd(w, slot, (recv - slot) / 1e3);
                 bytesRx.add(d.length());
                 SCHED_RECEIVED.increment();
               }
@@ -2414,7 +2448,7 @@ public class StreamLoad {
     double genSatLimitPct;
     String latencyBasis = "send";
     Double p50Send, p90Send, p99Send, p50Sched, p90Sched, p99Sched;
-    String latHistSend = "[]", latHistSched = "[]";
+    String latHistSend = "[]", latHistSched = "[]", schedPerS = "[]";
     double rateMibS, schedLatePct, schedLagMaxUs, offeredActualMibS;
     Double lagP50, lagP99, lagFirstP99, lagRestP99;
     String lagHist = "[]", lagFirstHist = "[]", lagRestHist = "[]";
@@ -2563,6 +2597,7 @@ public class StreamLoad {
         .append(",\"p99_us\":").append(p99Send)
         .append(",\"hist\":").append(latHistSend)
         .append("},\n");
+      sb.append("  \"sched_per_s_hist\":").append(schedPerS).append(",\n");
       sb.append("  \"chunk_latency_sched\":{")
         .append("\"p50_us\":").append(p50Sched)
         .append(",\"p90_us\":").append(p90Sched)

@@ -325,6 +325,16 @@ def merge(parts: list[dict], gen_cores: int, secs: float | None) -> dict:
         out[p99key] = pct_from_hist(h, 0.99) if h else None
         if p50key:
             out[p50key] = pct_from_hist(h, 0.50) if h else None
+    # #502 A/A spread: per-1s-block scheduled latency (merge by second, p99 per block).
+    by_s = {}
+    for r in parts:
+        for ent in r.get("sched_per_s_hist") or []:
+            by_s.setdefault(int(ent[0]), []).append(ent[1])
+    per_s = [[sec, merge_hist(hs)] for sec, hs in sorted(by_s.items())]
+    out["sched_per_s_hist"] = per_s
+    out["sched_p99_per_s_us"] = [
+        [sec, pct_from_hist(h, 0.99), sum(c for _, c in h)] for sec, h in per_s
+    ]
     out["first_admit"] = fa[:40]
     out["first_admit_warmup"] = fw[:40]
     return out

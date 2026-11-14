@@ -205,6 +205,11 @@ def test_merge_gen_pace_split():
     assert m["pace_capwait_p99_us"] is None and m["pace_capwait_hist"] == []
     assert m["ack_rtt_p50_us"] == mod.upper(idx(60))
     assert sum(c for _, c in m["ack_rtt_hist"]) == 200
+    c = part("c", sched_per_s_hist=[[0, [[idx(100), 10]]], [1, [[idx(300), 5]]]])
+    d = part("d", sched_per_s_hist=[[1, [[idx(300), 5], [idx(900), 1]]]])
+    m2 = mod.merge([c, d], gen_cores=3, secs=20)
+    assert [e[0] for e in m2["sched_per_s_hist"]] == [0, 1], m2["sched_per_s_hist"]
+    assert m2["sched_p99_per_s_us"][1] == [1, mod.upper(idx(900)), 11], m2["sched_p99_per_s_us"]
     print("OK test_merge_gen_pace_split")
 
 
