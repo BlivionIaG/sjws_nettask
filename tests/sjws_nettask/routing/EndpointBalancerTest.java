@@ -71,8 +71,13 @@ class EndpointBalancerTest {
                 this.hits[idx].incrementAndGet();
                 boolean fail = this.failing.contains(name);
                 var body = name.getBytes(StandardCharsets.UTF_8);
-                ex.sendResponseHeaders(fail ? 503 : 200, body.length);
-                ex.getResponseBody().write(body);
+                int status = fail ? 503 : 200;
+                if ("HEAD".equals(ex.getRequestMethod())) {
+                    ex.sendResponseHeaders(status, -1);
+                } else {
+                    ex.sendResponseHeaders(status, body.length);
+                    ex.getResponseBody().write(body);
+                }
                 ex.close();
             });
             s.start();
@@ -843,6 +848,31 @@ class EndpointBalancerTest {
         assertTrue(poolA.health.available(this.now.get()),
                 "scanning a cold recovering endpoint at the cap must not leak its half-open reservation");
         poolA.health.release();
+    }
+
+    @Test
+    void retryAtTheConnectionCapSkipsTheTriedAuthoritysWarmIdle() throws Exception {
+        var admission = Admission.of(0, 1);
+        var retry = new Resilience.Retry(1, EnumSet.of(Resilience.On.STATUS_503), 100);
+        var src = new StaticUpstreamSource(set(1, LbPolicy.ROUND_ROBIN, ep(0, 1), ep(1, 1)));
+        var b = balancer(src, retry, null, Duration.ofSeconds(10), admission);
+        assertEquals("a", body(b.handle(new Request("GET", "/"))));
+        assertEquals(1, admission.connections());
+        var poolA = b.poolOf(ep(0, 1).authority());
+        var poolB = b.poolOf(ep(1, 1).authority());
+        for (int i = 0; i < 100 && poolA.proxy.idleConnections() == 0; i++) {
+            Thread.sleep(20);
+        }
+        assertEquals(1, poolA.proxy.idleConnections());
+        assertEquals(0, poolB.proxy.idleConnections());
+        this.failing.add("a");
+        // HEAD so the 503 keep-alive returns to A's idle pool before the retry pick.
+        // A GET would close that socket in discardForRetry, and pickWarmIdle would not
+        // see A's idle — so ignoring the tried list would not fail the test.
+        var again = b.handle(new Request("HEAD", "/"));
+        assertEquals(200, again.status(), "retry must reach B, not reuse A's warm idle");
+        assertEquals(2, this.hits[0].get(), "A is tried once (warm-idle first attempt)");
+        assertEquals(1, this.hits[1].get(), "the retry must go to B, even without an idle there");
     }
 
     @Test

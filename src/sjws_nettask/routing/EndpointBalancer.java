@@ -553,13 +553,13 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
      * A weighted, usable endpoint that already holds an idle keep-alive. Weight-0 / SUSPECT
      * endpoints are skipped so their idle sockets can be reclaimed for a healthy one.
      */
-    private int pickWarmIdle(View v, int[] tried, int nTried, long now, boolean panic) {
+    private int pickWarmIdle(View v, String[] tried, int nTried, long now, boolean panic) {
         int n = v.pools.length;
         int start = ThreadLocalRandom.current().nextInt(n);
         for (int k = 0; k < n; k++) {
             int i = (start + k) % n;
             boolean weighted = v.set.endpointAt(i).effectiveWeight() > 0 || v.positive.length == n;
-            if (weighted && !contains(tried, nTried, i) && v.pools[i].proxy.idleConnections() > 0
+            if (weighted && !contains(tried, nTried, v.pools[i].key) && v.pools[i].proxy.idleConnections() > 0
                     && clientMayUse(v.pools[i], now, panic)) {
                 return i;
             }
