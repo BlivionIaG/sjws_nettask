@@ -8,6 +8,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _gatefix import ACCOUNTING, write_floor  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 AGG = HERE.parent / "agg.py"
 

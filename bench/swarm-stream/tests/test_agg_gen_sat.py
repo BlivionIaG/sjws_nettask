@@ -4,6 +4,9 @@ from __future__ import annotations
 import json, subprocess, sys, tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _gatefix import ACCOUNTING, write_floor  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 AGG = HERE.parent / "agg.py"
 
@@ -17,6 +20,9 @@ def write_abs(root: Path, tag: str, cpu: float, gen_cores: int = 2, load1_post: 
         "p50_us": 100.0,
         "p90_us": 200.0,
         "mib_s": 120.0,
+        "offered_mib_s": 110.0,  # inceptor Q1: paced gate window
+        "latency_basis": "scheduled",
+        **ACCOUNTING,
         "load1_pre": 0.5,
         "load1_post": load1_post,
         "self_loaded": False,  # loadgen may under-report; agg must recompute
@@ -44,6 +50,7 @@ def write_abs(root: Path, tag: str, cpu: float, gen_cores: int = 2, load1_post: 
     (d / "result.json").write_text(json.dumps(body))
 
 def run_agg(root: Path) -> str:
+    write_floor(root)
     return subprocess.check_output([sys.executable, str(AGG), str(root)], text=True)
 
 def flags(out: str, tag: str):
@@ -60,7 +67,7 @@ def main():
         # 3 cores → limit 240. 230 OK, 241 self_loaded
         write_abs(root, "abs-03", cpu=230.0, gen_cores=3)
         write_abs(root, "abs-04", cpu=241.0, gen_cores=3)
-        # load1_post >= 4 forces self_loaded even if CPU low
+        # load1_post >= 4 is NOT self_loaded (inceptor 21:32); CPU 10% << 160
         write_abs(root, "abs-05", cpu=10.0, gen_cores=2, load1_post=4.0)
         # Stale recorded override must NOT raise the limit (Codex P2): cpu=170, cores=2,
         # gen_sat_limit_pct=180 would wrongly pass if trusted; disclosed limit is 160.
@@ -72,7 +79,7 @@ def main():
             ("abs-02", False, True),
             ("abs-03", True, False),
             ("abs-04", False, True),
-            ("abs-05", False, True),
+            ("abs-05", True, False),
             ("abs-06", False, True),
         ):
             (v, s), ln = flags(out, tag)

@@ -4,6 +4,9 @@ from __future__ import annotations
 import json, subprocess, sys, tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _gatefix import ACCOUNTING, write_floor  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 AGG = HERE.parent / "agg.py"
 
@@ -16,6 +19,9 @@ def write_abs(root: Path, tag: str, **over):
         "p50_us": 100.0,
         "p90_us": 200.0,
         "mib_s": 120.0,
+        "offered_mib_s": 110.0,  # inceptor Q1: paced gate window
+        "latency_basis": "scheduled",
+        **ACCOUNTING,
         "load1_pre": 0.5,
         "load1_post": 1.0,
         "self_loaded": False,
@@ -43,6 +49,7 @@ def write_abs(root: Path, tag: str, **over):
     (d / "result.json").write_text(json.dumps(body))
 
 def run_agg(root: Path) -> str:
+    write_floor(root)
     return subprocess.check_output([sys.executable, str(AGG), str(root)], text=True)
 
 def line(out: str, tag: str) -> str:
@@ -77,12 +84,18 @@ def main():
         assert "valid=False" in line(out3, "abs-01")
         assert "noisy=True" in out3
 
-        # load1_post >= 6
+        # load1_post >= 6 is information only (inceptor 01:06): still valid
         root4 = Path(td) / "l"
         root4.mkdir()
-        write_abs(root4, "abs-01", load1_post=6.0)
+        write_abs(root4, "abs-01", load1_post=6.0, load1_peak=40.0)
         out4 = run_agg(root4)
-        assert "valid=False" in line(out4, "abs-01")
+        assert "valid=True" in line(out4, "abs-01"), out4
+        # pre-leg load1 >= 3 is still invalid
+        root5 = Path(td) / "p"
+        root5.mkdir()
+        write_abs(root5, "abs-01", load1_pre=3.2)
+        out5 = run_agg(root5)
+        assert "valid=False" in line(out5, "abs-01"), out5
 
         print("OK test_agg_noisy")
 
