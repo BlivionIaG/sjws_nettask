@@ -58,6 +58,37 @@ def pct_from_hist(hist: list, p: float):
     return upper(last) if hist else None
 
 
+def _ncpus(spec):
+    n = 0
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            n += int(b) - int(a) + 1
+        else:
+            n += 1
+    return max(1, n)
+
+
+def role_core_cpu(parts):
+    """Per-core-set CPU for ROLE_SPLIT legs, or None if no part is role-split."""
+    if not any(r.get("role_split") for r in parts):
+        return None
+    per_proc, per_core = [], {}
+    for r in parts:
+        pc, ac = r.get("role_pace_cpus") or "?", r.get("role_ack_cpus") or "?"
+        pv, av = r.get("role_pace_cpu_pct"), r.get("role_ack_cpu_pct")
+        per_proc.append({"pace_cpus": pc, "pace_pct": pv, "ack_cpus": ac, "ack_pct": av})
+        for k, v in ((pc, pv), (ac, av)):
+            if isinstance(v, (int, float)) and v == v:
+                per_core[k] = per_core.get(k, 0.0) + float(v)
+    limit = {k: 80.0 * _ncpus(k) for k in per_core}
+    any_over = any(per_core[k] > limit[k] for k in per_core)
+    return {"per_proc": per_proc, "per_core": per_core, "limit": limit, "any_over": any_over}
+
+
 def sum_num(parts, *keys, default=0):
     s = 0
     found = False
@@ -179,6 +210,18 @@ def merge(parts: list[dict], gen_cores: int, secs: float | None) -> dict:
     out["load1_pre"] = first_present(parts, "load1_pre")
     out["load1_peak"] = max_num(parts, "load1_peak")
     any_proc = any(c is not None and c > 80.0 for c in per)
+    # #502 option (b) (inceptor 2026-11-17 23:31): with ROLE_SPLIT each process spans its pace core
+    # and the shared ack core, so "> 80% of its pinned core" is judged per role group: the summed
+    # CPU of every thread pinned to one core set (all processes) against 80% x its core count.
+    role = role_core_cpu(parts)
+    if role is not None:
+        out["role_split"] = True
+        out["role_cpu_pct_per_proc"] = role["per_proc"]
+        out["role_core_cpu_pct"] = role["per_core"]
+        out["role_core_limit_pct"] = role["limit"]
+        any_proc = role["any_over"]
+    else:
+        out["role_split"] = False
     gen_sat = bool((cpu is not None and cpu > sat) or any_proc)
     out["generator_saturated"] = gen_sat
     out["generator_saturated_any_proc"] = bool(any_proc)

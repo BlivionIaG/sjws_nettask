@@ -213,9 +213,28 @@ def test_merge_gen_pace_split():
     print("OK test_merge_gen_pace_split")
 
 
+def test_merge_gen_role_split():
+    # #502 option (b): two processes, pace cores 0 and 1, shared ack core 2.
+    a = part("a", role_split=True, role_pace_cpus="0", role_ack_cpus="2", role_pace_cpu_pct=30.0,
+             role_ack_cpu_pct=45.0, client_cpu_pct_of_wall=75.0)
+    b = part("b", role_split=True, role_pace_cpus="1", role_ack_cpus="2", role_pace_cpu_pct=20.0,
+             role_ack_cpu_pct=30.0, client_cpu_pct_of_wall=50.0)
+    m = mod.merge([a, b], gen_cores=3, secs=20)
+    assert m["role_split"] and m["role_core_cpu_pct"] == {"0": 30.0, "2": 75.0, "1": 20.0}, m["role_core_cpu_pct"]
+    assert not m["self_loaded"], m  # no core set over 80 %, sum 125 < 240
+    b2 = dict(b, role_ack_cpu_pct=40.0)  # ack core 2 at 85 % -> self_loaded
+    m2 = mod.merge([a, b2], gen_cores=3, secs=20)
+    assert m2["self_loaded"] and m2["role_core_cpu_pct"]["2"] == 85.0, m2
+    # a process above 80 % in total (pace + ack) is NOT self_loaded when every core set is under 80 %
+    a3 = dict(a, client_cpu_pct_of_wall=90.0)
+    assert not mod.merge([a3, b], gen_cores=3, secs=20)["self_loaded"]
+    print("OK test_merge_gen_role_split")
+
+
 if __name__ == "__main__":
     import tempfile
     main()
     test_merge_gen_pace_split()
+    test_merge_gen_role_split()
     with tempfile.TemporaryDirectory() as d:
         test_merge_gen_refuses_empty(Path(d))

@@ -355,6 +355,100 @@ public class StreamLoad {
   }
   static final LongAdder TIMER_SLACK_SET = new LongAdder();
   static volatile int PACER_NICE = Integer.MIN_VALUE;
+  static final double[] ROLE_JIFFIES = new double[2], ROLE_CPU_PCT = {Double.NaN, Double.NaN};
+
+  /**
+   * #502 option (b), inceptor 2026-11-17 23:31, harness only: split generator roles across cores.
+   * PACE role = "sl-pacer", producer threads "sl-p-*" and the nice spawner; every other thread of the
+   * process (ack readers "sl-ack-*", consumer carriers, JVM threads, main) is the ACK role. A pinner
+   * thread re-applies per-thread affinity (taskset -p -c) every 100 ms for new threads. Per-role CPU
+   * (% of one core) is sampled over the measure window from /proc/self/task/<tid>/stat.
+   */
+  static final class RolePin {
+    static volatile boolean on;
+    static volatile String paceCpus = "", ackCpus = "";
+    static final ConcurrentHashMap<String, String> APPLIED = new ConcurrentHashMap<>();
+    static final LongAdder PINNED = new LongAdder(), FAILED = new LongAdder();
+    static boolean isPace(String comm) {
+      return comm.startsWith("sl-pacer") || comm.startsWith("sl-p-") || comm.equals("sl-nice-spawner");
+    }
+    static void init(String spec) {
+      int c = spec.indexOf(':');
+      if (c <= 0 || c == spec.length() - 1) throw new IllegalArgumentException("--role-cpus PACECPUS:ACKCPUS, got " + spec);
+      paceCpus = spec.substring(0, c); ackCpus = spec.substring(c + 1);
+      on = true;
+      pinAll();
+      Thread.ofPlatform().name("sl-rolepin").daemon(true).start(() -> {
+        while (true) {
+          try { Thread.sleep(100); } catch (InterruptedException e) { return; }
+          pinAll();
+        }
+      });
+    }
+    static String comm(Path task) {
+      try { return Files.readString(task.resolve("comm")).trim(); } catch (Exception e) { return null; }
+    }
+    static synchronized void pinAll() {
+      if (!on) return;
+      try (DirectoryStream<Path> ds = Files.newDirectoryStream(Path.of("/proc/self/task"))) {
+        for (Path t : ds) {
+          String tid = t.getFileName().toString();
+          String comm = comm(t);
+          if (comm == null) continue;
+          String want = isPace(comm) ? paceCpus : ackCpus;
+          if (want.equals(APPLIED.get(tid))) continue;
+          try {
+            Process pr = new ProcessBuilder("taskset", "-p", "-c", want, tid).redirectErrorStream(true)
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
+            if (pr.waitFor() == 0) { APPLIED.put(tid, want); PINNED.increment(); } else FAILED.increment();
+          } catch (Exception e) { FAILED.increment(); }
+        }
+      } catch (Exception e) { FAILED.increment(); }
+    }
+    /** Per-thread role map: label, tid, comm, role, Cpus_allowed_list (one line per thread). */
+    static void dump(String path, String label) {
+      if (path == null) return;
+      StringBuilder sb = new StringBuilder();
+      try (DirectoryStream<Path> ds = Files.newDirectoryStream(Path.of("/proc/self/task"))) {
+        for (Path t : ds) {
+          String comm = comm(t);
+          if (comm == null) continue;
+          String allowed = "?";
+          try {
+            for (String line : Files.readAllLines(t.resolve("status")))
+              if (line.startsWith("Cpus_allowed_list:")) allowed = line.substring(18).trim();
+          } catch (Exception ignored) {}
+          sb.append(label).append('\t').append(t.getFileName()).append('\t').append(comm).append('\t')
+            .append(isPace(comm) ? "pace" : "ack").append('\t').append(allowed).append('\n');
+        }
+        Files.writeString(Path.of(path), sb.toString(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+      } catch (Exception ignored) {}
+    }
+    /** tid -> {utime+stime jiffies, 1 if PACE role}. */
+    static Map<String, long[]> taskJiffies() {
+      Map<String, long[]> m = new HashMap<>();
+      try (DirectoryStream<Path> ds = Files.newDirectoryStream(Path.of("/proc/self/task"))) {
+        for (Path t : ds) {
+          try {
+            String st = Files.readString(t.resolve("stat"));
+            String comm = st.substring(st.indexOf('(') + 1, st.lastIndexOf(')'));
+            String[] f = st.substring(st.lastIndexOf(')') + 2).trim().split("\\s+");
+            m.put(t.getFileName().toString(), new long[] {Long.parseLong(f[11]) + Long.parseLong(f[12]), isPace(comm) ? 1 : 0});
+          } catch (Exception ignored) {}
+        }
+      } catch (Exception ignored) {}
+      return m;
+    }
+    /** Adds per-role jiffies between two snapshots (threads present in both) into acc {pace, ack}. */
+    static void addDelta(Map<String, long[]> a, Map<String, long[]> b, double[] acc) {
+      for (Map.Entry<String, long[]> e : b.entrySet()) {
+        long[] x = a.get(e.getKey());
+        if (x == null) continue;
+        long d = Math.max(0, e.getValue()[0] - x[0]);
+        acc[e.getValue()[1] == 1 ? 0 : 1] += d;
+      }
+    }
+  }
 
   /**
    * #502 (a), harness only: with --pacer-nice-boost one.sh launches the generator 10 nice levels
@@ -593,6 +687,12 @@ public class StreamLoad {
     boolean pacerLoop = false;
     /** #502: run the pacing-loop thread at the launch nice and every other thread at nice 19 (--pacer-nice-boost). */
     boolean pacerNiceBoost = false;
+    /** #502 option (b): "PACECPUS:ACKCPUS" pins sl-pacer + producers to PACECPUS, everything else to ACKCPUS (--role-cpus). */
+    String roleCpus = null;
+    /** Per-thread taskset map written at measure start and end (--role-map-out). */
+    String roleMapOut = null;
+    /** #502 option (b): one ack-reader thread per paced stream (socket reads off the pacer); on with --role-cpus. */
+    boolean ackThreads = false;
     /** Max spin before a slot in the pacer loop (µs); the loop parks until then. */
     long pacerSpinUs = 20;
     /**
@@ -631,6 +731,7 @@ public class StreamLoad {
     }
     Args args = parse(a);
     if (args.pacerLoop && args.pacerNiceBoost && args.rateMibS > 0) NiceBoost.init();
+    if (args.roleCpus != null) RolePin.init(args.roleCpus);
     List<String> tokens = loadTokens(args.tokensFile);
     Result r = run(args, tokens);
     Files.writeString(Path.of(args.out), r.toJson());
@@ -765,6 +866,16 @@ public class StreamLoad {
         fail += selfCheck("pacer-loop " + ns + ": lag_p99 < 1% of sync lag_p99", lp[0] < 0.01 * sync[0]);
         fail += selfCheck("pacer-loop " + ns + ": sent all slots", lp[3] >= lp[4] - ns);
       }
+      // Option (b): socket reads on per-stream ack threads, parsing on the pacer.
+      pacerLoopRun(base, iv * 11, 200_000_000L, 11, true); // warm-up, unchecked
+      for (int ns : new int[] {1, 11}) {
+        double[] lp = pacerLoopRun(base, iv * ns, windowNs, ns, true);
+        System.out.printf(Locale.ROOT,
+            "pacer-loop-ack-threads-self-test streams=%d interval=%.1fus lag_p50=%.0fus lag_p99=%.0fus behind=%.1f%% capwait=%.1f%% sent=%.0f/%.0f pacer_cpu=%.0f%%%n",
+            ns, iv * ns / 1e3, lp[5], lp[0], lp[1], lp[2], lp[3], lp[4], lp[6]);
+        fail += selfCheck("pacer-loop ack-threads " + ns + ": lag_p99 < 1% of sync lag_p99", lp[0] < 0.01 * sync[0]);
+        fail += selfCheck("pacer-loop ack-threads " + ns + ": sent all slots", lp[3] >= lp[4] - ns);
+      }
       srv.interrupt();
     } catch (Exception e) {
       System.err.println("pipeline-self-test error: " + e);
@@ -830,11 +941,15 @@ public class StreamLoad {
 
   /** Self-test: {lag_p99, behind%, capwait%, sent, expected, lag_p50, pacer_cpu%} for the pacer loop. */
   static double[] pacerLoopRun(URI base, long iv, long windowNs, int streams) throws Exception {
+    return pacerLoopRun(base, iv, windowNs, streams, false);
+  }
+  static double[] pacerLoopRun(URI base, long iv, long windowNs, int streams, boolean split) throws Exception {
     for (LongAdder c : List.of(SCHED_SENDS, SCHED_LATE, SCHED_SENT, PACE_WAKE_N, PACE_BEHIND_N, PACE_CAPWAIT_N)) c.reset();
     LAG.clearAll(); LAG_FIRST.clearAll(); LAG_REST.clearAll(); PACE_WAKE.clearAll(); PACE_BEHIND.clearAll();
     PACE_CAPWAIT.clearAll(); ACK_RTT.clearAll();
     Args a = new Args();
     a.window = 8;
+    a.ackThreads = split;
     Win w = new Win(true, streams, iv);
     long start = System.nanoTime() + 30_000_000L;
     w.startNs = start; w.endNs = start + windowNs;
@@ -994,15 +1109,18 @@ public class StreamLoad {
         // including the last seconds. Previously the deadline was (secs-3) after this skip, which
         // missed the last ~3.5 s of a 20 s window.
         Thread.sleep(2000);
+        if (RolePin.on) { RolePin.pinAll(); RolePin.dump(args.roleMapOut, "measure_start"); }
         double cSecSum = 0, sSecSum = 0, wallSum = 0;
         int n = 0;
         long deadline = System.nanoTime() + (long)(Math.max(3, args.secs) * 1e9);
         while (System.nanoTime() < deadline) {
+          Map<String, long[]> ra = RolePin.on ? RolePin.taskJiffies() : null;
           long c0 = readProcJiffies("self");
           long s0 = args.serverPid > 0 ? readProcJiffies(Integer.toString(args.serverPid)) : -1;
           long t0 = System.nanoTime();
           Thread.sleep(1000);
           long c1 = readProcJiffies("self");
+          if (ra != null) RolePin.addDelta(ra, RolePin.taskJiffies(), ROLE_JIFFIES);
           long s1 = args.serverPid > 0 ? readProcJiffies(Integer.toString(args.serverPid)) : -1;
           double wallS = (System.nanoTime() - t0) / 1e9;
           cSecSum += (c1 - c0) / scClk();
@@ -1010,9 +1128,14 @@ public class StreamLoad {
           wallSum += wallS;
           n++;
         }
+        if (RolePin.on) RolePin.dump(args.roleMapOut, "measure_end");
         double cPct = wallSum > 0 ? cSecSum / wallSum * 100.0 : 0;
         double sPct = wallSum > 0 && n > 0 ? sSecSum / wallSum * 100.0 : Double.NaN;
         cpuSample.set(new double[]{cSecSum, cPct, sSecSum, sPct});
+        if (wallSum > 0) {
+          ROLE_CPU_PCT[0] = ROLE_JIFFIES[0] / scClk() / wallSum * 100.0;
+          ROLE_CPU_PCT[1] = ROLE_JIFFIES[1] / scClk() / wallSum * 100.0;
+        }
       } catch (Exception ignored) {}
     });
 
@@ -1045,6 +1168,9 @@ public class StreamLoad {
     r.pacerWriteMaxUs = PACER_WRITE_MAX_NS.get() / 1e3; r.pacerDrainMaxUs = PACER_DRAIN_MAX_NS.get() / 1e3;
     r.pacerIterP99 = PACER_ITER.count() > 0 ? PACER_ITER.pctFromBuckets(0.99) : Double.NaN;
     r.pacerIterMax = PACER_ITER.count() > 0 ? PACER_ITER.pctFromBuckets(1.0) : Double.NaN;
+    r.roleSplit = RolePin.on; r.rolePaceCpus = RolePin.paceCpus; r.roleAckCpus = RolePin.ackCpus;
+    r.rolePaceCpuPct = ROLE_CPU_PCT[0]; r.roleAckCpuPct = ROLE_CPU_PCT[1];
+    r.rolePinned = RolePin.PINNED.sum(); r.rolePinFailures = RolePin.FAILED.sum(); r.ackThreads = args.ackThreads && r.pacerLoop;
     r.pacerNice = PACER_NICE == Integer.MIN_VALUE ? -99 : PACER_NICE; r.niceBoost = NiceBoost.on;
     r.niceDemoted = NiceBoost.DEMOTED.sum(); r.niceFailed = NiceBoost.FAILED.sum();
     r.pacerRunMs = PACER_RUN_NS / 1e6; r.pacerRqWaitMs = PACER_RQWAIT_NS / 1e6; r.pacerNonvolCs = PACER_NONVOL_CS;
@@ -1204,6 +1330,7 @@ public class StreamLoad {
         producers.add(Thread.startVirtualThread(prod));
       }
     }
+    if (RolePin.on) RolePin.pinAll();
     long admitDl = System.nanoTime() + (long) (Math.max(5.0, args.admitTimeoutS) * 1e9);
     while (admit.getCount() > 0 && System.nanoTime() < admitDl) {
       admit.await(50, TimeUnit.MILLISECONDS);
@@ -1533,6 +1660,12 @@ public class StreamLoad {
       long seq; long capT0; boolean draining;
       byte[] acc = new byte[16384]; int accLen; // bytes read without blocking, not yet parsed
       final CountDownLatch done = new CountDownLatch(1);
+      // Option (b) ack-thread mode: the "sl-ack-*" thread reads the socket, the pacer parses.
+      volatile InputStream ackIn; volatile int gen; volatile boolean ackIdle = true, ackStop, wantUnpark;
+      volatile IOException rxErr; volatile int rxErrGen;
+      final Object rxLock = new Object();
+      byte[] rx = new byte[16384]; int rxLen; long rxLastNs;
+      Thread acker;
       Stream(LeanHttp lean, byte[] dataHdr, Lease lease, byte[] payload, Track track, long phaseNs, long nextNs,
           boolean coStamp, int depth, String pool) {
         this.lean = lean; this.dataHdr = dataHdr; this.lease = lease; this.payload = payload; this.track = track;
@@ -1552,6 +1685,9 @@ public class StreamLoad {
     final long spinNs;
     volatile boolean shut;
     Thread thread;
+    final boolean split;
+    final AtomicInteger ackerSeq = new AtomicInteger();
+    static final int ACK_POLL_MS = 20;
 
     PacerLoop(Args args, Win w, AtomicBoolean inTeardown, ConcurrentLinkedQueue<String> measureErr,
         ConcurrentLinkedQueue<String> teardownErr, AtomicLong requests, AtomicLong credit429,
@@ -1560,9 +1696,79 @@ public class StreamLoad {
       this.teardownErr = teardownErr; this.requests = requests; this.credit429 = credit429;
       this.producerTransportRetries = producerTransportRetries;
       this.spinNs = Math.max(0L, args.pacerSpinUs) * 1000L;
+      this.split = args.ackThreads;
     }
     void start() { thread = NiceBoost.startThread("sl-pacer", this); }
-    void register(Stream st) { incoming.add(st); LockSupport.unpark(thread); }
+    void register(Stream st) {
+      if (split) {
+        st.acker = Thread.ofPlatform().name("sl-ack-" + ackerSeq.getAndIncrement()).daemon(true).start(() -> ackerRun(st));
+        if (RolePin.on) RolePin.pinAll();
+      }
+      incoming.add(st);
+      LockSupport.unpark(thread);
+    }
+
+    /**
+     * Ack-reader thread (option (b)): blocking reads of the published connection into st.rx. A
+     * short SO_TIMEOUT (set on publish) lets it notice retraction. Handshake with the pacer:
+     * the acker writes ackIdle=false then re-reads ackIn; the pacer writes ackIn=null then reads
+     * ackIdle, so they never both touch the socket's input.
+     */
+    void ackerRun(Stream st) {
+      byte[] buf = new byte[16384];
+      while (!st.ackStop && !shut) {
+        InputStream in = st.ackIn;
+        int g = st.gen;
+        if (in == null) { st.ackIdle = true; LockSupport.parkNanos(200_000L); continue; }
+        st.ackIdle = false;
+        if (st.ackIn != in) { st.ackIdle = true; continue; }
+        try {
+          int r = in.read(buf);
+          if (r < 0) throw new EOFException("pacer-loop: connection closed");
+          long t = System.nanoTime();
+          synchronized (st.rxLock) {
+            if (st.gen == g) {
+              if (st.rxLen + r > st.rx.length) st.rx = Arrays.copyOf(st.rx, Math.max(st.rx.length * 2, st.rxLen + r));
+              System.arraycopy(buf, 0, st.rx, st.rxLen, r);
+              st.rxLen += r;
+              st.rxLastNs = t;
+            }
+          }
+          if (st.wantUnpark) LockSupport.unpark(thread);
+        } catch (java.net.SocketTimeoutException te) {
+          // poll ackIn / ackStop
+        } catch (IOException e) {
+          if (st.gen == g && st.ackIn == in) {
+            st.rxErrGen = g; st.rxErr = e;
+            st.ackIn = null;
+            LockSupport.unpark(thread);
+          }
+        }
+      }
+      st.ackIdle = true;
+    }
+
+    /** Pacer side: publish the stream's current connection to its ack reader. */
+    void publish(Stream st) {
+      if (!split || st.lean.in == null || st.ackIn == st.lean.in) return;
+      try { st.lean.sock.setSoTimeout(ACK_POLL_MS); } catch (IOException ignored) {}
+      st.ackIn = st.lean.in;
+    }
+
+    /** Pacer side: take the input back from the ack reader (bounded wait for it to leave read()). */
+    boolean retract(Stream st, long maxWaitNs) {
+      if (!split) return true;
+      st.ackIn = null;
+      long dl = System.nanoTime() + maxWaitNs;
+      while (!st.ackIdle) {
+        if (System.nanoTime() > dl) return false;
+        LockSupport.parkNanos(50_000L);
+      }
+      if (st.lean.sock != null) {
+        try { st.lean.sock.setSoTimeout(st.lean.soTimeoutMs); } catch (IOException ignored) {}
+      }
+      return true;
+    }
     void shutdown() {
       shut = true;
       LockSupport.unpark(thread);
@@ -1636,6 +1842,7 @@ public class StreamLoad {
           try { drainNb(head); } catch (IOException e) { fail(head, e); }
           if (head.inflight.size() >= head.depth) {
             if (head.capT0 == 0) head.capT0 = System.nanoTime();
+            head.wantUnpark = true;
             blocked.add(head);
             continue;
           }
@@ -1644,13 +1851,16 @@ public class StreamLoad {
         ready.add(head);
       }
       // Hard stop or shutdown: release every waiting producer.
-      for (Stream s : all) s.done.countDown();
+      for (Stream s : all) { s.ackStop = true; s.done.countDown(); }
     }
 
     boolean inMeasure(long t) { return w.account && w.startNs != Long.MAX_VALUE && t >= w.startNs && t < w.endNs; }
 
     void send(Stream st, long arriveNs, java.util.concurrent.ThreadLocalRandom rnd) {
-      if (!st.redo.isEmpty()) resendRedo(st, rnd);
+      if (!st.redo.isEmpty()) {
+        retract(st, 200_000_000L);
+        resendRedo(st, rnd);
+      }
       long sendNs = System.nanoTime();
       long slotNs = st.nextNs;
       long capWait = st.capT0 != 0 ? sendNs - st.capT0 : 0;
@@ -1680,6 +1890,7 @@ public class StreamLoad {
         st.lean.send(st.dataHdr, frame);
         long dt = System.nanoTime() - t0;
         if (counted) { PACER_WRITE.add(dt / 1e3); PACER_WRITE_MAX_NS.accumulate(dt); }
+        publish(st);
       } catch (IOException e) {
         fail(st, e);
       }
@@ -1688,6 +1899,17 @@ public class StreamLoad {
     /** Transport error: everything unacked is resent in seq order on a new connection (server dedups). */
     void fail(Stream st, IOException e) {
       if (!inTeardown.get()) producerTransportRetries.incrementAndGet();
+      resync(st);
+    }
+
+    /** Close the connection and queue everything unacked for an in-order resend (server dedups). */
+    void resync(Stream st) {
+      if (split) {
+        st.gen++;
+        st.ackIn = null;
+        synchronized (st.rxLock) { st.rxLen = 0; }
+        st.rxErr = null;
+      }
       st.lean.closeQuiet();
       st.accLen = 0;
       st.redo.addAll(st.inflight);
@@ -1710,7 +1932,7 @@ public class StreamLoad {
      * rest arrives, instead of blocking the loop in readResponse.
      */
     void drainNb(Stream st) throws IOException {
-      if (st.inflight.isEmpty() || st.lean.in == null) return;
+      if (st.inflight.isEmpty() || (!split && st.lean.in == null)) return;
       long t0 = System.nanoTime();
       try { drainNb0(st); } finally {
         long dt = System.nanoTime() - t0;
@@ -1720,13 +1942,28 @@ public class StreamLoad {
       }
     }
     void drainNb0(Stream st) throws IOException {
-      InputStream in = st.lean.in;
-      int av;
-      while ((av = in.available()) > 0) {
-        if (st.accLen == st.acc.length) st.acc = Arrays.copyOf(st.acc, st.acc.length * 2);
-        int r = in.read(st.acc, st.accLen, Math.min(av, st.acc.length - st.accLen));
-        if (r < 0) throw new EOFException("pacer-loop: connection closed");
-        st.accLen += r;
+      long rxNs = 0;
+      if (split) {
+        IOException err = st.rxErr;
+        if (err != null && st.rxErrGen == st.gen) { st.rxErr = null; throw err; }
+        synchronized (st.rxLock) {
+          if (st.rxLen > 0) {
+            if (st.accLen + st.rxLen > st.acc.length) st.acc = Arrays.copyOf(st.acc, Math.max(st.acc.length * 2, st.accLen + st.rxLen));
+            System.arraycopy(st.rx, 0, st.acc, st.accLen, st.rxLen);
+            st.accLen += st.rxLen;
+            st.rxLen = 0;
+            rxNs = st.rxLastNs;
+          }
+        }
+      } else {
+        InputStream in = st.lean.in;
+        int av;
+        while ((av = in.available()) > 0) {
+          if (st.accLen == st.acc.length) st.acc = Arrays.copyOf(st.acc, st.acc.length * 2);
+          int r = in.read(st.acc, st.accLen, Math.min(av, st.acc.length - st.accLen));
+          if (r < 0) throw new EOFException("pacer-loop: connection closed");
+          st.accLen += r;
+        }
       }
       int pos = 0;
       int[] status = new int[1];
@@ -1736,7 +1973,7 @@ public class StreamLoad {
         pos += used;
         Pending pd = st.inflight.pollFirst();
         requests.incrementAndGet();
-        if (pd.counted()) ACK_RTT.add((System.nanoTime() - pd.writeNs()) / 1e3);
+        if (pd.counted()) ACK_RTT.add(((split && rxNs != 0 ? rxNs : System.nanoTime()) - pd.writeNs()) / 1e3);
         if (status[0] == 200 || status[0] == 204) {
           if (pd.counted()) { st.track.sent.incrementAndGet(); SCHED_SENT.increment(); }
           st.free.addLast(pd.frame());
@@ -1748,6 +1985,8 @@ public class StreamLoad {
         System.arraycopy(st.acc, pos, st.acc, 0, st.accLen - pos);
         st.accLen -= pos;
       }
+      // Ack-thread mode: a non-2xx needs an in-order resend on a connection the pacer owns.
+      if (split && !st.redo.isEmpty()) resync(st);
     }
 
     /** Non-blocking ack reads for every stream with requests in flight, until {@code untilNs}. */
@@ -1773,7 +2012,7 @@ public class StreamLoad {
         } catch (IOException e) {
           fail(st, e);
         }
-        if (st.inflight.size() < st.depth) { it.remove(); ready.add(st); }
+        if (st.inflight.size() < st.depth) { it.remove(); st.wantUnpark = false; ready.add(st); }
       }
     }
 
@@ -1787,6 +2026,10 @@ public class StreamLoad {
           fail(st, e);
         }
         if (st.inflight.isEmpty()) {
+          if (split) {
+            st.ackStop = true;
+            if (!retract(st, 0L)) continue; // ack reader still inside read(): next pass
+          }
           if (!st.redo.isEmpty()) resendRedo(st, java.util.concurrent.ThreadLocalRandom.current());
           it.remove();
           st.done.countDown(); // producer thread now owns the socket again (LAST)
@@ -2959,6 +3202,10 @@ public class StreamLoad {
         case "--pipeline-depth" -> args.pipelineDepth = Integer.parseInt(a[++i]);
         case "--pacer-loop" -> args.pacerLoop = true;
         case "--pacer-nice-boost" -> args.pacerNiceBoost = true;
+        case "--role-cpus" -> { args.roleCpus = a[++i]; args.ackThreads = true; }
+        case "--role-map-out" -> args.roleMapOut = a[++i];
+        case "--ack-threads" -> args.ackThreads = true;
+        case "--no-ack-threads" -> args.ackThreads = false;
         case "--no-pacer-nice-boost" -> args.pacerNiceBoost = false;
         case "--no-pacer-loop" -> args.pacerLoop = false;
         case "--pacer-spin-us" -> args.pacerSpinUs = Long.parseLong(a[++i]);
@@ -3011,7 +3258,10 @@ public class StreamLoad {
     double pacerWriteP99 = Double.NaN, pacerDrainP99 = Double.NaN, pacerWriteMaxUs, pacerDrainMaxUs;
     double pacerIterP99 = Double.NaN, pacerIterMax = Double.NaN, pacerRunMs, pacerRqWaitMs;
     long pacerNonvolCs, pacerNice = -99, niceDemoted, niceFailed;
-    boolean niceBoost;
+    boolean niceBoost, roleSplit, ackThreads;
+    String rolePaceCpus = "", roleAckCpus = "";
+    double rolePaceCpuPct = Double.NaN, roleAckCpuPct = Double.NaN;
+    long rolePinned, rolePinFailures;
     String paceWakeHist = "[]", paceBehindHist = "[]", paceCapwaitHist = "[]", ackRttHist = "[]";
     Double paceWakeP99, paceBehindP99, paceCapwaitP99, ackRttP50, ackRttP99;
     Double warmupDrainOpenBefore, warmupDrainOpenAfter, warmupDrainChargedBefore, warmupDrainChargedAfter;
@@ -3120,6 +3370,10 @@ public class StreamLoad {
       field(sb, "pipeline_depth", pipelineDepth, true);
       sb.append("  \"pacer_loop\":").append(pacerLoop).append(",\n");
       sb.append("  \"nice_boost\":").append(niceBoost).append(",\n");
+      sb.append("  \"role_split\":").append(roleSplit).append(",\n");
+      sb.append("  \"ack_threads\":").append(ackThreads).append(",\n");
+      sb.append("  \"role_pace_cpus\":\"").append(rolePaceCpus).append("\",\n");
+      sb.append("  \"role_ack_cpus\":\"").append(roleAckCpus).append("\",\n");
       field(sb, "pacer_write_p99_us", pacerWriteP99, true);
       field(sb, "pacer_write_max_us", pacerWriteMaxUs, true);
       field(sb, "pacer_drain_p99_us", pacerDrainP99, true);
@@ -3131,6 +3385,10 @@ public class StreamLoad {
       field(sb, "pacer_nonvol_cs", pacerNonvolCs, true);
       field(sb, "pacer_nice", pacerNice, true);
       field(sb, "nice_demoted_threads", niceDemoted, true);
+      field(sb, "role_pace_cpu_pct", rolePaceCpuPct, true);
+      field(sb, "role_ack_cpu_pct", roleAckCpuPct, true);
+      field(sb, "role_pinned_threads", rolePinned, true);
+      field(sb, "role_pin_failures", rolePinFailures, true);
       field(sb, "nice_demote_failures", niceFailed, true);
       field(sb, "gc_ms_window", gcMsWindow, true);
       field(sb, "gc_count_window", gcCountWindow, true);

@@ -242,6 +242,33 @@ StreamLoad moves every thread except `sl-pacer` (and the small spawner that crea
 is unchanged (still 19 under a waiter). Same cores and pinning (this is not dedicated pacer
 cores). `result.json` records `nice_boost`, `pacer_nice`, `nice_demoted_threads` and `nice_demote_failures`.
 
+Role split (option (b), inceptor 2026-11-17 23:31; `ROLE_SPLIT=1`, `--role-cpus PACE:ACK`): generator
+roles are split across cores, the server stays on `SRV_CPUS` (3-7).
+
+| role | threads | cores (default) |
+|---|---|---|
+| pace | `sl-pacer`, producer threads `sl-p-*`, the nice spawner | gen-0 on core 0, gen-1 on core 1 (`GEN_PACE_CPUS=0,1`) |
+| ack | ack readers `sl-ack-*` (one per paced stream), consumer carriers, JVM/GC/JIT, main | core 2 (`GEN_ACK_CPUS=2`), shared by both processes |
+
+- One generator process per `GEN_PACE_CPUS` entry (so `GEN_PROCS=2` by default); each is launched
+  with `taskset -c <pace>,<ack>` and a `sl-rolepin` thread re-applies per-thread affinity
+  (`taskset -p -c`) every 100 ms so new threads land on their role's core.
+- Ack-thread mode: with the pacing loop, each stream's socket is read by its own `sl-ack-*` thread
+  (blocking reads, 20 ms `SO_TIMEOUT` to notice hand-back); the pacer only copies the bytes and
+  parses them. The pacer takes the socket back before an in-order resend and before LAST.
+- Logged per leg in `affinity.txt`: process `taskset` for every process, per-thread role/CPU counts
+  per generator (from `rolemap-gen-<i>.tsv`, sampled at measure start and end), and the server's
+  per-thread CPU sets.
+- `self_loaded` is judged per role: self_loaded if the summed CPU of all threads pinned to one core
+  set (pace core 0, pace core 1, the shared ack core 2) is above 80% of that core, OR summed
+  generator CPU is above 240% (80% x `GEN_CORES=3`). Per-role CPU comes from
+  `/proc/self/task/<tid>/stat` over the measure window (`role_pace_cpu_pct`, `role_ack_cpu_pct` per
+  process; merged `role_core_cpu_pct`). A whole process above 80% is not by itself self_loaded in
+  this layout, since it spans two cores.
+- Closed-loop legs (no `RATE_MIB_S`) keep the 1-core-per-process layout (logged as skipped): their
+  producers are virtual threads on the consumer carriers, so a split would put everything on
+  the ack core. Every paced arm of an A/A or A/B runs the same split layout.
+
 Lag split per measured slot (`result.json`): `pace_wake_*` (arrived early, then parked/spun:
 wake precision), `pace_behind_*` (arrived after the slot: previous work overran),
 `pace_capwait_*` (in-flight cap full: real server back-pressure), plus `ack_rtt_p50/p99_us`

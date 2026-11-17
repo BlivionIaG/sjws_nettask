@@ -72,6 +72,21 @@ def main():
                             client_cpu_pct_per_proc=[90.0, 10.0, 10.0]))
     assert not ev["valid"] and ev["self_loaded"], ev
 
+    # #502 option (b): role-split legs judged per role core set, not per process
+    ev = wv.evaluate(base_ok(client_cpu_pct_of_wall=170.0, self_loaded=False, gen_cores=3,
+                            client_cpu_pct_per_proc=[90.0, 80.0],
+                            role_core_cpu_pct={"0": 60.0, "1": 50.0, "2": 60.0},
+                            role_core_limit_pct={"0": 80.0, "1": 80.0, "2": 80.0}))
+    assert ev["valid"] and not ev["self_loaded"], ev
+    ev = wv.evaluate(base_ok(client_cpu_pct_of_wall=150.0, self_loaded=False, gen_cores=3,
+                            client_cpu_pct_per_proc=[75.0, 75.0],
+                            role_core_cpu_pct={"0": 30.0, "1": 30.0, "2": 90.0},
+                            role_core_limit_pct={"0": 80.0, "1": 80.0, "2": 80.0}))
+    assert not ev["valid"] and ev["self_loaded"], ev
+    ev = wv.evaluate(base_ok(client_cpu_pct_of_wall=250.0, self_loaded=False, gen_cores=3,
+                            role_core_cpu_pct={"0": 70.0, "1": 70.0, "2": 70.0}))
+    assert ev["self_loaded"], ev  # sum > 240 %
+
     # smoke5 recorded rungs (inceptor 21:32): 25 and 50 were flagged wrongly.
     ev = wv.evaluate(base_ok(client_cpu_pct_of_wall=140.5473821746345, self_loaded=True, gen_cores=3,
                             load1_post=3.5,

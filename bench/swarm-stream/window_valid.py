@@ -4,7 +4,8 @@
 A window is valid only when ALL of:
   - chunk_samples >= 10000, p99 present, load1_pre < 3
   - not self_loaded (recomputed from generator CPU only: sum cpu > 80*gen_cores
-    OR any process > 80% of its own pinned core). load1_post is not part of this
+    OR any process > 80% of its own pinned core; for ROLE_SPLIT legs: any role core set
+    over 80% x its cores, from role_core_cpu_pct). load1_post is not part of this
     rule. Do not OR StreamLoad's stale pre-drain flag.
   - no transport retries / refused_per_ip / drain timeout / open sessions after drain
   - no setup failures (error_count / group_open_refusals)
@@ -58,6 +59,18 @@ def evaluate(r: dict) -> dict:
                 break
         except (TypeError, ValueError):
             pass
+    # #502 option (b): role-split legs are judged per role core set (merge-gen role_core_cpu_pct),
+    # not per process (a process spans its pace core and the shared ack core).
+    rc = r.get("role_core_cpu_pct")
+    if isinstance(rc, dict) and rc:
+        lim = r.get("role_core_limit_pct") or {}
+        any_proc = False
+        for k, v in rc.items():
+            try:
+                if v is not None and float(v) > float(lim.get(k, 80.0)):
+                    any_proc = True
+            except (TypeError, ValueError):
+                pass
     gen_sat = gen_sat or any_proc
     # Q4: recompute only. Do not OR a stale result.self_loaded: StreamLoad sets that
     # flag from end-of-measure load1, then merge_noisy overwrites load1_post with

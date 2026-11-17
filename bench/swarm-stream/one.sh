@@ -284,13 +284,30 @@ if [ "$LOADGEN" = java ]; then
   # (relative to the caller; the bench waiters run at +10); StreamLoad then moves every thread
   # except the pacing loop to nice 19, the value they had before (10 + 10, capped at 19).
   GEN_NICE=10
+  ROLE_EXTRA=()
+  # #502 option (b) (inceptor 2026-11-17 23:31): ROLE_SPLIT=1 splits generator roles across cores.
+  # One process per GEN_PACE_CPUS entry; its sl-pacer + producer threads are pinned to that core,
+  # every other thread (ack readers, consumers, JVM threads) to GEN_ACK_CPUS. Server stays on SRV_CPUS.
+  if [ "${ROLE_SPLIT:-0}" = 1 ] && [ -z "${RATE_MIB_S:-}" ]; then
+    # Closed-loop legs have no pacer and run producers as virtual threads on the consumer
+    # carriers, so a role split would only squeeze them onto the ack core: keep the 1-core layout.
+    echo "one.sh: ROLE_SPLIT skipped (closed-loop leg, no RATE_MIB_S): GEN_PROCS=$GEN_PROCS on $GEN_CPUS" | tee -a "$WD/affinity.txt"
+    ROLE_SPLIT=0
+  fi
+  if [ "${ROLE_SPLIT:-0}" = 1 ]; then
+    GEN_PACE_CPUS=${GEN_PACE_CPUS:-0,1}
+    GEN_ACK_CPUS=${GEN_ACK_CPUS:-2}
+    IFS=, read -r -a _pace_cpus <<< "$GEN_PACE_CPUS"
+    GEN_PROCS=${#_pace_cpus[@]}
+    echo "one.sh: ROLE_SPLIT pace_cpus=$GEN_PACE_CPUS ack_cpus=$GEN_ACK_CPUS gen_procs=$GEN_PROCS gen_cores=$GEN_CORES" | tee -a "$WD/affinity.txt"
+  fi
   if [ "${PACER_LOOP:-0}" = 1 ] && [ "${PACER_NICE_BOOST:-0}" = 1 ]; then GEN_EXTRA+=(--pacer-nice-boost); GEN_NICE=0; fi
   # #415/#414: optional generator JVM flags (e.g. JFR on the generator to find its own hot spots).
   read -r -a GEN_JAVA_ARGS <<< "${GEN_JAVA_OPTS:-}"
   # Launch one StreamLoad: _launch_streamload <pin> <streams> <groups> <group_offset> <rate_or_empty> <out>
   _launch_streamload() {
     local pin=$1 sp=$2 gp=$3 goff=$4 rate=$5 outp=$6
-    local extra=("${GEN_EXTRA[@]}")
+    local extra=("${GEN_EXTRA[@]}" "${ROLE_EXTRA[@]}")
     # Replace a pre-set --rate-mib-s with this process's share, if any.
     local i
     for i in "${!extra[@]}"; do
@@ -339,6 +356,11 @@ if [ "$LOADGEN" = java ]; then
       gp=$(( (leftover_g + np - 1) / np ))
       leftover_g=$((leftover_g - gp))
       pin=${_gc[$((p % ${#_gc[@]}))]}
+      ROLE_EXTRA=()
+      if [ "${ROLE_SPLIT:-0}" = 1 ]; then
+        pin="${_pace_cpus[$p]},$GEN_ACK_CPUS"
+        ROLE_EXTRA=(--role-cpus "${_pace_cpus[$p]}:$GEN_ACK_CPUS" --role-map-out "$WD/rolemap-gen-$p.tsv")
+      fi
       outp="$WD/gen-$p.json"
       rate=""
       if [ -n "${RATE_MIB_S:-}" ]; then
@@ -358,6 +380,21 @@ if [ "$LOADGEN" = java ]; then
     for GENPID in "${GENPIDS[@]}"; do
       wait "$GENPID" || rc=$?
     done
+    if [ "${ROLE_SPLIT:-0}" = 1 ]; then
+      # Per-thread role pinning, sampled by each generator at measure start and end.
+      for ((p=0; p<GEN_PROCS; p++)); do
+        f="$WD/rolemap-gen-$p.tsv"
+        if [ -s "$f" ]; then
+          awk -F'\t' -v g="gen-$p" '{k=$1" role="$4" cpus="$5; n[k]++} END {for (k in n) printf "one.sh: %s threads %s n=%d\n", g, k, n[k]}' "$f" | sort
+        else
+          echo "one.sh: gen-$p NO rolemap"
+        fi
+      done | tee -a "$WD/affinity.txt"
+      if [ -d "/proc/$SPID/task" ]; then
+        for t in /proc/"$SPID"/task/*; do awk '/^Cpus_allowed_list/ {print $2}' "$t/status" 2>/dev/null; done \
+          | sort | uniq -c | awk -v s="$SPID" '{printf "one.sh: server pid=%s threads cpus=%s n=%d\n", s, $2, $1}' | tee -a "$WD/affinity.txt"
+      fi
+    fi
     python3 "$HERE_DIR/merge-gen.py" "${PARTS[@]}" -o "$OUT" --gen-cores "$GEN_CORES" --secs "$SECS"
     [ "$rc" -eq 0 ] || echo "one.sh: a generator process exited $rc (merged $OUT anyway)" >&2
   fi
