@@ -28,7 +28,7 @@
     <h3.gate.branch>0</h3.gate.branch>
     <tls.gate.line>0</tls.gate.line>
     <tls.gate.branch>0</tls.gate.branch>
-    <bouncycastle.version>1.86</bouncycastle.version>
+    <bouncycastle.version>1.87</bouncycastle.version>
   </properties>
 
   <dependencyManagement>
