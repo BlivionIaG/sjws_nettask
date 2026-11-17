@@ -238,6 +238,41 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         return response;
     }
 
+    /**
+     * Drop a retried attempt's body and, when that closes the upstream socket, wait until the
+     * connection slot is released so the next acquire can succeed at {@code max_connections} (#508).
+     * Idle keep-alive reuse is unchanged: if the socket was returned to the pool, this does not wait.
+     */
+    static void discardForRetry(Response response, Duration timeout, Admission admission) {
+        if (response == null) {
+            return;
+        }
+        io.netty.channel.Channel closing = null;
+        if (response.body() instanceof Body.Stream stream) {
+            var src = stream.source();
+            if (src instanceof Source s) {
+                closing = s.closeAndAwaitable();
+            } else if (src instanceof ReleasingSource r) {
+                closing = r.closeAndAwaitable();
+            } else {
+                Body.discard(response.body());
+            }
+        } else {
+            Body.discard(response.body());
+        }
+        if (closing == null || timeout == null || timeout.isZero() || timeout.isNegative()) {
+            return;
+        }
+        if (admission == null || !admission.limitsConnections()) {
+            return; // no slot to reclaim: do not wait on close
+        }
+        try {
+            closing.closeFuture().await(Math.max(1, timeout.toMillis()), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     public Settings settings() {
         return this.settings;
     }
@@ -246,7 +281,6 @@ public final class ProxyHandler implements Handler, AutoCloseable {
     public int idleConnections() {
         return this.pool.idleCount();
     }
-
     /** Closes the pool; exchanges in flight finish and close their connections. */
     @Override
     public void close() {
@@ -325,13 +359,26 @@ public final class ProxyHandler implements Handler, AutoCloseable {
      * exception (classify it with {@link #kind(IOException)}, answer it with {@link #status}).
      */
     Response attempt(Request request) throws IOException, InterruptedException {
+        return attempt(request, false);
+    }
+
+    /**
+     * Like {@link #attempt}, but takes this handler's pending slot when {@code max_pending} is
+     * set. Used by a per-route one-shot so a plain-URL upstream still shares the cap; a balancer
+     * holds the slot itself and must keep calling {@link #attempt()}.
+     */
+    Response attemptWithPending(Request request) throws IOException, InterruptedException {
+        return attempt(request, true);
+    }
+
+    private Response attempt(Request request, boolean takePending) throws IOException, InterruptedException {
         boolean head = request.headOnly();
         long length = request.body().length();
         if (request.body() == sjws_nettask.core.RequestBody.EMPTY && hasDeclaredBody(request)) {
-            return StaticFileHandler.error(501, head); // a body the transport could not attach
+            return localRefusal(StaticFileHandler.error(501, head)); // a body the transport could not attach
         }
         if (length > this.settings.maxBody()) {
-            return StaticFileHandler.error(413, head);
+            return localRefusal(StaticFileHandler.error(413, head));
         }
         var refused = peerBudgetRefused(request, head);
         if (refused != null) {
@@ -341,14 +388,30 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         try {
             out = buildRequest(request, length);
         } catch (IllegalArgumentException e) {
-            return StaticFileHandler.error(400, head);
+            return localRefusal(StaticFileHandler.error(400, head));
+        }
+        Admission.Hold pending = null;
+        if (takePending && this.admission != null && this.admission.limitsPending()) {
+            pending = this.admission.tryPending();
+            if (pending == null) {
+                return overloaded(head);
+            }
         }
         try {
-            return exchange(request, out, length, true);
+            var response = exchange(request, out, length, true);
+            var hold = pending;
+            pending = null;
+            return withPending(response, hold);
         } catch (UpstreamPool.ConnectionLimit e) {
-            return overloaded(head);
+            var hold = pending;
+            pending = null;
+            return withPending(overloaded(head), hold);
         } catch (RequestBodyTooLarge e) {
-            return StaticFileHandler.error(413, head);
+            return localRefusal(StaticFileHandler.error(413, head)); // local, not an upstream verdict
+        } finally {
+            if (pending != null) {
+                pending.release();
+            }
         }
     }
 
@@ -512,7 +575,7 @@ public final class ProxyHandler implements Handler, AutoCloseable {
                     return withPending(outResponse, hold);
                 }
                 if (response != null) {
-                    Body.discard(response.body()); // the 5xx is replaced by the next attempt
+                    discardForRetry(response, this.settings.connectTimeout(), this.admission);
                 }
                 tries++;
             }
@@ -815,6 +878,8 @@ public final class ProxyHandler implements Handler, AutoCloseable {
         private final Duration idle;
         private ByteBuf current;
         private boolean closed;
+        /** Set by {@link #close} when the socket is shut down rather than returned to idle. */
+        private io.netty.channel.Channel closing;
 
         Source(UpstreamPool.Exchange ex, UpstreamPool pool, Duration idle) {
             this.ex = ex;
@@ -863,10 +928,23 @@ public final class ProxyHandler implements Handler, AutoCloseable {
             releaseCurrent();
             if (this.ex.ended) {
                 this.pool.release(this.ex.channel, this.ex.keepAlive);
+                if (!this.ex.keepAlive) {
+                    this.closing = this.ex.channel;
+                }
             } else {
                 this.ex.abandon();
                 this.pool.release(this.ex.channel, false);
+                this.closing = this.ex.channel;
             }
+        }
+
+        /**
+         * Close the body and, if that shuts the socket rather than returning it to the idle
+         * pool, return the channel so a retry can wait for the cap slot.
+         */
+        io.netty.channel.Channel closeAndAwaitable() {
+            close();
+            return this.closing;
         }
 
         boolean closed() {
@@ -896,6 +974,20 @@ public final class ProxyHandler implements Handler, AutoCloseable {
             } finally {
                 this.pending.release();
             }
+        }
+
+        io.netty.channel.Channel closeAndAwaitable() {
+            io.netty.channel.Channel closing = null;
+            try {
+                if (this.inner instanceof Source s) {
+                    closing = s.closeAndAwaitable();
+                } else {
+                    this.inner.close();
+                }
+            } finally {
+                this.pending.release();
+            }
+            return closing;
         }
     }
 }

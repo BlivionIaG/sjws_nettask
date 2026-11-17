@@ -366,6 +366,40 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
 
     @Override
     public Response handle(Request request) {
+        return dispatch(request, this.retry);
+    }
+
+    /** One try, no balancer retry: used by a per-route {@link RouteResilience} wrapper. */
+    Response oneShot(Request request) throws IOException, InterruptedException {
+        return oneShot(request, null, null);
+    }
+
+    /**
+     * One try that records the chosen endpoint's authority in {@code tried} so a route-level
+     * retry can exclude it even if discovery reorders the view between attempts. Transport
+     * failures are thrown so the caller can classify {@code connect}/{@code reset}/{@code timeout}
+     * instead of a synthetic 502/504.
+     *
+     * @param nTried {@code nTried[0]} is the number of valid entries already in {@code tried};
+     *        updated after this attempt when both arrays are non-null
+     */
+    Response oneShot(Request request, String[] tried, int[] nTried) throws IOException, InterruptedException {
+        return dispatch(request, null, tried, nTried, true);
+    }
+
+    private Response dispatch(Request request, Resilience.Retry retry) {
+        try {
+            return dispatch(request, retry, null, null, false);
+        } catch (IOException e) {
+            return StaticFileHandler.error(ProxyHandler.status(e), request.headOnly());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return StaticFileHandler.error(502, request.headOnly());
+        }
+    }
+
+    private Response dispatch(Request request, Resilience.Retry retry, String[] tried, int[] nTried, boolean rethrow)
+            throws IOException, InterruptedException {
         var v = this.view;
         boolean head = request.headOnly();
         if (v == null) {
@@ -379,13 +413,15 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
             }
         }
         try {
-            var retry = this.retry;
             boolean mayRetry = retry != null && request.body().length() == 0 && ProxyHandler.idempotent(request.method());
             if (retry != null) {
                 this.budget.deposit();
             }
-            int[] tried = mayRetry ? new int[retry.attempts()] : null;
-            int tries = 0;
+            int tries = nTried != null && tried != null ? nTried[0] : 0;
+            if (tried == null) {
+                tried = mayRetry ? new String[retry.attempts()] : null;
+                tries = 0;
+            }
             while (true) {
                 long now = this.clock.getAsLong();
                 int i = pick(v, tried, tries, now);
@@ -400,11 +436,13 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                 Resilience.On failed;
                 Response response = null;
                 int errorStatus = 0;
+                IOException transport = null;
                 pool.inflight.incrementAndGet();
                 try {
                     response = pool.proxy.attempt(request);
                     failed = ProxyHandler.kind(response);
                 } catch (IOException e) {
+                    transport = e;
                     failed = ProxyHandler.kind(e);
                     errorStatus = ProxyHandler.status(e);
                 } catch (InterruptedException e) {
@@ -413,6 +451,9 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                     if (pending != null) {
                         pending.release();
                         pending = null;
+                    }
+                    if (rethrow) {
+                        throw e;
                     }
                     return StaticFileHandler.error(502, head);
                 } finally {
@@ -433,18 +474,28 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
                     return ProxyHandler.withPending(response, hold);
                 }
                 pool.health.failure(this.clock.getAsLong());
-                boolean again = mayRetry && tries < retry.attempts() && retry.on().contains(failed)
-                        && this.budget.withdraw();
+                if (tried != null && tries < tried.length) {
+                    tried[tries] = pool.key;
+                }
+                boolean again = mayRetry && tries < retry.attempts() && retry.on().contains(failed) && this.budget.withdraw();
+                if (tried != null && tries < tried.length) {
+                    tries++;
+                    if (nTried != null) {
+                        nTried[0] = tries;
+                    }
+                }
                 if (!again) {
+                    if (rethrow && transport != null) {
+                        throw transport;
+                    }
                     var out = response != null ? response : StaticFileHandler.error(errorStatus, head);
                     var hold = pending;
                     pending = null;
                     return ProxyHandler.withPending(out, hold);
                 }
                 if (response != null) {
-                    Body.discard(response.body());
+                    ProxyHandler.discardForRetry(response, pool.proxy.settings().connectTimeout(), this.admission);
                 }
-                tried[tries++] = i;
             }
         } finally {
             if (pending != null) {
@@ -457,13 +508,21 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
      * An endpoint that is not ejected (unless the balancer panics) and, for a retry, not tried yet.
      * Falls back to a tried endpoint, then to any endpoint, so a request always gets one.
      */
-    int pick(View v, int[] tried, int nTried, long now) {
+    int pick(View v, String[] tried, int nTried, long now) {
         int n = v.pools.length;
         boolean panic = (long) this.ejected.get() * 100 > (long) this.outlier.maxEjectionPercent() * n;
+        // At the shared connection cap, prefer a usable endpoint that already has an idle
+        // socket so we reuse it instead of refusing a request that selected a cold one (#508).
+        if (this.admission != null && this.admission.atConnectionCap()) {
+            int warm = pickWarmIdle(v, tried, nTried, now, panic);
+            if (warm >= 0) {
+                return warm;
+            }
+        }
         int draws = Math.min(n, 4);
         for (int d = 0; d < draws; d++) {
             int i = policyPick(v);
-            if (!contains(tried, nTried, i) && clientMayUse(v.pools[i], now, panic)) {
+            if (!contains(tried, nTried, v.pools[i].key) && clientMayUse(v.pools[i], now, panic)) {
                 return i;
             }
         }
@@ -472,7 +531,7 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
             for (int k = 0; k < n; k++) {
                 int i = (start + k) % n;
                 boolean weighted = v.set.endpointAt(i).effectiveWeight() > 0 || v.positive.length == n;
-                if (weighted == (pass == 0) && !contains(tried, nTried, i)
+                if (weighted == (pass == 0) && !contains(tried, nTried, v.pools[i].key)
                         && clientMayUse(v.pools[i], now, panic)) {
                     return i;
                 }
@@ -488,6 +547,24 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
             return -1; // probes own recovery; do not send client traffic as a half-open probe
         }
         return policyPick(v); // everything ejected and below the panic line: still answer
+    }
+
+    /**
+     * A weighted, usable endpoint that already holds an idle keep-alive. Weight-0 / SUSPECT
+     * endpoints are skipped so their idle sockets can be reclaimed for a healthy one.
+     */
+    private int pickWarmIdle(View v, String[] tried, int nTried, long now, boolean panic) {
+        int n = v.pools.length;
+        int start = ThreadLocalRandom.current().nextInt(n);
+        for (int k = 0; k < n; k++) {
+            int i = (start + k) % n;
+            boolean weighted = v.set.endpointAt(i).effectiveWeight() > 0 || v.positive.length == n;
+            if (weighted && !contains(tried, nTried, v.pools[i].key) && v.pools[i].proxy.idleConnections() > 0
+                    && clientMayUse(v.pools[i], now, panic)) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     /**
@@ -640,9 +717,12 @@ public final class EndpointBalancer implements Handler, AutoCloseable {
         };
     }
 
-    private static boolean contains(int[] tried, int n, int i) {
-        for (int k = 0; k < n; k++) {
-            if (tried[k] == i) {
+    private static boolean contains(String[] tried, int n, String key) {
+        if (tried == null || key == null) {
+            return false;
+        }
+        for (int k = 0; k < n && k < tried.length; k++) {
+            if (key.equals(tried[k])) {
                 return true;
             }
         }

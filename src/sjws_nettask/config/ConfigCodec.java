@@ -301,6 +301,28 @@ public final class ConfigCodec {
                     }
                     case RouteSpec.Action.Static ignored -> out.append("      static: true\n");
                 }
+                if (route.retry() != null) {
+                    var retry = route.retry();
+                    out.append("      retry: { attempts: ").append(retry.attempts()).append(", on: [");
+                    var on = new java.util.ArrayList<String>();
+                    for (var kind : sjws_nettask.routing.Resilience.On.values()) {
+                        if (retry.on().contains(kind)) {
+                            on.add(switch (kind) {
+                                case CONNECT -> "connect";
+                                case TIMEOUT -> "timeout";
+                                case RESET -> "reset";
+                                case STATUS_502 -> "502";
+                                case STATUS_503 -> "503";
+                                case STATUS_504 -> "504";
+                            });
+                        }
+                    }
+                    out.append(String.join(", ", on)).append("], budget: ").append(retry.budgetPercent()).append(" }\n");
+                }
+                if (route.circuit() != null) {
+                    out.append("      circuit: { failures: ").append(route.circuit().failures())
+                            .append(", eject_for: ").append(quote(duration(route.circuit().openFor()))).append(" }\n");
+                }
                 if (route.rateLimit() != null) {
                     out.append("      rate_limit: ").append(limit(route.rateLimit())).append('\n');
                 }

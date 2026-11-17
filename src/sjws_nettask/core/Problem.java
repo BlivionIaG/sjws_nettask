@@ -57,7 +57,9 @@ public final class Problem {
 
     /**
      * Builds the response. Header fields of {@code like} other than the representation ones
-     * (e.g. Allow, Content-Range, Retry-After, WWW-Authenticate) are kept.
+     * (e.g. Allow, Content-Range, Retry-After, WWW-Authenticate) are kept. Fields that describe the
+     * replaced body (Content-Encoding, Content-Length, Content-MD5, Content-Digest, Repr-Digest,
+     * Digest, ETag, and any Accept-Encoding token in Vary added by compression) are dropped.
      *
      * @param typeBase null for {@code "about:blank"}, otherwise a URI the status code is appended to
      *        (e.g. "https://errors.example.com/" gives "https://errors.example.com/503")
@@ -89,11 +91,39 @@ public final class Problem {
                 switch (e.getKey()) {
                     case "accept-ranges", "content-type", "x-content-type-options", "content-security-policy",
                             "cache-control" -> { }
+                    // They describe the replaced body (e.g. a compress filter's gzip), not the JSON.
+                    case "content-encoding", "content-length", "content-md5", "content-digest", "repr-digest",
+                            "digest", "etag" -> { }
+                    case "vary" -> {
+                        var kept = withoutAcceptEncoding(e.getValue());
+                        if (kept != null) {
+                            headers.add(e.getKey(), kept);
+                        }
+                    }
                     default -> headers.add(e.getKey(), e.getValue());
                 }
             }
         }
         return new Response(status, headers, Body.Bytes.of(json.toString().getBytes(StandardCharsets.UTF_8)), head);
+    }
+
+    /** Drops {@code Accept-Encoding} tokens that compression added to a {@code Vary} field. */
+    private static String withoutAcceptEncoding(String vary) {
+        if (vary == null || vary.isBlank()) {
+            return null;
+        }
+        var kept = new StringBuilder();
+        for (var part : vary.split(",")) {
+            var token = part.trim();
+            if (token.isEmpty() || token.equalsIgnoreCase("Accept-Encoding")) {
+                continue;
+            }
+            if (kept.length() > 0) {
+                kept.append(", ");
+            }
+            kept.append(token);
+        }
+        return kept.length() == 0 ? null : kept.toString();
     }
 
     /** JSON string literal (RFC 8259): quotes, backslash and control characters escaped. */

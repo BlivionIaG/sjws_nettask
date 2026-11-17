@@ -57,7 +57,7 @@ import javax.net.ssl.SSLException;
  * One {@link Exchange} runs on a channel at a time; a channel goes back to the idle stack only
  * after its response ended cleanly with keep-alive.
  */
-final class UpstreamPool implements AutoCloseable {
+final class UpstreamPool implements AutoCloseable, Admission.IdleReclaim {
 
     /** No response head within the response timeout (a 504, never retried). */
     static final class HeadTimeout extends IOException {
@@ -102,6 +102,9 @@ final class UpstreamPool implements AutoCloseable {
 
     private final ByteBudget budget;
     private final Admission admission;
+    /** The cap hold released when this channel closes; used to await that socket, not the aggregate count. */
+    static final io.netty.util.AttributeKey<Admission.Hold> SLOT =
+            io.netty.util.AttributeKey.valueOf("sjws.admission.slot");
 
     UpstreamPool(URI upstream, Duration connectTimeout, int maxIdle, ByteBudget budget) {
         this(upstream, connectTimeout, maxIdle, budget, null);
@@ -110,6 +113,9 @@ final class UpstreamPool implements AutoCloseable {
     UpstreamPool(URI upstream, Duration connectTimeout, int maxIdle, ByteBudget budget, Admission admission) {
         this.budget = java.util.Objects.requireNonNull(budget);
         this.admission = admission;
+        if (admission != null) {
+            admission.attach(this);
+        }
         boolean tls = "https".equals(upstream.getScheme());
         this.host = upstream.getHost();
         this.port = upstream.getPort() > 0 ? upstream.getPort() : tls ? 443 : 80;
@@ -191,7 +197,13 @@ final class UpstreamPool implements AutoCloseable {
         if (this.admission != null && this.admission.limitsConnections()) {
             slot = this.admission.tryConnection();
             if (slot == null) {
-                throw new ConnectionLimit();
+                // An idle keep-alive on a sibling endpoint can hold the shared cap (#508).
+                if (this.admission.reclaimIdle(this, timeout == null ? this.connectTimeout : timeout)) {
+                    slot = this.admission.tryConnection();
+                }
+                if (slot == null) {
+                    throw new ConnectionLimit();
+                }
             }
         }
         Duration wait = timeout == null || timeout.isZero() || timeout.isNegative() ? this.connectTimeout : timeout;
@@ -215,17 +227,15 @@ final class UpstreamPool implements AutoCloseable {
         if (slot != null) {
             var ch = future.channel();
             if (ch != null) {
-                var held = slot;
-                ch.closeFuture().addListener(f -> held.release());
-                releasedOnClose = held;
+                bindSlot(ch, slot);
+                releasedOnClose = slot;
                 slot = null;
             }
         }
         try {
             var ch = connected.get(waitMs, TimeUnit.MILLISECONDS);
             if (slot != null) {
-                var held = slot;
-                ch.closeFuture().addListener(f -> held.release());
+                bindSlot(ch, slot);
                 slot = null;
             }
             return new Lease(ch, false);
@@ -314,6 +324,32 @@ final class UpstreamPool implements AutoCloseable {
     }
 
     /**
+     * Bind {@code hold} to {@code ch} so it is released exactly once when the channel closes.
+     */
+    private static void bindSlot(Channel ch, Admission.Hold hold) {
+        ch.attr(SLOT).set(hold);
+        ch.closeFuture().addListener(f -> hold.release());
+    }
+
+    @Override
+    public boolean closeOneIdleAndAwait(Duration timeout) throws InterruptedException {
+        var ch = this.idle.pollFirst();
+        if (ch == null) {
+            return false;
+        }
+        var hold = ch.attr(SLOT).get();
+        ch.close();
+        long waitMs = timeout == null || timeout.isZero() || timeout.isNegative()
+                ? 2000 : Math.max(1, timeout.toMillis());
+        if (hold != null) {
+            // Wait for this socket's hold, not the shared connection count: another acquire
+            // may take the freed slot before the aggregate count drops (#508 / Codex P2).
+            return hold.awaitReleased(waitMs, TimeUnit.MILLISECONDS);
+        }
+        return ch.closeFuture().await(waitMs, TimeUnit.MILLISECONDS) && ch.closeFuture().isDone();
+    }
+
+    /**
      * Stops keeping connections: idle ones close now and each exchange in flight closes its own when
      * it ends. New exchanges still connect. For an endpoint that left the set, so its idle sockets do
      * not linger on the upstream until {@link #close()}. Idempotent.
@@ -332,6 +368,9 @@ final class UpstreamPool implements AutoCloseable {
             return;
         }
         this.closed = true;
+        if (this.admission != null) {
+            this.admission.detach(this);
+        }
         for (var ch = this.idle.pollFirst(); ch != null; ch = this.idle.pollFirst()) {
             ch.close();
         }
