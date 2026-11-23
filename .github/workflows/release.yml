@@ -151,7 +151,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*-${{ needs.meta.outputs.version }}
           path: dist
