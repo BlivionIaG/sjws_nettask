@@ -47,7 +47,7 @@ jobs:
         run: |
           . /etc/os-release
           echo "key=wrk-${ID}-${VERSION_ID}-${RUNNER_ARCH}-v2" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/wrk-cache
           key: ${{ steps.wrk-cache.outputs.key }}
